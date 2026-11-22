@@ -11,6 +11,7 @@ from dataclasses import replace
 from incident_lab.cli import main
 from incident_lab.policy import (
     DEFAULT_POLICY, get_policy, list_policies, load_policy_file,
+    parse_ack_timeout_overrides,
 )
 from incident_lab.replay import load_result
 from incident_lab.scenarios import Scenario, get, list_scenarios
@@ -533,6 +534,154 @@ class TestReplay(unittest.TestCase):
     def test_cli_wrong_shape_fails(self):
         path = self._write_result_file({"incident": {"id": "x"}})
         self.assertEqual(main(["replay", path]), 2)
+
+
+class TestAckTimeoutOverrides(unittest.TestCase):
+    def test_positional_list_overrides_every_level(self):
+        policy = parse_ack_timeout_overrides(["120,300,600"], DEFAULT_POLICY)
+        self.assertEqual(
+            [level.ack_timeout_min for level in policy.levels],
+            [120, 300, 600])
+        self.assertEqual(policy.name, "standard")
+
+    def test_positional_tokens_may_be_space_separated(self):
+        policy = parse_ack_timeout_overrides(
+            ["120", "300", "600"], DEFAULT_POLICY)
+        self.assertEqual(
+            [level.ack_timeout_min for level in policy.levels],
+            [120, 300, 600])
+
+    def test_named_by_role_overrides_only_that_level(self):
+        policy = parse_ack_timeout_overrides(["primary=7"], DEFAULT_POLICY)
+        self.assertEqual(
+            [level.ack_timeout_min for level in policy.levels], [7, 5, 10])
+
+    def test_named_by_level_number_overrides_only_that_level(self):
+        policy = parse_ack_timeout_overrides(["L3=20"], DEFAULT_POLICY)
+        self.assertEqual(
+            [level.ack_timeout_min for level in policy.levels], [5, 5, 20])
+
+    def test_positional_override_changes_escalation_timing(self):
+        # latency-spike: primary never acks, secondary acks 4m after the
+        # primary timeout. With a 120m primary timeout that is 120 + 4.
+        policy = parse_ack_timeout_overrides(["120,300,600"], DEFAULT_POLICY)
+        result = simulate(get("latency-spike"), policy)
+        self.assertEqual(result.score.escalations, 1)
+        self.assertEqual(result.score.time_to_ack_min, 124)
+
+    def test_named_override_changes_escalation_timing(self):
+        # disk-full: primary acks in 3m, inside the standard 5m timeout.
+        # Give the primary only 1m and the incident escalates past
+        # everyone: secondary and manager never ack.
+        policy = parse_ack_timeout_overrides(["primary=1"], DEFAULT_POLICY)
+        result = simulate(get("disk-full"), policy)
+        self.assertEqual(result.score.escalations, 2)
+        self.assertFalse(result.score.resolved)
+        self.assertEqual(result.score.points, 0)
+
+    def test_level_number_override_changes_escalation_timing(self):
+        # latency-spike: primary times out at 5m, secondary acks 4m later.
+        # Shrink the secondary timeout to 1m and the secondary misses too.
+        policy = parse_ack_timeout_overrides(["L2=1"], DEFAULT_POLICY)
+        result = simulate(get("latency-spike"), policy)
+        self.assertEqual(result.score.escalations, 2)
+        self.assertFalse(result.score.resolved)
+
+    def test_zero_timeout_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_ack_timeout_overrides(["0,5,10"], DEFAULT_POLICY)
+
+    def test_negative_timeout_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_ack_timeout_overrides(["primary=-3"], DEFAULT_POLICY)
+
+    def test_non_integer_timeout_is_rejected(self):
+        for bad in ("abc", "2.5", "5m"):
+            with self.assertRaises(ValueError, msg=bad):
+                parse_ack_timeout_overrides([f"primary={bad}"], DEFAULT_POLICY)
+
+    def test_wrong_number_of_positional_timeouts_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_ack_timeout_overrides(["120,300"], DEFAULT_POLICY)
+        with self.assertRaises(ValueError):
+            parse_ack_timeout_overrides(["120,300,600,900"], DEFAULT_POLICY)
+
+    def test_unknown_role_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_ack_timeout_overrides(["oncall=5"], DEFAULT_POLICY)
+
+    def test_unknown_level_number_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_ack_timeout_overrides(["L9=5"], DEFAULT_POLICY)
+
+    def test_mixing_positional_and_named_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_ack_timeout_overrides(
+                ["120,300,600", "primary=5"], DEFAULT_POLICY)
+        with self.assertRaises(ValueError):
+            parse_ack_timeout_overrides(
+                ["primary=5", "120,300,600"], DEFAULT_POLICY)
+
+    def test_duplicate_level_is_rejected(self):
+        with self.assertRaises(ValueError):
+            parse_ack_timeout_overrides(
+                ["primary=1", "L1=2"], DEFAULT_POLICY)
+
+    def test_cli_positional_overrides_appear_in_json(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "latency-spike", "--ack-timeouts",
+                                   "120,300,600", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(
+            [level["ack_timeout_min"] for level in data["policy"]["levels"]],
+            [120, 300, 600])
+        self.assertEqual(data["score"]["time_to_ack_min"], 124)
+        self.assertEqual(data["score"]["escalations"], 1)
+
+    def test_cli_named_overrides_appear_in_json(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "cert-expiry", "--ack-timeouts",
+                                   "primary=120", "manager=30", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(
+            [level["ack_timeout_min"] for level in data["policy"]["levels"]],
+            [120, 5, 30])
+
+    def test_cli_human_output_shows_effective_timeouts(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "cert-expiry", "--ack-timeouts",
+                                   "120,300,600"]), 0)
+        self.assertIn(
+            "timeouts: ana (primary) 120m, ben (secondary) 300m, "
+            "carla (manager) 600m", buf.getvalue())
+
+    def test_cli_bad_timeout_fails(self):
+        self.assertEqual(
+            main(["run", "cert-expiry", "--ack-timeouts", "primary=0"]), 2)
+        self.assertEqual(
+            main(["run", "cert-expiry", "--ack-timeouts", "abc"]), 2)
+        self.assertEqual(
+            main(["run", "cert-expiry", "--ack-timeouts", "120,300"]), 2)
+
+    def test_cli_both_timeout_flags_fail(self):
+        self.assertEqual(
+            main(["run", "cert-expiry", "--ack-timeout", "5",
+                  "--ack-timeouts", "120,300,600"]), 2)
+
+    def test_cli_overrides_apply_on_top_of_named_policy(self):
+        # fast is 2/2/5; overriding only the primary gives 10/2/5.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "cert-expiry", "--policy", "fast",
+                                   "--ack-timeouts", "primary=10", "--json"]),
+                             0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(
+            [level["ack_timeout_min"] for level in data["policy"]["levels"]],
+            [10, 2, 5])
 
 
 if __name__ == "__main__":

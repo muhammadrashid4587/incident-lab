@@ -32,6 +32,8 @@ python3 -m incident_lab run disk-full
 python3 -m incident_lab run latency-spike
 python3 -m incident_lab run disk-full --json
 python3 -m incident_lab run latency-spike --policy fast
+python3 -m incident_lab run latency-spike --ack-timeouts 120,300,600
+python3 -m incident_lab run latency-spike --ack-timeouts primary=120 L2=300
 python3 -m incident_lab run disk-full --policy-file examples/custom-policy.json
 python3 -m incident_lab run dns-outage --json > /tmp/dns-outage.json
 python3 -m incident_lab replay /tmp/dns-outage.json
@@ -84,6 +86,17 @@ policy with `run <scenario> --policy <name>`:
 
 Override the timeout for every level with `run <scenario> --ack-timeout <minutes>`.
 `--ack-timeout` applies on top of whichever policy you picked.
+
+Override timeouts per level with `run <scenario> --ack-timeouts <spec>...`,
+either as a list in level order (`--ack-timeouts 120,300,600`) or by name
+(`--ack-timeouts primary=120 L2=300`, naming a role or a 1-based level
+number). Named overrides may cover any subset and leave the rest of the
+policy alone; a positional list must cover every level. Values must be
+positive integers in minutes, and a bad value, an unknown level, or the
+wrong number of timeouts fails the run with exit code 2 and an error
+message. `--ack-timeout` and `--ack-timeouts` cannot be combined. The
+effective timeouts are printed in the run output and in the policy
+section of `run --json`.
 
 Define your own named policies in a JSON file and load them with
 `run <scenario> --policy-file <path> --policy <name>`. A file policy with
@@ -142,9 +155,10 @@ make test
 
 ## Version
 
-0.6.0 — `replay` command: re-print a timeline from a saved `--json`
-run, with the file validated on load (also fixes `__version__`, which
-was still 0.4.0 after the 0.5.0 release).
+0.7.0 — Per-level ack timeouts on the command line (`--ack-timeouts
+120,300,600` or `--ack-timeouts primary=120 L2=300`), validated, applied
+on top of any policy, and shown in the run output and the `--json`
+report.
 
 ## Roadmap
 
@@ -154,4 +168,4 @@ was still 0.4.0 after the 0.5.0 release).
 - [x] Custom policies from a JSON file (`--policy-file`) (0.4.0)
 - [x] More scenarios (queue backlog, DNS outage) (0.5.0)
 - [x] `replay` command: re-print a timeline from a saved `--json` run (0.6.0)
-- [ ] Per-level ack timeouts on the command line
+- [x] Per-level ack timeouts on the command line (0.7.0)

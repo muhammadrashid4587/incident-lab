@@ -5,7 +5,9 @@ import json
 import sys
 
 from . import __version__
-from .policy import POLICIES, list_policies, load_policy_file
+from .policy import (
+    POLICIES, list_policies, load_policy_file, parse_ack_timeout_overrides,
+)
 from .replay import load_result
 from .scenarios import get, list_scenarios
 from .simulator import simulate
@@ -17,6 +19,9 @@ def _print_result(result) -> None:
     print(f"incident: {incident.title} [{incident.severity}]")
     print(f"service:  {incident.service}")
     print(f"policy:   {result.policy.name}")
+    print("timeouts: " + ", ".join(
+        f"{level.responder.name} ({level.responder.role}) "
+        f"{level.ack_timeout_min}m" for level in result.policy.levels))
     print()
     print(result.timeline.render())
     print()
@@ -49,6 +54,10 @@ def main(argv=None) -> int:
     run.add_argument("scenario", help="scenario name (see: incident-lab list)")
     run.add_argument("--ack-timeout", type=int, default=None,
                      help="override the ack timeout (minutes) for every level")
+    run.add_argument("--ack-timeouts", nargs="+", default=None,
+                     metavar="TIMEOUTS",
+                     help="override ack timeouts per level, in level order "
+                          "(120,300,600) or by name (primary=120 L2=300)")
     run.add_argument("--policy", default=None,
                      help="escalation policy to use "
                           f"({', '.join(list_policies())})")
@@ -127,6 +136,10 @@ def main(argv=None) -> int:
             print(f"known policies: {', '.join(policies)}",
                   file=sys.stderr)
             return 2
+        if args.ack_timeout is not None and args.ack_timeouts is not None:
+            print("use only one of --ack-timeout and --ack-timeouts",
+                  file=sys.stderr)
+            return 2
         if args.ack_timeout is not None:
             from dataclasses import replace
             levels = tuple(
@@ -134,6 +147,13 @@ def main(argv=None) -> int:
                 for level in policy.levels
             )
             policy = replace(policy, levels=levels)
+        elif args.ack_timeouts is not None:
+            try:
+                policy = parse_ack_timeout_overrides(args.ack_timeouts,
+                                                     policy)
+            except ValueError as exc:
+                print(f"invalid --ack-timeouts: {exc}", file=sys.stderr)
+                return 2
         result = simulate(scenario, policy)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))
