@@ -103,6 +103,18 @@ def _timeline_from_dict(raw) -> Timeline:
     return timeline
 
 
+def _require_number_or_none(data: dict, key: str, what: str):
+    value = data.get(key)
+    if value is not None and (isinstance(value, bool)
+                              or not isinstance(value, (int, float))):
+        raise ValueError(f"replay file: {what} {key!r} must be a number "
+                         "or null")
+    if value is not None and not 0.0 <= value <= 1.0:
+        raise ValueError(f"replay file: {what} {key!r} must be between "
+                         "0 and 1")
+    return value
+
+
 def _score_from_dict(raw) -> Score:
     data = _require_mapping(raw, "score")
     escalations = data.get("escalations")
@@ -115,6 +127,10 @@ def _score_from_dict(raw) -> Score:
     points = data.get("points")
     if isinstance(points, bool) or not isinstance(points, int):
         raise ValueError("replay file: score 'points' must be an integer")
+    ack_late_min = _require_int_or_none(data, "ack_late_min", "score")
+    if ack_late_min is not None and ack_late_min < 0:
+        raise ValueError("replay file: score 'ack_late_min' must not be "
+                         "negative")
     return Score(
         time_to_ack_min=_require_int_or_none(data, "time_to_ack_min",
                                              "score"),
@@ -125,6 +141,8 @@ def _score_from_dict(raw) -> Score:
         escalations=escalations,
         resolved=resolved,
         points=points,
+        ack_late_min=ack_late_min,
+        ack_credit=_require_number_or_none(data, "ack_credit", "score"),
     )
 
 

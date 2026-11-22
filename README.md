@@ -44,7 +44,9 @@ python3 scripts/demo.py
 
 `run --json` prints the whole result as machine-readable JSON instead of
 the human replay: incident, policy (levels with responders and ack
-timeouts), the timeline in time order, and the score. Unreached milestones
+timeouts), the timeline in time order, and the score. The score carries
+the acking level's lateness (`ack_late_min`, 0 for an on-time ack) and
+the partial credit it kept (`ack_credit`, 1.0 on time). Unreached milestones
 serialize as `null` (for example, an incident nobody acks has
 `"time_to_ack_min": null` and `"points": 0`).
 
@@ -125,8 +127,17 @@ Points start at 100 and are subtracted:
 - 1 point per 2 minutes of time-to-mitigate past 15 minutes
 - an incident nobody acks scores 0
 
+A late ack still counts, but it only keeps part of the score. The ack
+credit is 1.0 up to the acking level's timeout, then decays linearly to
+0.0 at twice the timeout, and the effective score is the base score
+above scaled by that credit. The acking level's lateness
+(`ack_late_min`) and credit (`ack_credit`) are shown in the run output
+and in the score section of `run --json`.
+
 Example: `disk-full` acks in 3m and mitigates in 23m with no escalations,
-so 100 - 0 - (23-15)//2 = 96.
+so 100 - 0 - (23-15)//2 = 96. On the `fast` policy the primary's 2m
+timeout makes that a 1m-late ack, so the credit is 1 - 1/2 = 0.5 and the
+effective score is 96 × 0.5 = 48.
 
 ## Layout
 
@@ -155,10 +166,10 @@ make test
 
 ## Version
 
-0.7.0 — Per-level ack timeouts on the command line (`--ack-timeouts
-120,300,600` or `--ack-timeouts primary=120 L2=300`), validated, applied
-on top of any policy, and shown in the run output and the `--json`
-report.
+0.8.0 — Late-ack partial credit: an ack after its level's timeout still
+counts, with credit decaying linearly from 1.0 at the timeout to 0.0 at
+twice the timeout; the acking level's lateness and the credit are shown
+in the run output and in the `run --json` score.
 
 ## Roadmap
 
@@ -169,3 +180,4 @@ report.
 - [x] More scenarios (queue backlog, DNS outage) (0.5.0)
 - [x] `replay` command: re-print a timeline from a saved `--json` run (0.6.0)
 - [x] Per-level ack timeouts on the command line (0.7.0)
+- [x] Late-ack partial credit: linear decay to zero at 2x the timeout (0.8.0)

@@ -28,6 +28,10 @@ def _print_result(result) -> None:
     print("score:")
     print(f"  time-to-ack:      {score.time_to_ack_min}m"
           if score.time_to_ack_min is not None else "  time-to-ack:      -")
+    print(f"  late by:          {score.ack_late_min}m"
+          if score.ack_late_min is not None else "  late by:          -")
+    print(f"  ack credit:       {score.ack_credit:.0%}"
+          if score.ack_credit is not None else "  ack credit:       -")
     print(f"  time-to-mitigate: {score.time_to_mitigate_min}m"
           if score.time_to_mitigate_min is not None
           else "  time-to-mitigate: -")

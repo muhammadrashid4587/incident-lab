@@ -88,13 +88,17 @@ class TestPolicies(unittest.TestCase):
         self.assertEqual(result.score.time_to_ack_min, 2)
         self.assertEqual(result.score.points, 100)
 
-    def test_fast_policy_escalates_past_slow_primary(self):
-        # disk-full: primary takes 3m, past the fast 2m timeout; nobody
-        # else acks, so the incident goes unacked and scores 0.
+    def test_fast_policy_late_ack_earns_partial_credit(self):
+        # disk-full: primary takes 3m, past the fast 2m timeout, so the
+        # ack is 1m late: credit 1 - 1/2 = 0.5. Base score is
+        # 100 - (23-15)//2 = 96, so the effective score is 96 * 0.5 = 48.
         result = simulate(get("disk-full"), get_policy("fast"))
-        self.assertEqual(result.score.escalations, 2)
-        self.assertFalse(result.score.resolved)
-        self.assertEqual(result.score.points, 0)
+        self.assertEqual(result.score.escalations, 0)
+        self.assertTrue(result.score.resolved)
+        self.assertEqual(result.score.time_to_ack_min, 3)
+        self.assertEqual(result.score.ack_late_min, 1)
+        self.assertEqual(result.score.ack_credit, 0.5)
+        self.assertEqual(result.score.points, 48)
 
 
 class TestPolicyFile(unittest.TestCase):
@@ -306,6 +310,125 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(score.time_to_resolve_min, 35)
 
 
+class TestLateAckPartialCredit(unittest.TestCase):
+    def _scenario(self, delay, timeout=5, mitigate=8, resolve=5):
+        return Scenario(
+            name="late", service="svc", title="late", severity="high",
+            description="", ack_delay_min=(delay, None, None),
+            mitigate_delay_min=mitigate, resolve_delay_min=resolve,
+        )
+
+    def test_on_time_ack_keeps_full_credit(self):
+        result = simulate(get("cert-expiry"), DEFAULT_POLICY)
+        self.assertEqual(result.score.ack_late_min, 0)
+        self.assertEqual(result.score.ack_credit, 1.0)
+        self.assertEqual(result.score.points, 100)
+
+    def test_ack_exactly_at_timeout_keeps_full_credit(self):
+        result = simulate(self._scenario(5), DEFAULT_POLICY)
+        self.assertEqual(result.score.ack_late_min, 0)
+        self.assertEqual(result.score.ack_credit, 1.0)
+
+    def test_late_ack_keeps_partial_credit(self):
+        # 3m ack against a 2m timeout: 1m late, credit 1 - 1/2 = 0.5.
+        # Base score 100 - (23-15)//2 = 96, effective score 96 * 0.5 = 48.
+        result = simulate(get("disk-full"), get_policy("fast"))
+        self.assertEqual(result.score.time_to_ack_min, 3)
+        self.assertEqual(result.score.ack_late_min, 1)
+        self.assertEqual(result.score.ack_credit, 0.5)
+        self.assertEqual(result.score.points, 48)
+        self.assertTrue(result.score.resolved)
+        self.assertEqual(result.score.escalations, 0)
+
+    def test_late_ack_credit_decays_linearly(self):
+        # 7m ack against a 5m timeout: 2m late, credit 1 - 2/5 = 0.6.
+        # Base score 100 - (7-5) - (15-15)//2 = 98, effective 98 * 0.6
+        # = 58.8, rounded to 59.
+        result = simulate(self._scenario(7), DEFAULT_POLICY)
+        self.assertEqual(result.score.ack_late_min, 2)
+        self.assertAlmostEqual(result.score.ack_credit, 0.6)
+        self.assertEqual(result.score.points, 59)
+
+    def test_ack_at_twice_the_timeout_keeps_no_credit(self):
+        # 10m ack against a 5m timeout: 5m late, credit 0. The incident
+        # still resolves, but at 0 points.
+        result = simulate(self._scenario(10), DEFAULT_POLICY)
+        self.assertEqual(result.score.ack_late_min, 5)
+        self.assertEqual(result.score.ack_credit, 0.0)
+        self.assertEqual(result.score.points, 0)
+        self.assertTrue(result.score.resolved)
+        self.assertEqual(result.score.time_to_ack_min, 10)
+
+    def test_very_late_ack_keeps_no_credit(self):
+        # 15m ack against a 5m timeout: 10m late, past twice the timeout.
+        result = simulate(self._scenario(15), DEFAULT_POLICY)
+        self.assertEqual(result.score.ack_late_min, 10)
+        self.assertEqual(result.score.ack_credit, 0.0)
+        self.assertEqual(result.score.points, 0)
+        self.assertTrue(result.score.resolved)
+
+    def test_unacked_run_has_no_lateness_or_credit(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        result = simulate(scenario, DEFAULT_POLICY)
+        self.assertIsNone(result.score.ack_late_min)
+        self.assertIsNone(result.score.ack_credit)
+        self.assertEqual(result.score.points, 0)
+
+    def test_late_ack_timeline_marks_the_lateness(self):
+        result = simulate(get("disk-full"), get_policy("fast"))
+        acked = [event for event in result.timeline
+                 if event.kind == "acked"]
+        self.assertEqual(len(acked), 1)
+        self.assertEqual(acked[0].t_min, 3)
+        self.assertIn("late by 1m", acked[0].detail)
+        self.assertIn("50%", acked[0].detail)
+
+    def test_json_reports_lateness_credit_and_effective_score(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--policy", "fast", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["score"]["ack_late_min"], 1)
+        self.assertEqual(data["score"]["ack_credit"], 0.5)
+        self.assertEqual(data["score"]["points"], 48)
+        self.assertEqual(data["score"]["time_to_ack_min"], 3)
+
+    def test_console_reports_lateness_credit_and_effective_score(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--policy", "fast"]), 0)
+        out = buf.getvalue()
+        self.assertIn("late by:", out)
+        self.assertIn("1m", out)
+        self.assertIn("ack credit:", out)
+        self.assertIn("50%", out)
+        self.assertIn("48/100", out)
+
+    def test_late_ack_replay_round_trip(self):
+        original = simulate(get("disk-full"), get_policy("fast"))
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(original.to_dict(), path)
+        self.addCleanup(os.unlink, path.name)
+        loaded = load_result(path.name)
+        self.assertEqual(loaded.score.to_dict(), original.score.to_dict())
+        json_buf = io.StringIO()
+        with redirect_stdout(json_buf):
+            self.assertEqual(main(["replay", path.name]), 0)
+        run_buf = io.StringIO()
+        with redirect_stdout(run_buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--policy", "fast"]), 0)
+        self.assertEqual(json_buf.getvalue(), run_buf.getvalue())
+
+
 class TestCli(unittest.TestCase):
     def test_list_names_all_scenarios(self):
         buf = io.StringIO()
@@ -372,6 +495,8 @@ class TestJsonOutput(unittest.TestCase):
             "escalations": 0,
             "resolved": True,
             "points": 96,
+            "ack_late_min": 0,
+            "ack_credit": 1.0,
         })
 
     def test_result_to_dict_unacked_serializes_nulls(self):
@@ -569,23 +694,31 @@ class TestAckTimeoutOverrides(unittest.TestCase):
         self.assertEqual(result.score.escalations, 1)
         self.assertEqual(result.score.time_to_ack_min, 124)
 
-    def test_named_override_changes_escalation_timing(self):
-        # disk-full: primary acks in 3m, inside the standard 5m timeout.
-        # Give the primary only 1m and the incident escalates past
-        # everyone: secondary and manager never ack.
+    def test_named_override_very_late_ack_scores_zero(self):
+        # disk-full: primary acks in 3m, but the override gives the
+        # primary only 1m, so the ack is 2m late — past twice the timeout
+        # — and keeps no credit. The incident still resolves, at 0 points.
         policy = parse_ack_timeout_overrides(["primary=1"], DEFAULT_POLICY)
         result = simulate(get("disk-full"), policy)
-        self.assertEqual(result.score.escalations, 2)
-        self.assertFalse(result.score.resolved)
+        self.assertEqual(result.score.escalations, 0)
+        self.assertTrue(result.score.resolved)
+        self.assertEqual(result.score.time_to_ack_min, 3)
+        self.assertEqual(result.score.ack_late_min, 2)
+        self.assertEqual(result.score.ack_credit, 0.0)
         self.assertEqual(result.score.points, 0)
 
-    def test_level_number_override_changes_escalation_timing(self):
-        # latency-spike: primary times out at 5m, secondary acks 4m later.
-        # Shrink the secondary timeout to 1m and the secondary misses too.
+    def test_level_number_override_very_late_ack_scores_zero(self):
+        # latency-spike: primary times out at 5m, secondary acks 4m later
+        # but the override gives the secondary only 1m, so the ack is 3m
+        # late — past twice the timeout — and keeps no credit.
         policy = parse_ack_timeout_overrides(["L2=1"], DEFAULT_POLICY)
         result = simulate(get("latency-spike"), policy)
-        self.assertEqual(result.score.escalations, 2)
-        self.assertFalse(result.score.resolved)
+        self.assertEqual(result.score.escalations, 1)
+        self.assertTrue(result.score.resolved)
+        self.assertEqual(result.score.time_to_ack_min, 9)
+        self.assertEqual(result.score.ack_late_min, 3)
+        self.assertEqual(result.score.ack_credit, 0.0)
+        self.assertEqual(result.score.points, 0)
 
     def test_zero_timeout_is_rejected(self):
         with self.assertRaises(ValueError):

@@ -11,6 +11,9 @@ Scoring (0-100, documented in README.md):
 - minus 1 per minute of time-to-ack past 5 minutes
 - minus 1 per 2 minutes of time-to-mitigate past 15 minutes
 - an incident nobody acks scores 0
+- a late ack (after its level's timeout) still counts, but the score is
+  scaled by partial credit: full credit up to the timeout, then linear
+  decay to zero at twice the timeout
 """
 
 from dataclasses import dataclass
@@ -23,6 +26,22 @@ from .timeline import Timeline
 ACK_GRACE_MIN = 5
 MITIGATE_GRACE_MIN = 15
 ESCALATION_PENALTY = 15
+# A late ack earns partial credit that decays linearly to zero when the
+# ack delay reaches this many times the level's ack timeout.
+LATE_ACK_CREDIT_WINDOW = 2
+
+
+def late_ack_credit(ack_delay_min: int, ack_timeout_min: int) -> float:
+    """Partial credit for an ack that arrives after its level's timeout.
+
+    Full credit (1.0) up to the timeout, then linear decay to zero at
+    ``LATE_ACK_CREDIT_WINDOW`` times the timeout; an ack later than that
+    still counts as an ack but earns no credit.
+    """
+    if ack_delay_min <= ack_timeout_min:
+        return 1.0
+    late_min = ack_delay_min - ack_timeout_min
+    return max(0.0, 1.0 - late_min / ack_timeout_min)
 
 
 @dataclass(frozen=True)
@@ -33,6 +52,12 @@ class Score:
     escalations: int
     resolved: bool
     points: int  # 0..100
+    # Minutes past the acking level's timeout (0 for an on-time ack),
+    # or None if nobody acked.
+    ack_late_min: object = None
+    # Fraction of the score a late ack keeps: 1.0 on time, decaying
+    # linearly to 0.0 at twice the timeout; None if nobody acked.
+    ack_credit: object = None
 
     def to_dict(self) -> dict:
         """JSON-ready dict; unreached milestones serialize as null."""
@@ -43,6 +68,8 @@ class Score:
             "escalations": self.escalations,
             "resolved": self.resolved,
             "points": self.points,
+            "ack_late_min": self.ack_late_min,
+            "ack_credit": self.ack_credit,
         }
 
 
@@ -105,10 +132,19 @@ def simulate(
     for i, level in enumerate(policy.levels):
         timeline.record(t, "paged", level.responder.name, level.responder.role)
         delay = scenario.ack_delay_min[i] if i < len(scenario.ack_delay_min) else None
-        if delay is not None and delay <= level.ack_timeout_min:
+        if delay is not None:
+            # The responder acks, on time or late. A late ack still counts:
+            # the incident proceeds, but the score is scaled by partial
+            # credit that decays linearly to zero at twice the timeout.
+            ack_late_min = max(0, delay - level.ack_timeout_min)
+            ack_credit = late_ack_credit(delay, level.ack_timeout_min)
             acked_at = t + delay
             acked_by = level.responder.name
-            timeline.record(acked_at, "acked", acked_by)
+            detail = ""
+            if ack_late_min:
+                detail = (f"late by {ack_late_min}m "
+                          f"(ack credit {ack_credit:.0%})")
+            timeline.record(acked_at, "acked", acked_by, detail)
             break
         # Missed ack: wait out the timeout, then escalate (or give up).
         t += level.ack_timeout_min
@@ -141,12 +177,17 @@ def simulate(
     points -= ESCALATION_PENALTY * escalations
     points -= max(0, acked_at - ACK_GRACE_MIN)
     points -= max(0, mitigated_at - MITIGATE_GRACE_MIN) // 2
+    # A late ack keeps only part of the score: the effective score is the
+    # base score scaled by the ack credit (1.0 for an on-time ack).
+    points = max(0, round(points * ack_credit))
     score = Score(
         time_to_ack_min=acked_at,
         time_to_mitigate_min=mitigated_at,
         time_to_resolve_min=resolved_at,
         escalations=escalations,
         resolved=True,
-        points=max(0, points),
+        points=points,
+        ack_late_min=ack_late_min,
+        ack_credit=ack_credit,
     )
     return SimulationResult(incident, policy, timeline, score)
