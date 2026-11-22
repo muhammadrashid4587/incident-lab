@@ -5,7 +5,7 @@ import json
 import sys
 
 from . import __version__
-from .policy import get_policy, list_policies
+from .policy import POLICIES, list_policies, load_policy_file
 from .scenarios import get, list_scenarios
 from .simulator import simulate
 
@@ -48,9 +48,13 @@ def main(argv=None) -> int:
     run.add_argument("scenario", help="scenario name (see: incident-lab list)")
     run.add_argument("--ack-timeout", type=int, default=None,
                      help="override the ack timeout (minutes) for every level")
-    run.add_argument("--policy", default="standard",
+    run.add_argument("--policy", default=None,
                      help="escalation policy to use "
                           f"({', '.join(list_policies())})")
+    run.add_argument("--policy-file", default=None, metavar="PATH",
+                     help="load named policies from a JSON file; use one "
+                          "with --policy, or the file's only policy if it "
+                          "has exactly one")
     run.add_argument("--json", action="store_true",
                      help="print the result as JSON instead of the replay")
 
@@ -71,11 +75,34 @@ def main(argv=None) -> int:
             print(f"known scenarios: {', '.join(list_scenarios())}",
                   file=sys.stderr)
             return 2
+        policies = dict(POLICIES)
+        if args.policy_file is not None:
+            try:
+                file_policies = load_policy_file(args.policy_file)
+            except OSError as exc:
+                print(f"cannot read policy file: {exc}", file=sys.stderr)
+                return 2
+            except ValueError as exc:
+                print(f"invalid policy file: {exc}", file=sys.stderr)
+                return 2
+            policies.update(file_policies)
+        policy_name = args.policy
+        if policy_name is None:
+            if args.policy_file is not None and len(file_policies) == 1:
+                policy_name = next(iter(file_policies))
+            elif args.policy_file is not None:
+                print("policy file has more than one policy; pick one with "
+                      "--policy", file=sys.stderr)
+                print(f"policies in file: {', '.join(file_policies)}",
+                      file=sys.stderr)
+                return 2
+            else:
+                policy_name = "standard"
         try:
-            policy = get_policy(args.policy)
+            policy = policies[policy_name]
         except KeyError:
-            print(f"unknown policy: {args.policy}", file=sys.stderr)
-            print(f"known policies: {', '.join(list_policies())}",
+            print(f"unknown policy: {policy_name}", file=sys.stderr)
+            print(f"known policies: {', '.join(policies)}",
                   file=sys.stderr)
             return 2
         if args.ack_timeout is not None:

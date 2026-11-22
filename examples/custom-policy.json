@@ -1,0 +1,23 @@
+{
+  "policies": {
+    "relaxed": {
+      "levels": [
+        {
+          "ack_timeout_min": 10,
+          "name": "ana",
+          "role": "primary"
+        },
+        {
+          "ack_timeout_min": 10,
+          "name": "ben",
+          "role": "secondary"
+        },
+        {
+          "ack_timeout_min": 20,
+          "name": "carla",
+          "role": "manager"
+        }
+      ]
+    }
+  }
+}

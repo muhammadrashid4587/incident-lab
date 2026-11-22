@@ -2,12 +2,16 @@
 
 import io
 import json
+import os
+import tempfile
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
 
 from incident_lab.cli import main
-from incident_lab.policy import DEFAULT_POLICY, get_policy, list_policies
+from incident_lab.policy import (
+    DEFAULT_POLICY, get_policy, list_policies, load_policy_file,
+)
 from incident_lab.scenarios import Scenario, get, list_scenarios
 from incident_lab.simulator import simulate
 from incident_lab.timeline import Timeline
@@ -89,6 +93,148 @@ class TestPolicies(unittest.TestCase):
         self.assertEqual(result.score.escalations, 2)
         self.assertFalse(result.score.resolved)
         self.assertEqual(result.score.points, 0)
+
+
+class TestPolicyFile(unittest.TestCase):
+    def _write_policy_file(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with handle:
+            if isinstance(data, str):
+                handle.write(data)
+            else:
+                json.dump(data, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def _two_policy_data(self):
+        return {"policies": {
+            "relaxed": {"levels": [
+                {"name": "ana", "role": "primary", "ack_timeout_min": 10},
+                {"name": "ben", "role": "secondary", "ack_timeout_min": 10},
+                {"name": "carla", "role": "manager", "ack_timeout_min": 20},
+            ]},
+            "brisk": {"levels": [
+                {"name": "ana", "role": "primary", "ack_timeout_min": 1},
+                {"name": "ben", "role": "secondary", "ack_timeout_min": 1},
+            ]},
+        }}
+
+    def test_loads_named_policies_with_timeouts(self):
+        path = self._write_policy_file(self._two_policy_data())
+        policies = load_policy_file(path)
+        self.assertEqual(sorted(policies), ["brisk", "relaxed"])
+        relaxed = policies["relaxed"]
+        self.assertEqual(relaxed.name, "relaxed")
+        self.assertEqual(
+            [level.ack_timeout_min for level in relaxed.levels],
+            [10, 10, 20])
+        self.assertEqual(
+            [level.responder.name for level in relaxed.levels],
+            ["ana", "ben", "carla"])
+        self.assertEqual(
+            [level.responder.role for level in relaxed.levels],
+            ["primary", "secondary", "manager"])
+
+    def test_loaded_policy_changes_simulation(self):
+        # latency-spike: primary misses, secondary acks 4m after the
+        # primary timeout. With relaxed 10m timeouts that is 10 + 4 = 14m.
+        path = self._write_policy_file(self._two_policy_data())
+        result = simulate(get("latency-spike"),
+                          load_policy_file(path)["relaxed"])
+        self.assertEqual(result.score.escalations, 1)
+        self.assertEqual(result.score.time_to_ack_min, 14)
+
+    def test_missing_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            load_policy_file("/no/such/policy-file.json")
+
+    def test_malformed_json_raises(self):
+        path = self._write_policy_file("{not json")
+        with self.assertRaises(json.JSONDecodeError):
+            load_policy_file(path)
+
+    def test_missing_policies_key_raises(self):
+        path = self._write_policy_file({"levels": []})
+        with self.assertRaises(ValueError):
+            load_policy_file(path)
+
+    def test_empty_policies_raises(self):
+        path = self._write_policy_file({"policies": {}})
+        with self.assertRaises(ValueError):
+            load_policy_file(path)
+
+    def test_empty_levels_raises(self):
+        path = self._write_policy_file(
+            {"policies": {"empty": {"levels": []}}})
+        with self.assertRaises(ValueError):
+            load_policy_file(path)
+
+    def test_zero_timeout_raises(self):
+        path = self._write_policy_file({"policies": {"bad": {"levels": [
+            {"name": "ana", "role": "primary", "ack_timeout_min": 0},
+        ]}}})
+        with self.assertRaises(ValueError):
+            load_policy_file(path)
+
+    def test_missing_role_raises(self):
+        path = self._write_policy_file({"policies": {"bad": {"levels": [
+            {"name": "ana", "ack_timeout_min": 5},
+        ]}}})
+        with self.assertRaises(ValueError):
+            load_policy_file(path)
+
+    def test_cli_uses_file_policy_by_name(self):
+        path = self._write_policy_file(self._two_policy_data())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "cert-expiry", "--policy-file", path,
+                      "--policy", "relaxed"]), 0)
+        out = buf.getvalue()
+        self.assertIn("policy:   relaxed", out)
+        self.assertIn("100/100", out)
+
+    def test_cli_single_policy_file_needs_no_policy_flag(self):
+        path = self._write_policy_file({"policies": {
+            "relaxed": self._two_policy_data()["policies"]["relaxed"]}})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "cert-expiry", "--policy-file", path]), 0)
+        self.assertIn("policy:   relaxed", buf.getvalue())
+
+    def test_cli_multi_policy_file_without_policy_flag_fails(self):
+        path = self._write_policy_file(self._two_policy_data())
+        self.assertEqual(
+            main(["run", "cert-expiry", "--policy-file", path]), 2)
+
+    def test_cli_missing_policy_file_fails(self):
+        self.assertEqual(
+            main(["run", "cert-expiry", "--policy-file",
+                  "/no/such/policy-file.json"]), 2)
+
+    def test_cli_invalid_policy_file_fails(self):
+        path = self._write_policy_file("{not json")
+        self.assertEqual(
+            main(["run", "cert-expiry", "--policy-file", path]), 2)
+
+    def test_cli_file_policy_overrides_builtin_name(self):
+        # A file policy called "fast" wins over the built-in fast (2/2/5).
+        path = self._write_policy_file({"policies": {"fast": {"levels": [
+            {"name": "ana", "role": "primary", "ack_timeout_min": 7},
+            {"name": "ben", "role": "secondary", "ack_timeout_min": 7},
+            {"name": "carla", "role": "manager", "ack_timeout_min": 7},
+        ]}}})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "cert-expiry", "--policy-file", path,
+                      "--policy", "fast", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(
+            [level["ack_timeout_min"] for level in data["policy"]["levels"]],
+            [7, 7, 7])
 
 
 class TestTimeline(unittest.TestCase):

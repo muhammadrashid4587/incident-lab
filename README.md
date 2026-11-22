@@ -32,6 +32,7 @@ python3 -m incident_lab run disk-full
 python3 -m incident_lab run latency-spike
 python3 -m incident_lab run disk-full --json
 python3 -m incident_lab run latency-spike --policy fast
+python3 -m incident_lab run disk-full --policy-file examples/custom-policy.json
 python3 scripts/demo.py
 ```
 
@@ -66,6 +67,24 @@ policy with `run <scenario> --policy <name>`:
 Override the timeout for every level with `run <scenario> --ack-timeout <minutes>`.
 `--ack-timeout` applies on top of whichever policy you picked.
 
+Define your own named policies in a JSON file and load them with
+`run <scenario> --policy-file <path> --policy <name>`. A file policy with
+the same name as a built-in one wins. If the file holds exactly one
+policy, `--policy` is optional. See `examples/custom-policy.json`:
+
+```json
+{"policies": {"relaxed": {"levels": [
+  {"name": "ana", "role": "primary", "ack_timeout_min": 10},
+  {"name": "ben", "role": "secondary", "ack_timeout_min": 10},
+  {"name": "carla", "role": "manager", "ack_timeout_min": 20}
+]}}}
+```
+
+Levels are validated on load: each needs a non-empty `name` and `role`
+and a positive integer `ack_timeout_min`, and a policy needs at least
+one level. A missing file, bad JSON, or an invalid policy fails the run
+with exit code 2 and an error message.
+
 ## Scoring
 
 Points start at 100 and are subtracted:
@@ -92,6 +111,8 @@ tests/
   test_incident_lab.py
 scripts/
   demo.py        run every scenario, one-line summary each
+examples/
+  custom-policy.json   sample file for --policy-file
 ```
 
 ## Tests
@@ -102,15 +123,16 @@ make test
 
 ## Version
 
-0.3.0 — named escalation policies: `run <scenario> --policy fast` uses a
-tighter 2/2/5 minute chain alongside the default `standard` 5/5/10 chain.
+0.4.0 — custom policies from a JSON file: `run <scenario> --policy-file
+examples/custom-policy.json` loads named policies with per-level ack
+timeouts; a single-policy file needs no `--policy` flag.
 
 ## Roadmap
 
 - [x] Escalation policies and timeline replay (0.1.0)
 - [x] `run --json` prints the full result as JSON (0.2.0)
 - [x] Named policies: `--policy fast` with tighter ack timeouts (0.3.0)
-- [ ] Custom policies from a JSON file (`--policy-file`)
+- [x] Custom policies from a JSON file (`--policy-file`) (0.4.0)
 - [ ] More scenarios (queue backlog, DNS outage)
 - [ ] `replay` command: re-print a timeline from a saved `--json` run
 - [ ] Per-level ack timeouts on the command line
