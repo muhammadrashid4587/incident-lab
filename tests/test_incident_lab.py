@@ -12,6 +12,7 @@ from incident_lab.cli import main
 from incident_lab.policy import (
     DEFAULT_POLICY, get_policy, list_policies, load_policy_file,
 )
+from incident_lab.replay import load_result
 from incident_lab.scenarios import Scenario, get, list_scenarios
 from incident_lab.simulator import simulate
 from incident_lab.timeline import Timeline
@@ -415,6 +416,123 @@ class TestJsonOutput(unittest.TestCase):
         self.assertEqual(data["score"]["points"], 67)
         self.assertEqual(data["score"]["time_to_ack_min"], 9)
         self.assertEqual(data["score"]["escalations"], 1)
+
+
+class TestReplay(unittest.TestCase):
+    def _write_result_file(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with handle:
+            if isinstance(data, str):
+                handle.write(data)
+            else:
+                json.dump(data, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def _saved_run(self, scenario_name, policy=DEFAULT_POLICY):
+        return simulate(get(scenario_name), policy).to_dict()
+
+    def test_round_trip_rebuilds_the_same_result(self):
+        original = simulate(get("dns-outage"), DEFAULT_POLICY)
+        path = self._write_result_file(original.to_dict())
+        loaded = load_result(path)
+        self.assertEqual(loaded.incident.id, original.incident.id)
+        self.assertEqual(loaded.incident.service, "edge-dns")
+        self.assertEqual(loaded.incident.severity, "critical")
+        self.assertEqual(loaded.policy.name, "standard")
+        self.assertEqual(
+            [level.ack_timeout_min for level in loaded.policy.levels],
+            [5, 5, 10])
+        self.assertEqual(loaded.score.to_dict(), original.score.to_dict())
+        self.assertEqual(
+            [event.to_dict() for event in loaded.timeline],
+            [event.to_dict() for event in original.timeline])
+
+    def test_unacked_run_round_trips_with_nulls(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        original = simulate(scenario, DEFAULT_POLICY)
+        path = self._write_result_file(original.to_dict())
+        loaded = load_result(path)
+        self.assertFalse(loaded.score.resolved)
+        self.assertEqual(loaded.score.points, 0)
+        self.assertIsNone(loaded.score.time_to_ack_min)
+        self.assertIn("unacked", loaded.timeline.kinds())
+
+    def test_replay_output_matches_run_output(self):
+        # Save a --json run, then replay it: the human-readable output
+        # must be identical to what `run` printed for the same scenario.
+        json_buf = io.StringIO()
+        with redirect_stdout(json_buf):
+            self.assertEqual(
+                main(["run", "dns-outage", "--json"]), 0)
+        path = self._write_result_file(json_buf.getvalue())
+        replay_buf = io.StringIO()
+        with redirect_stdout(replay_buf):
+            self.assertEqual(main(["replay", path]), 0)
+        run_buf = io.StringIO()
+        with redirect_stdout(run_buf):
+            self.assertEqual(main(["run", "dns-outage"]), 0)
+        self.assertEqual(replay_buf.getvalue(), run_buf.getvalue())
+
+    def test_missing_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            load_result("/no/such/replay.json")
+
+    def test_malformed_json_raises(self):
+        path = self._write_result_file("{not json")
+        with self.assertRaises(json.JSONDecodeError):
+            load_result(path)
+
+    def test_top_level_array_raises(self):
+        path = self._write_result_file([1, 2, 3])
+        with self.assertRaises(ValueError):
+            load_result(path)
+
+    def test_missing_score_raises(self):
+        data = self._saved_run("cert-expiry")
+        del data["score"]
+        path = self._write_result_file(data)
+        with self.assertRaises(ValueError):
+            load_result(path)
+
+    def test_out_of_order_events_raise(self):
+        data = self._saved_run("cert-expiry")
+        events = data["timeline"]["events"]
+        # declared at 0m, acked at 2m: swapping them breaks time order.
+        events[0], events[2] = events[2], events[0]
+        path = self._write_result_file(data)
+        with self.assertRaises(ValueError):
+            load_result(path)
+
+    def test_bad_severity_raises(self):
+        data = self._saved_run("cert-expiry")
+        data["incident"]["severity"] = "apocalyptic"
+        path = self._write_result_file(data)
+        with self.assertRaises(ValueError):
+            load_result(path)
+
+    def test_zero_timeout_raises(self):
+        data = self._saved_run("cert-expiry")
+        data["policy"]["levels"][0]["ack_timeout_min"] = 0
+        path = self._write_result_file(data)
+        with self.assertRaises(ValueError):
+            load_result(path)
+
+    def test_cli_missing_file_fails(self):
+        self.assertEqual(main(["replay", "/no/such/replay.json"]), 2)
+
+    def test_cli_malformed_json_fails(self):
+        path = self._write_result_file("{not json")
+        self.assertEqual(main(["replay", path]), 2)
+
+    def test_cli_wrong_shape_fails(self):
+        path = self._write_result_file({"incident": {"id": "x"}})
+        self.assertEqual(main(["replay", path]), 2)
 
 
 if __name__ == "__main__":

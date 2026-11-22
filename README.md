@@ -33,6 +33,8 @@ python3 -m incident_lab run latency-spike
 python3 -m incident_lab run disk-full --json
 python3 -m incident_lab run latency-spike --policy fast
 python3 -m incident_lab run disk-full --policy-file examples/custom-policy.json
+python3 -m incident_lab run dns-outage --json > /tmp/dns-outage.json
+python3 -m incident_lab replay /tmp/dns-outage.json
 python3 scripts/demo.py
 ```
 
@@ -43,6 +45,20 @@ the human replay: incident, policy (levels with responders and ack
 timeouts), the timeline in time order, and the score. Unreached milestones
 serialize as `null` (for example, an incident nobody acks has
 `"time_to_ack_min": null` and `"points": 0`).
+
+## Replay
+
+`replay <path>` reads a JSON file saved from `run --json` and re-prints
+the timeline and score in the same human-readable format `run` uses, so
+you can review a past incident without re-running it:
+
+```sh
+python3 -m incident_lab run dns-outage --json > dns-outage.json
+python3 -m incident_lab replay dns-outage.json
+```
+
+A missing file, bad JSON, or a file that is not a saved run fails with
+exit code 2 and an error message.
 
 ## Scenarios
 
@@ -108,7 +124,8 @@ incident_lab/
   timeline.py    append-only, time-ordered event log
   scenarios.py   built-in incident scenarios
   simulator.py   deterministic simulation + scoring
-  cli.py         list / run
+  replay.py      rebuild a saved --json run for re-printing
+  cli.py         list / run / replay
 tests/
   test_incident_lab.py
 scripts/
@@ -125,8 +142,9 @@ make test
 
 ## Version
 
-0.5.0 — two new scenarios: `queue-backlog` (consumer lag on orders-queue)
-and `dns-outage` (SERVFAIL on edge-dns, failover to backup provider).
+0.6.0 — `replay` command: re-print a timeline from a saved `--json`
+run, with the file validated on load (also fixes `__version__`, which
+was still 0.4.0 after the 0.5.0 release).
 
 ## Roadmap
 
@@ -135,5 +153,5 @@ and `dns-outage` (SERVFAIL on edge-dns, failover to backup provider).
 - [x] Named policies: `--policy fast` with tighter ack timeouts (0.3.0)
 - [x] Custom policies from a JSON file (`--policy-file`) (0.4.0)
 - [x] More scenarios (queue backlog, DNS outage) (0.5.0)
-- [ ] `replay` command: re-print a timeline from a saved `--json` run
+- [x] `replay` command: re-print a timeline from a saved `--json` run (0.6.0)
 - [ ] Per-level ack timeouts on the command line

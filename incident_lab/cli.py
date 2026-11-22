@@ -6,6 +6,7 @@ import sys
 
 from . import __version__
 from .policy import POLICIES, list_policies, load_policy_file
+from .replay import load_result
 from .scenarios import get, list_scenarios
 from .simulator import simulate
 
@@ -58,6 +59,12 @@ def main(argv=None) -> int:
     run.add_argument("--json", action="store_true",
                      help="print the result as JSON instead of the replay")
 
+    replay = sub.add_parser(
+        "replay",
+        help="re-print a timeline from a saved --json run")
+    replay.add_argument("path", metavar="PATH",
+                        help="path to a JSON file saved from run --json")
+
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -65,6 +72,21 @@ def main(argv=None) -> int:
             scenario = get(name)
             print(f"{name:<20} {scenario.service:<15} "
                   f"[{scenario.severity}] {scenario.title}")
+        return 0
+
+    if args.command == "replay":
+        try:
+            result = load_result(args.path)
+        except OSError as exc:
+            print(f"cannot read replay file: {exc}", file=sys.stderr)
+            return 2
+        except json.JSONDecodeError as exc:
+            print(f"invalid replay file: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"invalid replay file: {exc}", file=sys.stderr)
+            return 2
+        _print_result(result)
         return 0
 
     if args.command == "run":
