@@ -5,7 +5,7 @@ import json
 import sys
 
 from . import __version__
-from .policy import DEFAULT_POLICY
+from .policy import get_policy, list_policies
 from .scenarios import get, list_scenarios
 from .simulator import simulate
 
@@ -48,6 +48,9 @@ def main(argv=None) -> int:
     run.add_argument("scenario", help="scenario name (see: incident-lab list)")
     run.add_argument("--ack-timeout", type=int, default=None,
                      help="override the ack timeout (minutes) for every level")
+    run.add_argument("--policy", default="standard",
+                     help="escalation policy to use "
+                          f"({', '.join(list_policies())})")
     run.add_argument("--json", action="store_true",
                      help="print the result as JSON instead of the replay")
 
@@ -68,7 +71,13 @@ def main(argv=None) -> int:
             print(f"known scenarios: {', '.join(list_scenarios())}",
                   file=sys.stderr)
             return 2
-        policy = DEFAULT_POLICY
+        try:
+            policy = get_policy(args.policy)
+        except KeyError:
+            print(f"unknown policy: {args.policy}", file=sys.stderr)
+            print(f"known policies: {', '.join(list_policies())}",
+                  file=sys.stderr)
+            return 2
         if args.ack_timeout is not None:
             from dataclasses import replace
             levels = tuple(

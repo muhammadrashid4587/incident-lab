@@ -31,6 +31,7 @@ python3 -m incident_lab list
 python3 -m incident_lab run disk-full
 python3 -m incident_lab run latency-spike
 python3 -m incident_lab run disk-full --json
+python3 -m incident_lab run latency-spike --policy fast
 python3 scripts/demo.py
 ```
 
@@ -54,8 +55,16 @@ serialize as `null` (for example, an incident nobody acks has
 ## Escalation policy
 
 The default policy (`standard`) is: primary, 5 minute ack timeout;
-secondary, 5 minutes; manager, 10 minutes. Override the timeout for every
-level with `run <scenario> --ack-timeout <minutes>`.
+secondary, 5 minutes; manager, 10 minutes. Pick a different built-in
+policy with `run <scenario> --policy <name>`:
+
+| policy | primary | secondary | manager | for |
+| ------ | ------- | --------- | ------- | --- |
+| standard | 5m | 5m | 10m | the default chain |
+| fast | 2m | 2m | 5m | critical services where paging delay costs more than a hasty escalation |
+
+Override the timeout for every level with `run <scenario> --ack-timeout <minutes>`.
+`--ack-timeout` applies on top of whichever policy you picked.
 
 ## Scoring
 
@@ -93,5 +102,15 @@ make test
 
 ## Version
 
-0.2.0 — `run --json` prints the full result (incident, policy, timeline,
-score) as JSON.
+0.3.0 — named escalation policies: `run <scenario> --policy fast` uses a
+tighter 2/2/5 minute chain alongside the default `standard` 5/5/10 chain.
+
+## Roadmap
+
+- [x] Escalation policies and timeline replay (0.1.0)
+- [x] `run --json` prints the full result as JSON (0.2.0)
+- [x] Named policies: `--policy fast` with tighter ack timeouts (0.3.0)
+- [ ] Custom policies from a JSON file (`--policy-file`)
+- [ ] More scenarios (queue backlog, DNS outage)
+- [ ] `replay` command: re-print a timeline from a saved `--json` run
+- [ ] Per-level ack timeouts on the command line

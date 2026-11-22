@@ -7,7 +7,7 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 
 from incident_lab.cli import main
-from incident_lab.policy import DEFAULT_POLICY
+from incident_lab.policy import DEFAULT_POLICY, get_policy, list_policies
 from incident_lab.scenarios import Scenario, get, list_scenarios
 from incident_lab.simulator import simulate
 from incident_lab.timeline import Timeline
@@ -59,6 +59,36 @@ class TestAckAndEscalation(unittest.TestCase):
         self.assertIsNone(result.score.time_to_ack_min)
         self.assertIn("unacked", result.timeline.kinds())
         self.assertEqual(result.score.escalations, 2)
+
+
+class TestPolicies(unittest.TestCase):
+    def test_registry_lists_both_policies(self):
+        self.assertEqual(list_policies(), ["standard", "fast"])
+        self.assertIs(get_policy("standard"), DEFAULT_POLICY)
+
+    def test_unknown_policy_raises_key_error(self):
+        with self.assertRaises(KeyError):
+            get_policy("no-such-policy")
+
+    def test_fast_policy_has_tighter_timeouts(self):
+        fast = get_policy("fast")
+        self.assertEqual(
+            [level.ack_timeout_min for level in fast.levels], [2, 2, 5])
+
+    def test_fast_policy_acks_in_time_on_quick_scenario(self):
+        # cert-expiry: primary acks in 2m, inside the fast 2m timeout.
+        result = simulate(get("cert-expiry"), get_policy("fast"))
+        self.assertEqual(result.score.escalations, 0)
+        self.assertEqual(result.score.time_to_ack_min, 2)
+        self.assertEqual(result.score.points, 100)
+
+    def test_fast_policy_escalates_past_slow_primary(self):
+        # disk-full: primary takes 3m, past the fast 2m timeout; nobody
+        # else acks, so the incident goes unacked and scores 0.
+        result = simulate(get("disk-full"), get_policy("fast"))
+        self.assertEqual(result.score.escalations, 2)
+        self.assertFalse(result.score.resolved)
+        self.assertEqual(result.score.points, 0)
 
 
 class TestTimeline(unittest.TestCase):
@@ -127,6 +157,29 @@ class TestCli(unittest.TestCase):
 
     def test_run_unknown_scenario_fails(self):
         self.assertEqual(main(["run", "no-such-scenario"]), 2)
+
+    def test_run_fast_policy_changes_outcome(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "cert-expiry", "--policy", "fast"]),
+                             0)
+        out = buf.getvalue()
+        self.assertIn("policy:   fast", out)
+        self.assertIn("100/100", out)
+
+    def test_run_fast_policy_json_names_policy(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "cert-expiry", "--policy", "fast", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["policy"]["name"], "fast")
+        self.assertEqual(
+            [level["ack_timeout_min"] for level in data["policy"]["levels"]],
+            [2, 2, 5])
+
+    def test_run_unknown_policy_fails(self):
+        self.assertEqual(main(["run", "cert-expiry", "--policy", "bogus"]), 2)
 
 
 class TestJsonOutput(unittest.TestCase):
