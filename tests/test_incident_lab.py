@@ -275,6 +275,26 @@ class TestScoring(unittest.TestCase):
         self.assertEqual(
             simulate(get("deploy-regression"), DEFAULT_POLICY).score.points,
             36)
+        # queue-backlog: ack 4m, mitigate 29m, no escalations ->
+        # 100 - 0 - (29-15)//2 = 93.
+        self.assertEqual(
+            simulate(get("queue-backlog"), DEFAULT_POLICY).score.points, 93)
+        # dns-outage: ack 8m, mitigate 48m, 1 escalation ->
+        # 100 - 15 - (8-5) - (48-15)//2 = 66.
+        self.assertEqual(
+            simulate(get("dns-outage"), DEFAULT_POLICY).score.points, 66)
+
+    def test_new_scenarios_fields_match_timeline(self):
+        queue = simulate(get("queue-backlog"), DEFAULT_POLICY).score
+        self.assertEqual(queue.time_to_ack_min, 4)
+        self.assertEqual(queue.time_to_mitigate_min, 29)
+        self.assertEqual(queue.time_to_resolve_min, 44)
+        self.assertEqual(queue.escalations, 0)
+        dns = simulate(get("dns-outage"), DEFAULT_POLICY).score
+        self.assertEqual(dns.time_to_ack_min, 8)
+        self.assertEqual(dns.time_to_mitigate_min, 48)
+        self.assertEqual(dns.time_to_resolve_min, 73)
+        self.assertEqual(dns.escalations, 1)
 
     def test_score_fields_match_timeline(self):
         result = simulate(get("disk-full"), DEFAULT_POLICY)

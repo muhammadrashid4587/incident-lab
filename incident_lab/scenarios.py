@@ -79,6 +79,34 @@ SCENARIOS = {
         mitigate_delay_min=45,
         resolve_delay_min=30,
     ),
+    "queue-backlog": Scenario(
+        name="queue-backlog",
+        service="orders-queue",
+        title="Consumer lag over 2M messages on orders-queue",
+        severity="high",
+        description=(
+            "Order processing is falling behind: consumer lag passed 2M "
+            "messages after a downstream slowdown. The primary acks in "
+            "4m and scales up consumers to drain the backlog."
+        ),
+        ack_delay_min=(4, None, None),
+        mitigate_delay_min=25,
+        resolve_delay_min=15,
+    ),
+    "dns-outage": Scenario(
+        name="dns-outage",
+        service="edge-dns",
+        title="DNS resolution failing for edge-dns",
+        severity="critical",
+        description=(
+            "Authoritative DNS is returning SERVFAIL for customer domains. "
+            "The primary misses the page; the secondary acks in 3m and "
+            "fails over to the backup DNS provider."
+        ),
+        ack_delay_min=(None, 3, None),
+        mitigate_delay_min=40,
+        resolve_delay_min=25,
+    ),
 }
 
 

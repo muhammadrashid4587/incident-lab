@@ -52,6 +52,8 @@ serialize as `null` (for example, an incident nobody acks has
 | latency-spike | checkout-api | critical | primary misses the page, secondary acks in 4m |
 | cert-expiry | edge-tls | high | primary acks in 2m, quick fix |
 | deploy-regression | search-api | critical | primary and secondary miss, manager acks in 6m |
+| queue-backlog | orders-queue | high | primary acks in 4m, scales consumers to drain backlog |
+| dns-outage | edge-dns | critical | primary misses the page, secondary acks in 3m, fails over |
 
 ## Escalation policy
 
@@ -123,9 +125,8 @@ make test
 
 ## Version
 
-0.4.0 — custom policies from a JSON file: `run <scenario> --policy-file
-examples/custom-policy.json` loads named policies with per-level ack
-timeouts; a single-policy file needs no `--policy` flag.
+0.5.0 — two new scenarios: `queue-backlog` (consumer lag on orders-queue)
+and `dns-outage` (SERVFAIL on edge-dns, failover to backup provider).
 
 ## Roadmap
 
@@ -133,6 +134,6 @@ timeouts; a single-policy file needs no `--policy` flag.
 - [x] `run --json` prints the full result as JSON (0.2.0)
 - [x] Named policies: `--policy fast` with tighter ack timeouts (0.3.0)
 - [x] Custom policies from a JSON file (`--policy-file`) (0.4.0)
-- [ ] More scenarios (queue backlog, DNS outage)
+- [x] More scenarios (queue backlog, DNS outage) (0.5.0)
 - [ ] `replay` command: re-print a timeline from a saved `--json` run
 - [ ] Per-level ack timeouts on the command line
