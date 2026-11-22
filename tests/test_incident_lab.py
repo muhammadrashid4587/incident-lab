@@ -1,6 +1,7 @@
 """Tests for incident-lab."""
 
 import io
+import json
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
@@ -126,6 +127,75 @@ class TestCli(unittest.TestCase):
 
     def test_run_unknown_scenario_fails(self):
         self.assertEqual(main(["run", "no-such-scenario"]), 2)
+
+
+class TestJsonOutput(unittest.TestCase):
+    def test_event_and_timeline_to_dict(self):
+        timeline = Timeline()
+        timeline.record(0, "declared", "monitor", "disk 97% full")
+        timeline.record(3, "acked", "ana")
+        data = timeline.to_dict()
+        self.assertEqual(data, {"events": [
+            {"t_min": 0, "kind": "declared", "actor": "monitor",
+             "detail": "disk 97% full"},
+            {"t_min": 3, "kind": "acked", "actor": "ana", "detail": ""},
+        ]})
+
+    def test_score_to_dict_known_values(self):
+        # disk-full: ack 3m, mitigate 23m, resolve 35m, no escalations, 96.
+        score = simulate(get("disk-full"), DEFAULT_POLICY).score.to_dict()
+        self.assertEqual(score, {
+            "time_to_ack_min": 3,
+            "time_to_mitigate_min": 23,
+            "time_to_resolve_min": 35,
+            "escalations": 0,
+            "resolved": True,
+            "points": 96,
+        })
+
+    def test_result_to_dict_unacked_serializes_nulls(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        data = simulate(scenario, DEFAULT_POLICY).to_dict()
+        self.assertIsNone(data["score"]["time_to_ack_min"])
+        self.assertIsNone(data["score"]["time_to_mitigate_min"])
+        self.assertIsNone(data["score"]["time_to_resolve_min"])
+        self.assertEqual(data["score"]["points"], 0)
+        self.assertFalse(data["score"]["resolved"])
+        self.assertEqual(data["incident"]["id"], "ghost")
+        self.assertEqual(data["policy"]["name"], "standard")
+        self.assertEqual(len(data["policy"]["levels"]), 3)
+        self.assertEqual(data["policy"]["levels"][0]["responder"]["name"],
+                         "ana")
+        self.assertEqual(data["policy"]["levels"][0]["ack_timeout_min"], 5)
+        # JSON round-trip: nulls survive.
+        self.assertEqual(json.loads(json.dumps(data)), data)
+
+    def test_run_json_output_parses_and_matches_human_values(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "cert-expiry", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["incident"]["id"], "cert-expiry")
+        self.assertEqual(data["incident"]["service"], "edge-tls")
+        self.assertEqual(data["incident"]["severity"], "high")
+        self.assertEqual(data["score"]["points"], 100)
+        self.assertEqual(data["score"]["time_to_ack_min"], 2)
+        self.assertEqual(
+            [event["kind"] for event in data["timeline"]["events"]],
+            ["declared", "paged", "acked", "mitigated", "resolved"])
+
+    def test_run_json_latency_spike_values(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "latency-spike", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["score"]["points"], 67)
+        self.assertEqual(data["score"]["time_to_ack_min"], 9)
+        self.assertEqual(data["score"]["escalations"], 1)
 
 
 if __name__ == "__main__":

@@ -34,6 +34,17 @@ class Score:
     resolved: bool
     points: int  # 0..100
 
+    def to_dict(self) -> dict:
+        """JSON-ready dict; unreached milestones serialize as null."""
+        return {
+            "time_to_ack_min": self.time_to_ack_min,
+            "time_to_mitigate_min": self.time_to_mitigate_min,
+            "time_to_resolve_min": self.time_to_resolve_min,
+            "escalations": self.escalations,
+            "resolved": self.resolved,
+            "points": self.points,
+        }
+
 
 @dataclass
 class SimulationResult:
@@ -41,6 +52,33 @@ class SimulationResult:
     policy: EscalationPolicy
     timeline: Timeline
     score: Score
+
+    def to_dict(self) -> dict:
+        """JSON-ready dict of the whole result: incident, policy, timeline, score."""
+        return {
+            "incident": {
+                "id": self.incident.id,
+                "service": self.incident.service,
+                "title": self.incident.title,
+                "severity": self.incident.severity,
+                "description": self.incident.description,
+            },
+            "policy": {
+                "name": self.policy.name,
+                "levels": [
+                    {
+                        "responder": {
+                            "name": level.responder.name,
+                            "role": level.responder.role,
+                        },
+                        "ack_timeout_min": level.ack_timeout_min,
+                    }
+                    for level in self.policy.levels
+                ],
+            },
+            "timeline": self.timeline.to_dict(),
+            "score": self.score.to_dict(),
+        }
 
 
 def simulate(

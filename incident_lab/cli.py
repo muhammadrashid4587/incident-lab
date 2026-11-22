@@ -1,6 +1,7 @@
 """CLI for incident-lab: list scenarios, run one, print timeline + score."""
 
 import argparse
+import json
 import sys
 
 from . import __version__
@@ -47,6 +48,8 @@ def main(argv=None) -> int:
     run.add_argument("scenario", help="scenario name (see: incident-lab list)")
     run.add_argument("--ack-timeout", type=int, default=None,
                      help="override the ack timeout (minutes) for every level")
+    run.add_argument("--json", action="store_true",
+                     help="print the result as JSON instead of the replay")
 
     args = parser.parse_args(argv)
 
@@ -73,7 +76,11 @@ def main(argv=None) -> int:
                 for level in policy.levels
             )
             policy = replace(policy, levels=levels)
-        _print_result(simulate(scenario, policy))
+        result = simulate(scenario, policy)
+        if args.json:
+            print(json.dumps(result.to_dict(), indent=2))
+        else:
+            _print_result(result)
         return 0
 
     return 0

@@ -15,6 +15,15 @@ class Event:
     actor: str
     detail: str = ""
 
+    def to_dict(self) -> dict:
+        """JSON-ready dict for one event."""
+        return {
+            "t_min": self.t_min,
+            "kind": self.kind,
+            "actor": self.actor,
+            "detail": self.detail,
+        }
+
 
 class Timeline:
     """An ordered log of events for one incident."""
@@ -50,3 +59,7 @@ class Timeline:
                 line += f"  {event.detail}"
             lines.append(line)
         return "\n".join(lines)
+
+    def to_dict(self) -> dict:
+        """JSON-ready dict: events in time order."""
+        return {"events": [event.to_dict() for event in self.events]}

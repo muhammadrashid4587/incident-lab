@@ -30,8 +30,17 @@ the scenario, not by real humans.
 python3 -m incident_lab list
 python3 -m incident_lab run disk-full
 python3 -m incident_lab run latency-spike
+python3 -m incident_lab run disk-full --json
 python3 scripts/demo.py
 ```
+
+## JSON output
+
+`run --json` prints the whole result as machine-readable JSON instead of
+the human replay: incident, policy (levels with responders and ack
+timeouts), the timeline in time order, and the score. Unreached milestones
+serialize as `null` (for example, an incident nobody acks has
+`"time_to_ack_min": null` and `"points": 0`).
 
 ## Scenarios
 
@@ -84,4 +93,5 @@ make test
 
 ## Version
 
-0.1.0
+0.2.0 — `run --json` prints the full result (incident, policy, timeline,
+score) as JSON.
