@@ -39,6 +39,9 @@ python3 -m incident_lab run latency-spike --difficulty 3 --seed 7 --json
 python3 -m incident_lab run latency-spike --ack-timeouts 120,300,600
 python3 -m incident_lab run latency-spike --ack-timeouts primary=120 L2=300
 python3 -m incident_lab run disk-full --policy-file examples/custom-policy.json
+python3 -m incident_lab policy-template > my-policy.json
+python3 -m incident_lab policy-template fast --out my-fast-policy.json
+python3 -m incident_lab run disk-full --policy-file my-policy.json
 python3 -m incident_lab run dns-outage --json > /tmp/dns-outage.json
 python3 -m incident_lab run disk-full --seed 7 --json
 python3 -m incident_lab run disk-full --seed 7 --jitter 0-3 --json
@@ -339,6 +342,40 @@ and a positive integer `ack_timeout_min`, and a policy needs at least
 one level. A missing file, bad JSON, or an invalid policy fails the run
 with exit code 2 and an error message.
 
+## Policy templates
+
+`policy-template [name]` prints a built-in policy as a starter JSON
+policy file — the same shape `--policy-file` loads — so you can save
+it, edit it, and pass it back:
+
+```sh
+python3 -m incident_lab policy-template > my-policy.json
+python3 -m incident_lab policy-template fast --out my-fast-policy.json
+python3 -m incident_lab run disk-full --policy-file my-policy.json
+```
+
+With no name it templates the `standard` policy; `fast` templates the
+tighter chain. `--out PATH` writes the file directly instead of
+printing it. The template is validated through the same loader a
+policy file goes through, so it always loads cleanly — what you edit
+is up to you:
+
+- **timeouts**: change any level's `ack_timeout_min`, or the
+  responders' names and roles. The template's timeouts are the
+  normal-difficulty values; `--difficulty` still scales them
+  (×1.5 on easy, ×0.6 on hard), exactly as for a built-in policy.
+- **escalation rules**: the level order is the escalation order —
+  page the first level, wait out its timeout, escalate to the next.
+  Add a level to page someone else before the manager, or drop one
+  to shorten the chain (a policy needs at least one level).
+- **name**: rename the policy in the file to whatever you want to
+  call it, and pick it with `run --policy <name>` (or leave
+  `--policy` off when the file holds exactly one policy).
+
+An unknown policy name, or an unwritable `--out` path, fails with
+exit code 2 and an error message. A file you edited into an invalid
+shape fails the same way when a run loads it.
+
 ## Scoring
 
 Points start at 100 and are subtracted:
@@ -435,8 +472,8 @@ incident_lab/
   whatif.py      what-if replay: re-simulate a saved run with
                  overridden ack timeouts, difficulty or policy, show
                  how the score and grade would have changed
-  cli.py         list / run / replay / debrief / compare / stats /
-                 what-if
+  cli.py         list / template / policy-template / run / replay /
+                 debrief / compare / stats / what-if
 tests/
   test_incident_lab.py
 scripts/
@@ -497,12 +534,12 @@ human-readable form.
 
 ## Version
 
-0.21.0 — compare and stats accept what-if replay outputs: `compare`
-and `stats` take saved `what-if --json` files alongside normal runs,
-compare what-if replays against each other and against their base
-runs, and aggregate what-if runs in stats, flagging them as what-if
-with their overrides and points delta recorded; a what-if file whose
-points delta does not match its runs' scores is rejected.
+0.22.0 — `policy-template` command: `incident-lab policy-template
+[name]` prints a built-in policy as a starter JSON policy file (or
+writes it with `--out PATH`), ready to edit and pass back with
+`--policy-file`; the template is validated through the policy loader
+so it always loads cleanly, and an edited template used in a run
+applies its timeouts.
 
 ## Roadmap
 
@@ -527,3 +564,4 @@ points delta does not match its runs' scores is rejected.
 - [x] What-if replay: `what-if <saved-run.json> --ack-timeout N | --ack-timeouts ... | --difficulty X` re-simulates a saved run with overridden parameters and shows how the score and grade would have changed (human form or `--json`); the incident's behaviour is rebuilt from the saved run's own recorded delays, a seeded run's jitter is not drawn again, hints are kept, and the original run file is never modified (0.19.0)
 - [x] What-if replay against a different named policy: `what-if <saved-run.json> --policy <name>` (built-in, or from `--policy-file`) re-simulates the saved run under that policy and shows how the score and grade would have changed; the new policy's timeouts are scaled to the original run's difficulty unless `--difficulty` is also given, an unknown policy name fails with exit code 2, and the original run file is never modified (0.20.0)
 - [x] Compare and stats accept what-if replay outputs: `compare` and `stats` take saved `what-if --json` files alongside normal runs, compare what-if replays against each other and against their base runs, and aggregate what-if runs in stats, flagging them as what-if with their overrides and points delta recorded; a what-if file whose points delta does not match its runs' scores is rejected (0.21.0)
+- [x] Policy template command: `policy-template [name]` prints a built-in policy as a starter JSON policy file (or writes it with `--out PATH`), ready to edit and pass back with `--policy-file`; the template is validated through the policy loader so it always loads cleanly (0.22.0)

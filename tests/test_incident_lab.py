@@ -19,6 +19,7 @@ from incident_lab.difficulty import (
 from incident_lab.policy import (
     DEFAULT_POLICY, EscalationPolicy, Level, Responder, get_policy,
     list_policies, load_policy_file, parse_ack_timeout_overrides,
+    policy_template, policy_to_dict,
 )
 from incident_lab.replay import load_result, load_saved
 from incident_lab.scenarios import (
@@ -252,6 +253,105 @@ class TestPolicyFile(unittest.TestCase):
         self.assertEqual(
             [level["ack_timeout_min"] for level in data["policy"]["levels"]],
             [7, 7, 7])
+
+
+class TestPolicyTemplates(unittest.TestCase):
+    def _write_policy_file(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with handle:
+            if isinstance(data, str):
+                handle.write(data)
+            else:
+                json.dump(data, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_policy_to_dict_matches_standard_policy(self):
+        self.assertEqual(policy_to_dict(DEFAULT_POLICY), {"levels": [
+            {"name": "ana", "role": "primary", "ack_timeout_min": 5},
+            {"name": "ben", "role": "secondary", "ack_timeout_min": 5},
+            {"name": "carla", "role": "manager", "ack_timeout_min": 10},
+        ]})
+
+    def test_policy_template_defaults_to_standard(self):
+        self.assertEqual(policy_template("standard"), {"policies": {
+            "standard": policy_to_dict(DEFAULT_POLICY)}})
+
+    def test_policy_template_uses_fast_timeouts(self):
+        data = policy_template("fast")
+        self.assertEqual(
+            [level["ack_timeout_min"]
+             for level in data["policies"]["fast"]["levels"]],
+            [2, 2, 5])
+
+    def test_policy_template_unknown_policy_raises(self):
+        with self.assertRaises(KeyError):
+            policy_template("no-such-policy")
+
+    def test_cli_policy_template_prints_shareable_json(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["policy-template"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data, {"policies": {
+            "standard": policy_to_dict(DEFAULT_POLICY)}})
+
+    def test_cli_policy_template_round_trips_through_policy_file(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["policy-template", "fast"]), 0)
+        path = self._write_policy_file(buf.getvalue())
+        policies = load_policy_file(path)
+        self.assertEqual(policies["fast"], get_policy("fast"))
+
+    def test_cli_policy_template_unknown_policy_fails(self):
+        self.assertEqual(main(["policy-template", "no-such-policy"]), 2)
+
+    def test_cli_policy_template_out_writes_file(self):
+        path = os.path.join(tempfile.gettempdir(),
+                            "incident-lab-policy-template.json")
+        self.addCleanup(lambda: os.path.exists(path) and os.unlink(path))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["policy-template", "standard", "--out", path]), 0)
+        self.assertIn("wrote policy template", buf.getvalue())
+        self.assertIn(path, buf.getvalue())
+        policies = load_policy_file(path)
+        self.assertEqual(policies["standard"], DEFAULT_POLICY)
+
+    def test_cli_policy_template_out_bad_path_fails(self):
+        self.assertEqual(
+            main(["policy-template", "--out", "/no/such/dir/policy.json"]),
+            2)
+
+    def test_template_can_be_edited_and_used_for_a_run(self):
+        # The whole point of the template: save it, edit a timeout,
+        # pass it back with --policy-file and the run uses the edit.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["policy-template"]), 0)
+        data = json.loads(buf.getvalue())
+        data["policies"]["standard"]["levels"][0]["ack_timeout_min"] = 1
+        path = self._write_policy_file(data)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--policy-file", path,
+                      "--json"]), 0)
+        run_data = json.loads(buf.getvalue())
+        self.assertEqual(
+            [level["ack_timeout_min"]
+             for level in run_data["policy"]["levels"]],
+            [1, 5, 10])
+        # disk-full's primary acks in 3m, past the edited 1m timeout:
+        # a late ack still counts (no escalation), but it is 2m late
+        # against a 1m timeout, so the credit decays to zero.
+        self.assertEqual(run_data["score"]["escalations"], 0)
+        self.assertEqual(run_data["score"]["ack_late_min"], 2)
+        self.assertEqual(run_data["score"]["ack_credit"], 0.0)
+        self.assertEqual(run_data["score"]["points"], 0)
 
 
 class TestTimeline(unittest.TestCase):

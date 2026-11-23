@@ -220,6 +220,40 @@ def _policy_from_dict(name: str, data) -> EscalationPolicy:
     return EscalationPolicy(name=name, levels=tuple(levels))
 
 
+def policy_to_dict(policy: EscalationPolicy) -> dict:
+    """JSON-ready dict of a policy (its name is the key it sits under).
+
+    The shape matches one entry of a policy file, so the output of
+    ``policy-template`` can be saved and used with ``--policy-file``
+    as-is.
+    """
+    return {
+        "levels": [
+            {"name": level.responder.name,
+             "role": level.responder.role,
+             "ack_timeout_min": level.ack_timeout_min}
+            for level in policy.levels
+        ]
+    }
+
+
+def policy_template(name: str) -> dict:
+    """Starter policy file for a built-in policy, as a JSON-ready dict.
+
+    Returns ``{"policies": {name: ...}}`` with the named built-in
+    policy's levels, ready to save, edit (rename it, change the
+    timeouts, add or drop levels) and load back with
+    ``--policy-file``. The generated dict is validated through the
+    same loader a policy file goes through, so a template always
+    loads cleanly. Raises KeyError for an unknown policy name.
+    """
+    policy = get_policy(name)
+    data = {"policies": {name: policy_to_dict(policy)}}
+    # Validate the template the same way a saved file is validated.
+    _policy_from_dict(name, data["policies"][name])
+    return data
+
+
 def load_policy_file(path: str) -> dict:
     """Load named policies from a JSON file.
 

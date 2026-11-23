@@ -12,6 +12,7 @@ from .difficulty import (
 )
 from .policy import (
     POLICIES, list_policies, load_policy_file, parse_ack_timeout_overrides,
+    policy_template,
 )
 from .replay import load_result, load_saved
 from .scenarios import (
@@ -184,6 +185,18 @@ def main(argv=None) -> int:
     template.add_argument("scenario",
                           help="scenario name (see: incident-lab list)")
 
+    policy_template_parser = sub.add_parser(
+        "policy-template",
+        help="print a built-in policy as a starter JSON policy file, "
+             "ready to edit and use with run --policy-file")
+    policy_template_parser.add_argument(
+        "policy", nargs="?", default="standard",
+        help="policy name to base the template on "
+             f"({', '.join(list_policies())}); default standard")
+    policy_template_parser.add_argument(
+        "--out", default=None, metavar="PATH",
+        help="write the template to this file instead of printing it")
+
     run = sub.add_parser("run", help="run one scenario and print the replay")
     run.add_argument("scenario", help="scenario name (see: incident-lab list)")
     run.add_argument("--scenario-file", default=None, metavar="PATH",
@@ -331,6 +344,29 @@ def main(argv=None) -> int:
         print(json.dumps(
             {"scenarios": {scenario.name: scenario_to_dict(scenario)}},
             indent=2))
+        return 0
+
+    if args.command == "policy-template":
+        try:
+            data = policy_template(args.policy)
+        except KeyError:
+            print(f"unknown policy: {args.policy}", file=sys.stderr)
+            print(f"known policies: {', '.join(list_policies())}",
+                  file=sys.stderr)
+            return 2
+        text = json.dumps(data, indent=2)
+        if args.out is not None:
+            try:
+                with open(args.out, "w", encoding="utf-8") as handle:
+                    handle.write(text + "\n")
+            except OSError as exc:
+                print(f"cannot write policy template: {exc}",
+                      file=sys.stderr)
+                return 2
+            print(f"wrote policy template for {args.policy!r} "
+                  f"to {args.out}")
+            return 0
+        print(text)
         return 0
 
     if args.command == "replay":
