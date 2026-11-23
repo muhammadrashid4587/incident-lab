@@ -15,6 +15,12 @@ the impact grows to the next stage, so a SEV-1 that nobody acks
 quickly gets worse while the chain walks. Scenarios without stages
 have no impact progression; the chain records an empty impact for
 them.
+
+A scenario may also carry ``slo_percent``: the service's SLO target
+(99.9, say). The incident's downtime — declaration to mitigated —
+is reported against the monthly error budget that SLO allows, as
+error-budget burn in percent; a scenario without an SLO reports no
+burn.
 """
 
 from dataclasses import dataclass
@@ -44,6 +50,11 @@ class Scenario:
     # incident is declared, index 1 after the first missed level, and
     # so on. Empty means the scenario has no impact progression.
     impact_stages: tuple = ()
+    # The service's SLO target in percent (99.9, say), or None when the
+    # scenario carries no SLO. The monthly error budget is
+    # (100 - SLO)% of a 30-day month; the incident's downtime is
+    # reported against it as error-budget burn.
+    slo_percent: object = None
 
 
 SCENARIOS = {
@@ -59,6 +70,7 @@ SCENARIOS = {
         ack_delay_min=(3, None, None),
         mitigate_delay_min=20,
         resolve_delay_min=12,
+        slo_percent=99.9,
         hints=(
             "Check WAL archiving: a stalled archiver is the usual cause "
             "of disk growth after a deploy.",
@@ -80,6 +92,7 @@ SCENARIOS = {
         ack_delay_min=(None, 4, None),
         mitigate_delay_min=35,
         resolve_delay_min=20,
+        slo_percent=99.95,
         hints=(
             "Check the downstream dependency first: a latency spike "
             "with no deploys is usually a slow database or queue.",
@@ -101,6 +114,7 @@ SCENARIOS = {
         ack_delay_min=(2, None, None),
         mitigate_delay_min=8,
         resolve_delay_min=5,
+        slo_percent=99.9,
         hints=(
             "Renew the certificate by hand first; fix the silent renewal "
             "job after the incident is over.",
@@ -120,6 +134,7 @@ SCENARIOS = {
         ack_delay_min=(None, None, 6),
         mitigate_delay_min=45,
         resolve_delay_min=30,
+        slo_percent=99.9,
         hints=(
             "Roll back the deploy first: an 18% error rate starting "
             "right after a deploy is the deploy until proven otherwise.",
@@ -142,6 +157,7 @@ SCENARIOS = {
         ack_delay_min=(4, None, None),
         mitigate_delay_min=25,
         resolve_delay_min=15,
+        slo_percent=99.5,
         hints=(
             "Scale the consumers up before anything else: lag drains "
             "only as fast as consumption, and the backlog is the "
@@ -165,6 +181,7 @@ SCENARIOS = {
         ack_delay_min=(None, 3, None),
         mitigate_delay_min=40,
         resolve_delay_min=25,
+        slo_percent=99.99,
         hints=(
             "Fail over to the backup DNS provider first; DNS is "
             "foundational, and every minute down blocks everything "
@@ -192,6 +209,7 @@ SCENARIOS = {
         ack_delay_min=(None, None, 4),
         mitigate_delay_min=50,
         resolve_delay_min=30,
+        slo_percent=99.9,
         hints=(
             "Fail over to the standby payments cluster first; "
             "checkout is down and every minute costs revenue.",
@@ -237,6 +255,7 @@ def scenario_to_dict(scenario: Scenario) -> dict:
         "resolve_delay_min": scenario.resolve_delay_min,
         "hints": list(scenario.hints),
         "impact_stages": list(scenario.impact_stages),
+        "slo_percent": scenario.slo_percent,
     }
 
 
@@ -298,7 +317,28 @@ def _scenario_from_dict(name: str, data) -> Scenario:
             data, "resolve_delay_min", name),
         hints=tuple(_require_hints(data, name)),
         impact_stages=tuple(_require_impact_stages(data, name)),
+        slo_percent=_require_slo(data, name),
     )
+
+
+def _require_slo(data: dict, name: str) -> object:
+    """Validate a scenario file's optional ``slo_percent``.
+
+    Absent (or null) means the scenario carries no SLO and no
+    error-budget burn is reported. Present it must be a number
+    between 90 (inclusive) and 100 (exclusive): an SLO of 100% allows
+    no downtime at all, so there is no budget to burn against, and
+    anything below 90% is not an SLO worth tracking.
+    """
+    raw = data.get("slo_percent")
+    if raw is None:
+        return None
+    if (isinstance(raw, bool) or not isinstance(raw, (int, float))
+            or not 90 <= raw < 100):
+        raise ValueError(
+            f"scenario {name!r}: 'slo_percent' must be a number from "
+            f"90 up to (but not including) 100, got {raw!r}")
+    return raw
 
 
 def _require_impact_stages(data: dict, name: str) -> list:

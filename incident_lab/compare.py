@@ -24,6 +24,9 @@ _SCORE_FIELDS = [
     ("escalations", "escalations", ""),
     ("ack_late_min", "late by", "m"),
     ("ack_credit", "ack credit", ""),
+    # Error-budget burn is a percent number (115.7), not a fraction,
+    # so it formats as "115.7%" rather than like ack_credit.
+    ("error_budget_burn_pct", "error budget burn", "%"),
 ]
 
 
@@ -136,9 +139,9 @@ class Comparison:
         lines.append("")
         lines.append("score:")
         for row in self.score_rows:
-            a = _fmt_value(row["a"], row["unit"])
-            b = _fmt_value(row["b"], row["unit"])
-            delta = _fmt_delta(row["delta"], row["unit"])
+            a = _fmt_value(row["a"], row["unit"], row["metric"])
+            b = _fmt_value(row["b"], row["unit"], row["metric"])
+            delta = _fmt_delta(row["delta"], row["unit"], row["metric"])
             lines.append(f"  {row['label']:<17} A: {a:<8} B: {b:<8} "
                          f"Δ: {delta}")
         lines.append("")
@@ -178,17 +181,21 @@ class Comparison:
         return "\n".join(lines)
 
 
-def _fmt_value(value, unit: str) -> str:
+def _fmt_value(value, unit: str, metric: str = "") -> str:
     if value is None:
         return "-"
+    if metric == "error_budget_burn_pct":
+        return f"{value:.1f}%"
     if isinstance(value, float):
         return f"{value:.0%}"
     return f"{value}{unit}"
 
 
-def _fmt_delta(delta, unit: str) -> str:
+def _fmt_delta(delta, unit: str, metric: str = "") -> str:
     if delta is None:
         return "-"
+    if metric == "error_budget_burn_pct":
+        return f"{delta:+.1f}%"
     if isinstance(delta, float):
         return f"{delta:+.0%}"
     return f"{delta:+d}{unit}"

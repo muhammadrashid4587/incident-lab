@@ -24,6 +24,11 @@ Scoring (0-100, documented in README.md):
   whose impact grew while the page went unanswered shows that growth
   in the run JSON, and `replay`, `debrief`, `compare` and `stats` all
   see it
+- error-budget burn: a scenario carries an SLO target (``slo_percent``,
+  e.g. 99.9); the monthly error budget is the allowed downtime in a
+  30-day month, and the incident's downtime (declaration to mitigated)
+  is reported as a percentage of that budget — over 100% means this one
+  incident spent the whole month's budget
 """
 
 from dataclasses import dataclass, field
@@ -55,6 +60,37 @@ HINT_COST_POINTS = 5
 # resolve delays once someone acks, so the whole incident varies with
 # the seed while staying reproducible.
 DEFAULT_JITTER_RANGE = (0, 1)
+
+
+# Minutes in a 30-day month: the window an SLO's error budget is
+# measured over. A 99.9% SLO allows 0.1% of 43,200 minutes — 43.2m
+# of downtime a month — before the budget is spent.
+MINUTES_PER_MONTH = 30 * 24 * 60
+
+
+def error_budget_minutes(slo_percent: float) -> float:
+    """Monthly error budget in minutes for an SLO target.
+
+    The share of a 30-day month the service is allowed to be down:
+    (100 - SLO)% of 43,200 minutes. A 99.9% SLO allows 43.2m, a
+    99.99% SLO allows 4.32m.
+    """
+    return (100.0 - slo_percent) / 100.0 * MINUTES_PER_MONTH
+
+
+def error_budget_burn_pct(slo_percent, downtime_min) -> object:
+    """Share of the monthly error budget an incident burned, in percent.
+
+    ``downtime_min`` is the minutes from declaration to mitigated.
+    Returns None when the scenario has no SLO or the incident was
+    never mitigated (no downtime to measure); over 100 means this one
+    incident spent the whole month's budget. Rounded to one decimal so
+    the JSON stays readable.
+    """
+    if slo_percent is None or downtime_min is None:
+        return None
+    budget = error_budget_minutes(slo_percent)
+    return round(downtime_min / budget * 100, 1)
 
 
 def compute_points(*, escalations: int, acked_at, ack_credit: float,
@@ -198,6 +234,16 @@ class Score:
     # total; the cost is already deducted from ``points``.
     hints_used: int = 0
     hint_cost_points: int = 0
+    # The service's SLO target in percent (99.9, say), or None when the
+    # scenario carries no SLO.
+    slo_percent: object = None
+    # Minutes from declaration to mitigated — the service was down or
+    # degraded for this long — or None when never mitigated.
+    downtime_min: object = None
+    # Share of the monthly error budget the downtime burned, in
+    # percent (over 100 means the incident alone spent the whole
+    # month's budget); None when there is no SLO or no downtime.
+    error_budget_burn_pct: object = None
 
     def to_dict(self) -> dict:
         """JSON-ready dict; unreached milestones serialize as null."""
@@ -214,6 +260,9 @@ class Score:
             "resolve_delay_min": self.resolve_delay_min,
             "hints_used": self.hints_used,
             "hint_cost_points": self.hint_cost_points,
+            "slo_percent": self.slo_percent,
+            "downtime_min": self.downtime_min,
+            "error_budget_burn_pct": self.error_budget_burn_pct,
         }
 
 
@@ -509,7 +558,8 @@ def simulate(
             return SimulationResult(
                 incident, policy, timeline,
                 Score(None, None, None, escalations, False, 0,
-                      hints_used=len(used_hints), hint_cost_points=hint_cost),
+                      hints_used=len(used_hints), hint_cost_points=hint_cost,
+                      slo_percent=scenario.slo_percent),
                 seed=seed, jitter=jitter_range, difficulty=difficulty,
                 hints=used_hints, escalation_chain=chain,
             )
@@ -518,7 +568,8 @@ def simulate(
             return SimulationResult(
                 incident, policy, timeline,
                 Score(None, None, None, escalations, False, 0,
-                      hints_used=len(used_hints), hint_cost_points=hint_cost),
+                      hints_used=len(used_hints), hint_cost_points=hint_cost,
+                      slo_percent=scenario.slo_percent),
                 seed=seed, jitter=jitter_range, difficulty=difficulty,
                 hints=used_hints, escalation_chain=chain,
             )
@@ -556,6 +607,12 @@ def simulate(
         resolve_delay_min=resolve_delay,
         hints_used=len(used_hints),
         hint_cost_points=hint_cost,
+        slo_percent=scenario.slo_percent,
+        # Downtime runs from declaration (t=0) to mitigated: the
+        # service was down or degraded for that whole span.
+        downtime_min=mitigated_at,
+        error_budget_burn_pct=error_budget_burn_pct(
+            scenario.slo_percent, mitigated_at),
     )
     return SimulationResult(incident, policy, timeline, score, seed=seed,
                             jitter=jitter_range, difficulty=difficulty,

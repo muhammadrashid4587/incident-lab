@@ -152,6 +152,13 @@ def _print_result(result) -> None:
     print(f"  time-to-resolve:  {score.time_to_resolve_min}m"
           if score.time_to_resolve_min is not None
           else "  time-to-resolve:  -")
+    if score.slo_percent is not None:
+        print(f"  downtime:         {score.downtime_min}m"
+              if score.downtime_min is not None else "  downtime:         -")
+        if score.error_budget_burn_pct is not None:
+            print(f"  error budget:     burned "
+                  f"{score.error_budget_burn_pct:.1f}% of the monthly "
+                  f"budget (SLO {score.slo_percent}%)")
     print(f"  escalations:      {score.escalations}")
     print(f"  resolved:         {'yes' if score.resolved else 'no'}")
     if score.hints_used:

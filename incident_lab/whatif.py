@@ -89,6 +89,7 @@ def _scenario_from_result(original) -> Scenario:
         mitigate_delay_min=mitigate_delay,
         resolve_delay_min=resolve_delay,
         hints=tuple(hint.text for hint in original.hints),
+        slo_percent=score.slo_percent,
         # The impact stages the original run walked through, read off
         # its recorded escalation chain: one stage per level paged,
         # in order. The replay walks the same levels (a miss stays a
@@ -180,6 +181,13 @@ class WhatIfResult:
         lines.append(
             f"  escalations:      {self.original.score.escalations} "
             f"-> {self.replayed.score.escalations}")
+        if (self.original.score.error_budget_burn_pct is not None
+                or self.replayed.score.error_budget_burn_pct is not None):
+            lines.append(
+                "  error budget:     "
+                f"{_fmt_burn(self.original.score.error_budget_burn_pct)}"
+                f" -> {_fmt_burn(self.replayed.score.error_budget_burn_pct)}"
+                " of the monthly budget")
         lines.append("")
         lines.append("what-if timeline:")
         lines.append(self.replayed.timeline.render())
@@ -188,6 +196,10 @@ class WhatIfResult:
 
 def _fmt_maybe(value) -> str:
     return f"{value}m" if value is not None else "-"
+
+
+def _fmt_burn(value) -> str:
+    return f"{value:.1f}%" if value is not None else "-"
 
 
 def what_if(original, ack_timeout=None, ack_timeouts=None,

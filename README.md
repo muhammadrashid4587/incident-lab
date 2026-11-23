@@ -98,7 +98,12 @@ the acking level's lateness (`ack_late_min`, 0 for an on-time ack) and
 the partial credit it kept (`ack_credit`, 1.0 on time). The score also
 carries the effective mitigate and resolve delays
 (`mitigate_delay_min`, `resolve_delay_min`, `null` when the incident
-was never mitigated or resolved), which vary with `--seed`. Unreached milestones
+was never mitigated or resolved), which vary with `--seed`. The score
+also carries the error-budget burn (see Error budget): the service's
+SLO target (`slo_percent`), the downtime in minutes from declaration
+to mitigated (`downtime_min`), and the share of the monthly error
+budget that downtime burned (`error_budget_burn_pct`, over 100 when
+the incident alone spent the whole month's budget). Unreached milestones
 serialize as `null` (for example, an incident nobody acks has
 `"time_to_ack_min": null` and `"points": 0`). The top-level `seed` records
 the `--seed` value used for the run, or `null` for an unseeded run, and the
@@ -308,15 +313,15 @@ invalid scenario fails the run with exit code 2 and an error message.
 
 ## Scenarios
 
-| name | service | severity | what happens |
-| ---- | ------- | -------- | ------------ |
-| disk-full | payments-db | high | primary acks in 3m, mitigates in 20m |
-| latency-spike | checkout-api | critical | primary misses the page, secondary acks in 4m |
-| cert-expiry | edge-tls | high | primary acks in 2m, quick fix |
-| deploy-regression | search-api | critical | primary and secondary miss, manager acks in 6m |
-| queue-backlog | orders-queue | high | primary acks in 4m, scales consumers to drain backlog |
-| dns-outage | edge-dns | critical | primary misses the page, secondary acks in 3m, fails over |
-| payments-outage | payments-api | critical | SEV-1: on-call and senior miss, incident commander acks in 4m; impact grows while paging |
+| name | service | severity | SLO | what happens |
+| ---- | ------- | -------- | --- | ------------ |
+| disk-full | payments-db | high | 99.9% | primary acks in 3m, mitigates in 20m |
+| latency-spike | checkout-api | critical | 99.95% | primary misses the page, secondary acks in 4m |
+| cert-expiry | edge-tls | high | 99.9% | primary acks in 2m, quick fix |
+| deploy-regression | search-api | critical | 99.9% | primary and secondary miss, manager acks in 6m |
+| queue-backlog | orders-queue | high | 99.5% | primary acks in 4m, scales consumers to drain backlog |
+| dns-outage | edge-dns | critical | 99.99% | primary misses the page, secondary acks in 3m, fails over |
+| payments-outage | payments-api | critical | 99.9% | SEV-1: on-call and senior miss, incident commander acks in 4m; impact grows while paging |
 
 ## Escalation policy
 
@@ -448,6 +453,29 @@ Example: `disk-full` acks in 3m and mitigates in 23m with no escalations,
 so 100 - 0 - (23-15)//2 = 96. On the `fast` policy the primary's 2m
 timeout makes that a 1m-late ack, so the credit is 1 - 1/2 = 0.5 and the
 effective score is 96 × 0.5 = 48.
+
+## Error budget
+
+Every scenario carries an SLO target (`slo_percent`, for example 99.9
+for `payments-db`), and the run reports how much of the monthly error
+budget the incident burned. The budget is the downtime the SLO allows
+in a 30-day month — (100 - SLO)% of 43,200 minutes, so 99.9% allows
+43.2m and 99.99% allows 4.32m — and the incident's downtime is the
+minutes from declaration to mitigated. The burn is downtime / budget
+as a percent, rounded to one decimal: `disk-full` is down 23m, so it
+burns 53.2% of its 99.9% budget, while `payments-outage` on the `sev1`
+policy is down 62m and burns 143.5% — one incident spending the whole
+month's budget. The run output shows the downtime and the burn, and
+the score section of `run --json` carries `slo_percent`,
+`downtime_min` and `error_budget_burn_pct` (all `null` for a scenario
+with no SLO, and `downtime_min` / `error_budget_burn_pct` `null` when
+the incident was never mitigated). `debrief` flags a burn over 100%
+as a finding with an action to review the SLO and the response,
+`compare` diffs the burn between two runs, `stats` reports the mean
+burn across runs, `what-if` recomputes it from the replayed delays,
+and drills record it too. Scenario files can set their own
+`slo_percent` (a number from 90 up to but not including 100);
+`template` prints it, and a scenario without one reports no burn.
 
 ## Hints
 
@@ -729,6 +757,21 @@ human-readable form.
 
 ## Version
 
+0.27.0 — error-budget burn: every scenario carries an SLO target
+(`slo_percent`, for example 99.9% for `payments-db`), and the run
+reports the downtime (declaration to mitigated) as a percentage of
+the monthly error budget that SLO allows in a 30-day month — over
+100% means one incident spent the whole month's budget (`disk-full`
+burns 53.2%, `payments-outage` on the `sev1` policy burns 143.5%).
+The run output shows the downtime and the burn, `run --json` carries
+`slo_percent`, `downtime_min` and `error_budget_burn_pct` on the
+score, `debrief` flags a burn over 100% with an action to review the
+SLO and the response, `compare` diffs the burn between two runs,
+`stats` reports the mean burn, `what-if` recomputes it from the
+replayed delays, and drills record it too. Scenario files can set
+their own `slo_percent` (90 up to but not including 100); `template`
+prints it, and a scenario without one reports no burn.
+
 0.26.0 — SEV-1 scenario with a multi-level escalation chain:
 `payments-outage` (payments API fully down, on-call and senior miss,
 incident commander acks in 4m) with a new `sev1` policy (on-call 3m,
@@ -810,3 +853,4 @@ resolved instead of claiming nobody acked.
 - [x] Interactive `hint` during a drill: type `hint` at any drill prompt to ask for the scenario's next known-good action when stuck (costs 5 points, like `run --hints`), drawn in order and continuing after any up-front `--hints`, printed with the next milestone and what the scoring rewards at that point, and recorded in the drill's JSON exactly like an up-front hint, so `replay`, `debrief`, `compare` and `stats` all work on drill runs with mid-drill hints (0.24.0)
 - [x] Per-operator drill history: `drill --operator NAME` records the drill (finished or abandoned) in a history file (`~/.incident-lab/history.json` by default, `--history-file PATH` to point elsewhere), and `history --operator NAME` shows that operator's runs in order with scores, grades and response times plus a summary (runs, mean and best score, first vs latest, trend from the second half of runs against the first); plain `history` summarises every operator, `--json` prints either view as JSON, and a drill without `--operator` records nothing (0.25.0)
 - [x] SEV-1 scenario with a multi-level escalation chain: `payments-outage` with a `sev1` policy (on-call 3m, senior 5m, incident commander 10m), impact stages that grow with every missed level, and the escalation chain recorded in `run --json` and shown by `replay`, `debrief`, `compare` and `stats`; `what-if` keeps the original run's impact stages and drills record the chain too (0.26.0)
+- [x] Error-budget burn: every scenario carries an SLO target (`slo_percent`), and the run reports the downtime (declaration to mitigated) as a percentage of the monthly error budget that SLO allows in a 30-day month — over 100% means one incident spent the whole month's budget; shown in `run` output and `run --json`, flagged by `debrief` when over 100%, diffed by `compare`, averaged by `stats`, recomputed by `what-if`, recorded by drills, and settable per scenario in scenario files (0.27.0)

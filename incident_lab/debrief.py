@@ -51,6 +51,13 @@ class Debrief:
     # Difficulty the run was played at, or None for a saved run from
     # before difficulties existed.
     difficulty: object = None
+    # The service's SLO target, the incident's downtime in minutes,
+    # and the share of the monthly error budget it burned (None when
+    # the run predates error-budget reporting, or the incident was
+    # never mitigated).
+    slo_percent: object = None
+    downtime_min: object = None
+    error_budget_burn_pct: object = None
 
     def to_dict(self) -> dict:
         """JSON-ready dict: summary, findings, action items, timeline."""
@@ -71,6 +78,9 @@ class Debrief:
                 "time_to_resolve_min": self.time_to_resolve_min,
                 "escalations": self.escalations,
                 "resolved": self.resolved,
+                "slo_percent": self.slo_percent,
+                "downtime_min": self.downtime_min,
+                "error_budget_burn_pct": self.error_budget_burn_pct,
             },
             "went_well": list(self.went_well),
             "went_badly": list(self.went_badly),
@@ -91,6 +101,12 @@ class Debrief:
         ]
         if self.difficulty is not None:
             lines.append(f"Difficulty: {self.difficulty.name}")
+        if self.error_budget_burn_pct is not None:
+            lines.append(
+                f"Error budget: burned "
+                f"{self.error_budget_burn_pct:.1f}% of the monthly budget "
+                f"(SLO {self.slo_percent}%, downtime "
+                f"{self.downtime_min}m)")
         lines += [
             ("Time-to-ack: "
              f"{self.time_to_ack_min}m" if self.time_to_ack_min is not None
@@ -168,6 +184,35 @@ def _impact_growth(result: SimulationResult) -> tuple:
     return went_badly, action_items
 
 
+def _error_budget_finding(result: SimulationResult) -> tuple:
+    """Findings for an incident that burned its error budget.
+
+    Returns ``(went_badly, action_items)``: when the downtime burned
+    more than the whole monthly budget (over 100%), that is a bad
+    finding with an action to review the SLO and the response time.
+    At or under 100% the budget held, so there is nothing to flag,
+    and a run with no SLO or no downtime reports nothing.
+    """
+    score = result.score
+    burn = score.error_budget_burn_pct
+    if burn is None or burn <= 100:
+        return [], []
+    return (
+        [f"Downtime of {score.downtime_min}m burned {burn:.1f}% of the "
+         f"monthly error budget (SLO {score.slo_percent}%) — this one "
+         f"incident spent the whole month's budget"],
+        [{
+            "action": (
+                f"Review the {score.slo_percent}% SLO and the response: "
+                f"{score.downtime_min}m of downtime burned {burn:.1f}% "
+                f"of the monthly error budget, so either the SLO is too "
+                f"tight for this service or mitigation needs to be "
+                f"faster"),
+            "owner": "on-call lead",
+        }],
+    )
+
+
 def _partial_debrief(result: SimulationResult, ack_grace_min: int,
                      mitigate_grace_min: int) -> Debrief:
     """Postmortem for a run that acked but never resolved.
@@ -202,6 +247,10 @@ def _partial_debrief(result: SimulationResult, ack_grace_min: int,
         })
     # The impact may have grown while the page went unanswered.
     badly, actions = _impact_growth(result)
+    went_badly.extend(badly)
+    action_items.extend(actions)
+    # The downtime may have burned the month's error budget.
+    badly, actions = _error_budget_finding(result)
     went_badly.extend(badly)
     action_items.extend(actions)
     if score.escalations == 0:
@@ -278,6 +327,9 @@ def _partial_debrief(result: SimulationResult, ack_grace_min: int,
         action_items=action_items,
         timeline=result.timeline.render(),
         difficulty=result.difficulty,
+        slo_percent=score.slo_percent,
+        downtime_min=score.downtime_min,
+        error_budget_burn_pct=score.error_budget_burn_pct,
     )
 
 
@@ -355,6 +407,9 @@ def generate_debrief(result: SimulationResult) -> Debrief:
             action_items=action_items,
             timeline=result.timeline.render(),
             difficulty=result.difficulty,
+            slo_percent=score.slo_percent,
+            downtime_min=score.downtime_min,
+            error_budget_burn_pct=score.error_budget_burn_pct,
         )
 
     # The first `escalations` levels missed; the next level acked.
@@ -378,6 +433,11 @@ def generate_debrief(result: SimulationResult) -> Debrief:
 
     # The impact may have grown while the page went unanswered.
     badly, actions = _impact_growth(result)
+    went_badly.extend(badly)
+    action_items.extend(actions)
+
+    # The downtime may have burned the month's error budget.
+    badly, actions = _error_budget_finding(result)
     went_badly.extend(badly)
     action_items.extend(actions)
 
@@ -447,4 +507,7 @@ def generate_debrief(result: SimulationResult) -> Debrief:
         action_items=action_items,
         timeline=result.timeline.render(),
         difficulty=result.difficulty,
+        slo_percent=score.slo_percent,
+        downtime_min=score.downtime_min,
+        error_budget_burn_pct=score.error_budget_burn_pct,
     )

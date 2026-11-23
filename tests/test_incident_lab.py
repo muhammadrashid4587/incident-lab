@@ -31,7 +31,9 @@ from incident_lab.replay import load_result, load_saved
 from incident_lab.scenarios import (
     Scenario, get, list_scenarios, load_scenario_file, scenario_to_dict,
 )
-from incident_lab.simulator import simulate, simulate_batch
+from incident_lab.simulator import (
+    error_budget_burn_pct, error_budget_minutes, simulate, simulate_batch,
+)
 from incident_lab.stats import aggregate_stats
 from incident_lab.timeline import Timeline
 from incident_lab.whatif import WhatIfResult, what_if
@@ -619,6 +621,11 @@ class TestJsonOutput(unittest.TestCase):
             "resolve_delay_min": 12,
             "hints_used": 0,
             "hint_cost_points": 0,
+            # disk-full has a 99.9% SLO: 43.2m monthly budget, 23m of
+            # downtime burns 53.2% of it.
+            "slo_percent": 99.9,
+            "downtime_min": 23,
+            "error_budget_burn_pct": 53.2,
         })
 
     def test_result_to_dict_unacked_serializes_nulls(self):
@@ -1624,8 +1631,17 @@ class TestDebrief(unittest.TestCase):
             self.assertEqual(main(["debrief", path, "--json"]), 0)
         data = json.loads(buf.getvalue())
         self.assertEqual(data["summary"]["escalations"], 1)
-        self.assertEqual(len(data["action_items"]), 2)
+        # latency-spike: 44m of downtime against a 99.95% SLO (21.6m
+        # monthly budget) burns 203.7% of the budget, so the debrief
+        # adds a third action item about the SLO and the response.
+        self.assertEqual(len(data["action_items"]), 3)
         self.assertEqual(data["action_items"][0]["owner"], "ana")
+        self.assertEqual(data["summary"]["slo_percent"], 99.95)
+        self.assertEqual(data["summary"]["downtime_min"], 44)
+        self.assertEqual(data["summary"]["error_budget_burn_pct"], 203.7)
+        self.assertTrue(any(
+            "error budget" in item["action"]
+            for item in data["action_items"]))
 
     def test_cli_debrief_missing_file_fails(self):
         self.assertEqual(main(["debrief", "/tmp/no-such-run.json"]), 2)
@@ -3887,6 +3903,207 @@ class TestSev1EscalationChain(unittest.TestCase):
                                              get_policy("sev1"))
         self.assertEqual([level.ack_timeout_min for level in policy.levels],
                          [5, 5, 10])
+
+
+class TestErrorBudgetBurn(unittest.TestCase):
+    def _write_scenario_file(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(data, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_error_budget_minutes(self):
+        # A 30-day month has 43,200 minutes; the budget is the allowed
+        # share of it: 99.9% allows 43.2m, 99.99% allows 4.32m.
+        self.assertAlmostEqual(error_budget_minutes(99.9), 43.2)
+        self.assertAlmostEqual(error_budget_minutes(99.99), 4.32)
+        self.assertAlmostEqual(error_budget_minutes(99.5), 216.0)
+
+    def test_error_budget_burn_pct(self):
+        self.assertEqual(error_budget_burn_pct(99.9, 43.2), 100.0)
+        self.assertEqual(error_budget_burn_pct(99.9, 50), 115.7)
+        self.assertIsNone(error_budget_burn_pct(None, 50))
+        self.assertIsNone(error_budget_burn_pct(99.9, None))
+
+    def test_every_builtin_scenario_has_an_slo(self):
+        for name in list_scenarios():
+            slo = get(name).slo_percent
+            self.assertIsInstance(slo, float, name)
+            self.assertTrue(90 <= slo < 100, name)
+
+    def test_disk_full_burn(self):
+        # disk-full: ack 3m, mitigate 23m, so 23m of downtime against
+        # a 99.9% SLO (43.2m budget) burns 53.2%.
+        result = simulate(get("disk-full"), DEFAULT_POLICY)
+        self.assertEqual(result.score.slo_percent, 99.9)
+        self.assertEqual(result.score.downtime_min, 23)
+        self.assertEqual(result.score.error_budget_burn_pct, 53.2)
+
+    def test_payments_outage_burns_over_the_full_budget(self):
+        # SEV-1 on the sev1 policy: ack 12m, mitigate 62m, so 62m of
+        # downtime against a 99.9% SLO burns 143.5% — one incident
+        # spends the whole month's budget.
+        result = simulate(get("payments-outage"), get_policy("sev1"))
+        self.assertEqual(result.score.downtime_min, 62)
+        self.assertEqual(result.score.error_budget_burn_pct, 143.5)
+
+    def test_scenario_without_slo_reports_no_burn(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(2, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        result = simulate(scenario, DEFAULT_POLICY)
+        self.assertIsNone(result.score.slo_percent)
+        self.assertEqual(result.score.downtime_min, 12)
+        self.assertIsNone(result.score.error_budget_burn_pct)
+
+    def test_unacked_run_has_no_downtime_or_burn(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        result = simulate(scenario, DEFAULT_POLICY)
+        self.assertIsNone(result.score.downtime_min)
+        self.assertIsNone(result.score.error_budget_burn_pct)
+
+    def test_scenario_file_validates_slo(self):
+        base = scenario_to_dict(get("disk-full"))
+        for bad in (100, 89.9, "99.9", True, [99.9]):
+            data = dict(base, slo_percent=bad)
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                load_scenario_file(self._write_scenario_file(
+                    {"scenarios": {"bad": data}}))
+        # A valid SLO loads, and a missing one means no SLO.
+        data = dict(base, slo_percent=99.95)
+        loaded = load_scenario_file(self._write_scenario_file(
+            {"scenarios": {"ok": data}}))
+        self.assertEqual(loaded["ok"].slo_percent, 99.95)
+        data = dict(base)
+        del data["slo_percent"]
+        loaded = load_scenario_file(self._write_scenario_file(
+            {"scenarios": {"ok": data}}))
+        self.assertIsNone(loaded["ok"].slo_percent)
+
+    def test_template_round_trips_slo(self):
+        data = scenario_to_dict(get("disk-full"))
+        self.assertEqual(data["slo_percent"], 99.9)
+        loaded = load_scenario_file(self._write_scenario_file(
+            {"scenarios": {"disk-full": data}}))
+        self.assertEqual(loaded["disk-full"].slo_percent, 99.9)
+
+    def test_replay_round_trips_burn(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY)
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(result.to_dict(), handle)
+        self.addCleanup(os.unlink, handle.name)
+        loaded = load_result(handle.name)
+        self.assertEqual(loaded.score.slo_percent, 99.9)
+        self.assertEqual(loaded.score.downtime_min, 23)
+        self.assertEqual(loaded.score.error_budget_burn_pct, 53.2)
+
+    def test_replay_of_old_run_has_no_burn_fields(self):
+        data = simulate(get("disk-full"), DEFAULT_POLICY).to_dict()
+        for key in ("slo_percent", "downtime_min",
+                    "error_budget_burn_pct"):
+            del data["score"][key]
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(data, handle)
+        self.addCleanup(os.unlink, handle.name)
+        loaded = load_result(handle.name)
+        self.assertIsNone(loaded.score.slo_percent)
+        self.assertIsNone(loaded.score.downtime_min)
+        self.assertIsNone(loaded.score.error_budget_burn_pct)
+
+    def test_run_prints_downtime_and_burn(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "disk-full"]), 0)
+        out = buf.getvalue()
+        self.assertIn("downtime:         23m", out)
+        self.assertIn("error budget:     burned 53.2% of the monthly "
+                      "budget (SLO 99.9%)", out)
+
+    def test_debrief_flags_burn_over_100_only(self):
+        over = generate_debrief(
+            simulate(get("payments-outage"), get_policy("sev1")))
+        self.assertTrue(any("error budget" in item
+                            for item in over.went_badly))
+        self.assertTrue(any("error budget" in item["action"]
+                            for item in over.action_items))
+        self.assertIn("143.5%", over.render())
+        # disk-full burns 53.2%: the budget held, so no finding.
+        under = generate_debrief(simulate(get("disk-full"),
+                                          DEFAULT_POLICY))
+        self.assertFalse(any("error budget" in item
+                             for item in under.went_badly))
+        self.assertIn("53.2%", under.render())
+
+    def test_compare_shows_burn_delta(self):
+        a = simulate(get("disk-full"), DEFAULT_POLICY)
+        b = simulate(get("latency-spike"), DEFAULT_POLICY)
+        comparison = compare_results(a, b)
+        rows = {row["metric"]: row for row in comparison.score_rows}
+        self.assertEqual(rows["error_budget_burn_pct"]["a"], 53.2)
+        self.assertEqual(rows["error_budget_burn_pct"]["b"], 203.7)
+        self.assertAlmostEqual(
+            rows["error_budget_burn_pct"]["delta"], 150.5)
+        self.assertIn("error budget burn", comparison.render())
+        self.assertIn("203.7%", comparison.render())
+
+    def test_stats_mean_burn(self):
+        runs = [simulate(get("disk-full"), DEFAULT_POLICY),
+                simulate(get("latency-spike"), DEFAULT_POLICY)]
+        stats = aggregate_stats(runs)
+        self.assertAlmostEqual(
+            stats.mean_error_budget_burn_pct, (53.2 + 203.7) / 2)
+        self.assertEqual(stats.to_dict()["mean_error_budget_burn_pct"],
+                         stats.mean_error_budget_burn_pct)
+        self.assertIn("error budget burn",
+                      stats.render())
+
+    def test_drill_records_burn(self):
+        drill = run_drill(
+            get("disk-full"), DEFAULT_POLICY,
+            input_stream=io.StringIO("ack 3\nmitigate 20\nresolve 12\n"),
+            prompt_stream=io.StringIO())
+        self.assertEqual(drill.score.downtime_min, 23)
+        self.assertEqual(drill.score.error_budget_burn_pct, 53.2)
+
+    def test_drill_abandoned_after_mitigate_still_reports_burn(self):
+        drill = run_drill(
+            get("disk-full"), DEFAULT_POLICY,
+            input_stream=io.StringIO("ack 3\nmitigate 20\nquit\n"),
+            prompt_stream=io.StringIO())
+        self.assertFalse(drill.score.resolved)
+        self.assertEqual(drill.score.downtime_min, 23)
+        self.assertEqual(drill.score.error_budget_burn_pct, 53.2)
+
+    def test_what_if_keeps_slo_and_recomputes_burn(self):
+        # latency-spike: ack 9m, downtime 44m, burn 203.7% on a 99.95%
+        # SLO. A 10m ack timeout waits out the primary's miss longer,
+        # so the ack lands at 14m and the burn grows.
+        original = simulate(get("latency-spike"), DEFAULT_POLICY)
+        outcome = what_if(original, ack_timeout=10)
+        self.assertEqual(outcome.replayed.score.slo_percent, 99.95)
+        self.assertEqual(outcome.replayed.score.downtime_min, 49)
+        self.assertEqual(outcome.replayed.score.error_budget_burn_pct,
+                         226.9)
+        self.assertIn("226.9%", outcome.render())
+
+    def test_batch_runs_carry_burn(self):
+        batch = simulate_batch(get("disk-full"), DEFAULT_POLICY,
+                               seeds=[1, 2])
+        for run in batch.runs:
+            self.assertEqual(run.score.slo_percent, 99.9)
+            self.assertIsNotNone(run.score.error_budget_burn_pct)
 
 
 if __name__ == "__main__":

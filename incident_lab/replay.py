@@ -117,6 +117,28 @@ def _require_number_or_none(data: dict, key: str, what: str):
     return value
 
 
+def _require_nonnegative_number_or_none(data: dict, key: str, what: str):
+    """A number >= 0, or null (for a field a saved run may not have)."""
+    value = data.get(key)
+    if value is not None and (isinstance(value, bool)
+                              or not isinstance(value, (int, float))
+                              or value < 0):
+        raise ValueError(f"replay file: {what} {key!r} must be a "
+                         "non-negative number or null")
+    return value
+
+
+def _require_slo_or_none(data: dict, key: str, what: str):
+    """An SLO percent (90 up to but not including 100), or null."""
+    value = data.get(key)
+    if value is not None and (isinstance(value, bool)
+                              or not isinstance(value, (int, float))
+                              or not 90 <= value < 100):
+        raise ValueError(f"replay file: {what} {key!r} must be a number "
+                         "from 90 up to (but not including) 100, or null")
+    return value
+
+
 def _score_from_dict(raw) -> Score:
     data = _require_mapping(raw, "score")
     escalations = data.get("escalations")
@@ -132,6 +154,10 @@ def _score_from_dict(raw) -> Score:
     ack_late_min = _require_int_or_none(data, "ack_late_min", "score")
     if ack_late_min is not None and ack_late_min < 0:
         raise ValueError("replay file: score 'ack_late_min' must not be "
+                         "negative")
+    downtime_min = _require_int_or_none(data, "downtime_min", "score")
+    if downtime_min is not None and downtime_min < 0:
+        raise ValueError("replay file: score 'downtime_min' must not be "
                          "negative")
     return Score(
         time_to_ack_min=_require_int_or_none(data, "time_to_ack_min",
@@ -155,6 +181,12 @@ def _score_from_dict(raw) -> Score:
         # round-trip as zero hints at zero cost.
         hints_used=_require_hint_count(data, "hints_used"),
         hint_cost_points=_require_hint_count(data, "hint_cost_points"),
+        # Saved runs from before 0.27.0 have no error-budget fields;
+        # they round-trip as no SLO and no downtime.
+        slo_percent=_require_slo_or_none(data, "slo_percent", "score"),
+        downtime_min=downtime_min,
+        error_budget_burn_pct=_require_nonnegative_number_or_none(
+            data, "error_budget_burn_pct", "score"),
     )
 
 

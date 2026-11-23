@@ -28,12 +28,15 @@ def _mean(values: list):
 class RunStats:
     # One row per run: {"label", "scenario", "points", "grade",
     # "time_to_ack_min", "time_to_mitigate_min", "time_to_resolve_min",
-    # "escalations", "resolved", "hints_used", "impact", "what_if"}; a
-    # milestone a run never reached is None in its row, "impact" is
-    # the impact the run ended at from its escalation chain (None
-    # when the run recorded no chain or the scenario has no impact
-    # stages), and "what_if" is None for a real run or {"overrides",
-    # "points_delta", "base_points"} for a what-if replay.
+    # "escalations", "resolved", "hints_used", "impact", "what_if",
+    # "error_budget_burn_pct"}; a milestone a run never reached is
+    # None in its row, "impact" is the impact the run ended at from
+    # its escalation chain (None when the run recorded no chain or the
+    # scenario has no impact stages), "error_budget_burn_pct" is the
+    # share of the monthly error budget the run burned (None when the
+    # run has no SLO or was never mitigated), and "what_if" is None for
+    # a real run or {"overrides", "points_delta", "base_points"} for a
+    # what-if replay.
     runs: list
     count: int
     # Points spread across all runs.
@@ -46,6 +49,10 @@ class RunStats:
     mean_time_to_ack_min: object
     mean_time_to_mitigate_min: object
     mean_time_to_resolve_min: object
+    # Mean error-budget burn in percent, over the runs that reported
+    # one (a run with no SLO or no downtime reports none); None when
+    # no run reported a burn.
+    mean_error_budget_burn_pct: object
     # How many runs were acked and resolved at all.
     acked: int
     resolved: int
@@ -83,6 +90,7 @@ class RunStats:
             "mean_time_to_ack_min": self.mean_time_to_ack_min,
             "mean_time_to_mitigate_min": self.mean_time_to_mitigate_min,
             "mean_time_to_resolve_min": self.mean_time_to_resolve_min,
+            "mean_error_budget_burn_pct": self.mean_error_budget_burn_pct,
             "acked": self.acked,
             "resolved": self.resolved,
             "escalations": {
@@ -119,6 +127,11 @@ class RunStats:
         lines.append(f"  time-to-ack:      {_fmt_mean(self.mean_time_to_ack_min)}")
         lines.append(f"  time-to-mitigate: {_fmt_mean(self.mean_time_to_mitigate_min)}")
         lines.append(f"  time-to-resolve:  {_fmt_mean(self.mean_time_to_resolve_min)}")
+        if self.mean_error_budget_burn_pct is not None:
+            lines.append(
+                f"  error budget burn: "
+                f"{self.mean_error_budget_burn_pct:.1f}% of the monthly "
+                f"budget (mean)")
         lines.append("")
         lines.append(f"acked:      {self.acked}/{self.count}")
         lines.append(f"resolved:   {self.resolved}/{self.count}")
@@ -215,6 +228,9 @@ def aggregate_stats(results: list, labels: list = None,
             "escalations": score.escalations,
             "resolved": score.resolved,
             "hints_used": score.hints_used,
+            # The share of the monthly error budget the run burned
+            # (None when the run has no SLO or was never mitigated).
+            "error_budget_burn_pct": score.error_budget_burn_pct,
             # The impact the run ended at, from its escalation chain
             # (None when the run recorded no chain or the scenario has
             # no impact stages).
@@ -253,6 +269,9 @@ def aggregate_stats(results: list, labels: list = None,
         mean_time_to_resolve_min=_mean(
             [row["time_to_resolve_min"] for row in rows
              if row["time_to_resolve_min"] is not None]),
+        mean_error_budget_burn_pct=_mean(
+            [row["error_budget_burn_pct"] for row in rows
+             if row["error_budget_burn_pct"] is not None]),
         acked=sum(1 for row in rows
                   if row["time_to_ack_min"] is not None),
         resolved=sum(1 for row in rows if row["resolved"]),

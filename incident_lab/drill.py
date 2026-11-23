@@ -46,7 +46,7 @@ from .policy import EscalationPolicy
 from .scenarios import Scenario
 from .simulator import (
     HINT_COST_POINTS, EscalationStep, Hint, Score, SimulationResult,
-    compute_points, impact_at, late_ack_credit,
+    compute_points, error_budget_burn_pct, impact_at, late_ack_credit,
 )
 from .timeline import Timeline
 
@@ -148,7 +148,8 @@ def _read_decision(prompt_stream, input_stream, prompt: str,
 def _partial_result(incident, policy, timeline, *, escalations,
                     acked_at, acked_by, ack_late_min, ack_credit,
                     mitigated_at, mitigate_delay_min, difficulty,
-                    used_hints, hint_cost, escalation_chain=None) -> SimulationResult:
+                    used_hints, hint_cost, escalation_chain=None,
+                    slo_percent=None) -> SimulationResult:
     """Build the result for a drill that stopped early.
 
     The timeline holds the events so far (plus the ``abandoned``
@@ -156,6 +157,9 @@ def _partial_result(incident, policy, timeline, *, escalations,
     reached, with the unreached ones as null and ``resolved`` false.
     The escalation chain holds one step per level the drill actually
     walked — a level quit on before any decision records no step.
+    Downtime runs from declaration to mitigated when the drill got
+    that far, so a drill abandoned after mitigating still reports
+    its error-budget burn.
     """
     points = compute_points(
         escalations=escalations, acked_at=acked_at, ack_credit=ack_credit,
@@ -176,6 +180,10 @@ def _partial_result(incident, policy, timeline, *, escalations,
             resolve_delay_min=None,
             hints_used=len(used_hints),
             hint_cost_points=hint_cost,
+            slo_percent=slo_percent,
+            downtime_min=mitigated_at,
+            error_budget_burn_pct=error_budget_burn_pct(
+                slo_percent, mitigated_at),
         ),
         difficulty=difficulty,
         hints=used_hints,
@@ -328,7 +336,8 @@ def run_drill(
                 ack_credit=None, mitigated_at=None,
                 mitigate_delay_min=None, difficulty=difficulty,
                 used_hints=used_hints, hint_cost=_hint_cost(),
-                escalation_chain=chain)
+                escalation_chain=chain,
+                slo_percent=scenario.slo_percent)
         if command == "wait":
             # Missed ack: wait out the timeout, then escalate (or give
             # up, exactly as `run` does when nobody acks).
@@ -369,7 +378,8 @@ def run_drill(
                 ack_credit=None, mitigated_at=None,
                 mitigate_delay_min=None, difficulty=difficulty,
                 used_hints=used_hints, hint_cost=_hint_cost(),
-                escalation_chain=chain)
+                escalation_chain=chain,
+                slo_percent=scenario.slo_percent)
         # The operator acks, on time or late: the same late-ack credit
         # `run` gives for an ack past its level's timeout.
         delay = arg
@@ -414,7 +424,8 @@ def run_drill(
             ack_late_min=ack_late_min, ack_credit=ack_credit,
             mitigated_at=None, mitigate_delay_min=None,
             difficulty=difficulty, used_hints=used_hints,
-            hint_cost=_hint_cost(), escalation_chain=chain)
+            hint_cost=_hint_cost(), escalation_chain=chain,
+            slo_percent=scenario.slo_percent)
     mitigate_delay = arg
     mitigated_at = acked_at + mitigate_delay
     timeline.record(mitigated_at, "mitigated", acked_by)
@@ -437,7 +448,7 @@ def run_drill(
             mitigated_at=mitigated_at,
             mitigate_delay_min=mitigate_delay, difficulty=difficulty,
             used_hints=used_hints, hint_cost=_hint_cost(),
-            escalation_chain=chain)
+            escalation_chain=chain, slo_percent=scenario.slo_percent)
     resolve_delay = arg
     resolved_at = mitigated_at + resolve_delay
     timeline.record(resolved_at, "resolved", acked_by)
@@ -461,6 +472,10 @@ def run_drill(
             resolve_delay_min=resolve_delay,
             hints_used=len(used_hints),
             hint_cost_points=_hint_cost(),
+            slo_percent=scenario.slo_percent,
+            downtime_min=mitigated_at,
+            error_budget_burn_pct=error_budget_burn_pct(
+                scenario.slo_percent, mitigated_at),
         ),
         difficulty=difficulty,
         hints=used_hints,
