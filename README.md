@@ -48,6 +48,10 @@ python3 -m incident_lab replay /tmp/dns-outage.json
 python3 -m incident_lab run latency-spike --json > /tmp/latency-spike.json
 python3 -m incident_lab debrief /tmp/latency-spike.json
 python3 -m incident_lab debrief /tmp/latency-spike.json --json
+python3 -m incident_lab run disk-full --seed 1 --json > /tmp/run-seed-1.json
+python3 -m incident_lab run disk-full --seed 7 --json > /tmp/run-seed-7.json
+python3 -m incident_lab compare /tmp/run-seed-1.json /tmp/run-seed-7.json
+python3 -m incident_lab compare /tmp/run-seed-1.json /tmp/run-seed-7.json --json
 python3 -m incident_lab template disk-full > my-disk-full.json
 python3 -m incident_lab run disk-full --scenario-file my-disk-full.json
 python3 -m incident_lab run cache-down --scenario-file examples/custom-scenario.json
@@ -111,6 +115,30 @@ as JSON instead of Markdown.
 python3 -m incident_lab run latency-spike --json > latency-spike.json
 python3 -m incident_lab debrief latency-spike.json
 ```
+
+## Compare
+
+`compare <run-a.json> <run-b.json>` diffs two saved `run --json` runs
+side by side: a score table with the delta on each metric (points,
+time-to-ack, time-to-mitigate, time-to-resolve, escalations, lateness,
+ack credit) and a timeline diff — the events both runs share, with
+how each event's time shifted, plus the events only one run has. With
+`--json` the same comparison prints as JSON instead. A comparison is
+most useful for two runs of the same scenario (for example, two seeds,
+or the same incident before and after a policy change); comparing
+different scenarios still works, but the report says plainly that the
+scores are not directly comparable, and a different policy is flagged
+the same way. A milestone one run never reached (nobody acked, never
+mitigated) shows as `-` with no delta.
+
+```sh
+python3 -m incident_lab run disk-full --seed 1 --json > run-seed-1.json
+python3 -m incident_lab run disk-full --seed 7 --json > run-seed-7.json
+python3 -m incident_lab compare run-seed-1.json run-seed-7.json
+```
+
+A missing file, bad JSON, or a file that is not a saved run fails with
+exit code 2 and an error message.
 
 ## Incident templates
 
@@ -260,7 +288,9 @@ incident_lab/
   difficulty.py  difficulty ladder: easy / normal / hard scaling
   replay.py      rebuild a saved --json run for re-printing
   debrief.py     structured postmortem from a saved run
-  cli.py         list / run / replay / debrief
+  compare.py     side-by-side diff of two saved runs: score deltas,
+                 shared-event time shifts, events only one run has
+  cli.py         list / run / replay / debrief / compare
 tests/
   test_incident_lab.py
 scripts/
@@ -321,11 +351,11 @@ human-readable form.
 
 ## Version
 
-0.15.0 — difficulty ladder: `run --difficulty easy|normal|hard` (or
-1/2/3) scales ack timeouts, scoring targets and the default seeded
-jitter, records the difficulty in `run --json`, and `replay`/`debrief`
-show it (a debrief judges the run against the difficulty's own
-targets).
+0.16.0 — run comparison: `compare <run-a.json> <run-b.json>` diffs two
+saved runs side by side (score deltas per metric and a timeline diff
+of shared-event time shifts plus events only one run has), in human
+form or `--json`; flags different scenarios and policies, and shows
+unreached milestones as `-` with no delta.
 
 ## Roadmap
 
@@ -344,3 +374,4 @@ targets).
 - [x] Debrief/postmortem report generator: `debrief <saved-run.json>` writes a structured postmortem (summary with score and grade, timeline, what went well / badly, action items with owners) as Markdown or `--json`, every finding derived from the run (0.13.0)
 - [x] Shareable incident templates: `template <scenario>` prints a scenario as JSON, `run --scenario-file` loads named scenarios from a JSON file (file wins over built-in names), validated like `--policy-file` (0.14.0)
 - [x] Difficulty ladder: `run --difficulty easy|normal|hard` (or 1/2/3) scales ack timeouts (×1.5 / ×1.0 / ×0.6), scoring targets (ack grace 8/5/3m, mitigate grace 20/15/10m) and the default seeded jitter (0-0 / 0-1 / 0-3), records the difficulty in `run --json`, and `replay`/`debrief` show it (0.15.0)
+- [x] Run comparison: `compare <run-a.json> <run-b.json>` diffs two saved runs side by side (score deltas per metric, timeline diff of shared-event time shifts plus events only one run has), human form or `--json`, flags different scenarios/policies, unreached milestones show as `-` (0.16.0)

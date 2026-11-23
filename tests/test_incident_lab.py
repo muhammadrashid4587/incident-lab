@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 
 from incident_lab.cli import main, parse_jitter_range, parse_seed_spec
+from incident_lab.compare import compare_results
 from incident_lab.debrief import generate_debrief, grade
 from incident_lab.difficulty import (
     EASY, HARD, NORMAL, apply_difficulty, list_difficulties,
@@ -1824,6 +1825,113 @@ class TestDifficulty(unittest.TestCase):
         with handle:
             json.dump(data, handle)
         return handle.name
+
+
+class TestCompare(unittest.TestCase):
+    def _run(self, scenario, policy=DEFAULT_POLICY, **kwargs):
+        return simulate(get(scenario), policy, **kwargs)
+
+    def _write_run(self, result):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(result.to_dict(), handle)
+        return handle.name
+
+    def test_same_run_compares_identical(self):
+        result = self._run("disk-full")
+        comparison = compare_results(result, result)
+        self.assertTrue(comparison.same_scenario)
+        self.assertTrue(comparison.same_policy)
+        self.assertTrue(comparison.timelines_identical)
+        self.assertTrue(all(row["delta"] == 0
+                            for row in comparison.score_rows))
+        self.assertEqual(comparison.timeline_only_a, [])
+        self.assertEqual(comparison.timeline_only_b, [])
+        self.assertIn("identical", comparison.render())
+
+    def test_different_scenarios_flagged_and_scored(self):
+        a = self._run("disk-full")      # 96 points, no escalations
+        b = self._run("latency-spike")  # 67 points, one escalation
+        comparison = compare_results(a, b)
+        self.assertFalse(comparison.same_scenario)
+        self.assertIn("different scenarios", comparison.render())
+        rows = {row["metric"]: row for row in comparison.score_rows}
+        self.assertEqual(rows["points"]["delta"], 67 - 96)
+        self.assertEqual(rows["escalations"]["delta"], 1)
+        self.assertEqual(rows["time_to_ack_min"]["delta"], 9 - 3)
+        # latency-spike escalates, so B has an escalation event A does
+        # not; the declared events differ too (different titles), so
+        # neither run's declared event matches the other's.
+        self.assertTrue(any(event["kind"] == "escalated"
+                            for event in comparison.timeline_only_b))
+        self.assertTrue(any(event["kind"] == "declared"
+                            for event in comparison.timeline_only_a))
+
+    def test_seeded_runs_share_events_with_shifts(self):
+        a = self._run("disk-full", seed=1)
+        b = self._run("disk-full", seed=2)
+        comparison = compare_results(a, b)
+        self.assertTrue(comparison.same_scenario)
+        self.assertEqual(len(comparison.timeline_matched), 5)
+        self.assertEqual(comparison.timeline_only_a, [])
+        self.assertEqual(comparison.timeline_only_b, [])
+        for item in comparison.timeline_matched:
+            self.assertEqual(item["shift"], item["t_b"] - item["t_a"])
+
+    def test_unacked_run_has_null_deltas(self):
+        nobody = Scenario(
+            name="silent", service="svc", title="silent",
+            severity="low", description="",
+            ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=5,
+        )
+        unacked = simulate(nobody, DEFAULT_POLICY)
+        acked = self._run("disk-full")
+        comparison = compare_results(unacked, acked)
+        rows = {row["metric"]: row for row in comparison.score_rows}
+        self.assertIsNone(rows["time_to_ack_min"]["delta"])
+        self.assertIsNone(rows["time_to_mitigate_min"]["delta"])
+        self.assertEqual(rows["points"]["delta"], 96)
+        self.assertIn("-", comparison.render())
+
+    def test_different_policies_flagged(self):
+        from incident_lab.policy import get_policy
+        a = self._run("disk-full")
+        b = self._run("disk-full", policy=get_policy("fast"))
+        comparison = compare_results(a, b)
+        self.assertFalse(comparison.same_policy)
+        self.assertIn("different policies", comparison.render())
+
+    def test_cli_compare_human_and_json(self):
+        path_a = self._write_run(self._run("disk-full", seed=1))
+        path_b = self._write_run(self._run("disk-full", seed=2))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["compare", path_a, path_b]), 0)
+        output = buf.getvalue()
+        self.assertIn(f"A: {path_a}", output)
+        self.assertIn(f"B: {path_b}", output)
+        self.assertIn("points", output)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["compare", path_a, path_b, "--json"]),
+                             0)
+        data = json.loads(buf.getvalue())
+        self.assertTrue(data["same_scenario"])
+        self.assertTrue(data["timeline"]["identical"]
+                        or data["timeline"]["matched"])
+        self.assertEqual(data["run_a"]["scenario"], "disk-full")
+
+    def test_cli_compare_bad_files_fail(self):
+        path = self._write_run(self._run("disk-full"))
+        self.assertEqual(main(["compare", path, "/tmp/no-such-run.json"]),
+                         2)
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            handle.write("{not json")
+        self.assertEqual(main(["compare", path, handle.name]), 2)
 
 
 if __name__ == "__main__":

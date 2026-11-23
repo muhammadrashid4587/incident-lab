@@ -5,6 +5,7 @@ import json
 import sys
 
 from . import __version__
+from .compare import compare_results
 from .debrief import generate_debrief
 from .difficulty import (
     apply_difficulty, list_difficulties, parse_difficulty,
@@ -228,6 +229,18 @@ def main(argv=None) -> int:
                          help="print the postmortem as JSON instead of "
                               "Markdown")
 
+    compare = sub.add_parser(
+        "compare",
+        help="diff two saved --json runs side by side: score deltas "
+             "and timeline differences")
+    compare.add_argument("path_a", metavar="RUN-A",
+                         help="path to a JSON file saved from run --json")
+    compare.add_argument("path_b", metavar="RUN-B",
+                         help="path to a JSON file saved from run --json")
+    compare.add_argument("--json", action="store_true",
+                         help="print the comparison as JSON instead of "
+                              "the human-readable diff")
+
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -282,6 +295,29 @@ def main(argv=None) -> int:
             print(json.dumps(debrief.to_dict(), indent=2))
         else:
             print(debrief.render())
+        return 0
+
+    if args.command == "compare":
+        results = []
+        for path in (args.path_a, args.path_b):
+            try:
+                results.append(load_result(path))
+            except OSError as exc:
+                print(f"cannot read compare file: {exc}", file=sys.stderr)
+                return 2
+            except json.JSONDecodeError as exc:
+                print(f"invalid compare file: {exc}", file=sys.stderr)
+                return 2
+            except ValueError as exc:
+                print(f"invalid compare file: {exc}", file=sys.stderr)
+                return 2
+        comparison = compare_results(results[0], results[1],
+                                     label_a=args.path_a,
+                                     label_b=args.path_b)
+        if args.json:
+            print(json.dumps(comparison.to_dict(), indent=2))
+        else:
+            print(comparison.render())
         return 0
 
     if args.command == "run":
