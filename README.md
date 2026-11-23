@@ -63,6 +63,8 @@ python3 -m incident_lab run disk-full --json > /tmp/disk-full.json
 python3 -m incident_lab what-if /tmp/disk-full.json --ack-timeout 10
 python3 -m incident_lab what-if /tmp/disk-full.json --difficulty hard
 python3 -m incident_lab what-if /tmp/disk-full.json --ack-timeouts primary=2 --json
+python3 -m incident_lab what-if /tmp/disk-full.json --policy standard
+python3 -m incident_lab what-if /tmp/disk-full.json --policy fast --difficulty hard --json
 python3 scripts/demo.py
 ```
 
@@ -151,12 +153,23 @@ exit code 2 and an error message.
 
 ## What-if replay
 
-`what-if <path> --ack-timeout N | --ack-timeouts ... | --difficulty X`
-replays a saved `run --json` run with overridden parameters and shows
-how the score and grade would have changed — what if the primary had
-had 10 minutes to ack, or the same incident had been played on hard?
-The original run file is never modified; the what-if result lives only
-in the output.
+`what-if <path> --ack-timeout N | --ack-timeouts ... | --difficulty X |
+--policy NAME` replays a saved `run --json` run with overridden
+parameters and shows how the score and grade would have changed —
+what if the primary had had 10 minutes to ack, or the same incident
+had been played on hard, or under the standard policy instead of
+fast? The original run file is never modified; the what-if result
+lives only in the output.
+
+`--policy` swaps in a different named escalation policy (built-in, or
+from `--policy-file`, the same way `run` loads one; a file policy
+with the same name as a built-in one wins, and a file with exactly
+one policy needs no `--policy`). The new policy's timeouts are scaled
+to the original run's difficulty, so the replay stays at the
+difficulty the run was played at unless `--difficulty` is also given.
+Behaviour is replayed by chain position — a miss stays a miss — so
+if the new chain is shorter than the level that acked, nobody acks.
+An unknown policy name fails with exit code 2 and an error message.
 
 The replay rebuilds the incident's actual behaviour from the saved
 run: the acking responder's delay is the time-to-ack minus the
@@ -183,13 +196,16 @@ points delta and both grades.
 python3 -m incident_lab run disk-full --policy fast --json > disk-full.json
 python3 -m incident_lab what-if disk-full.json --ack-timeout 5
 python3 -m incident_lab what-if disk-full.json --difficulty hard --json
+python3 -m incident_lab what-if disk-full.json --policy standard
 ```
 
 Example: `disk-full` on the fast policy scores 48 (grade D) because
 the primary's 3m ack is 1m late against the 2m timeout and the late-ack
 credit halves the score. Replayed with 5m timeouts it scores 96
 (grade A) — the same incident, the same responder, just a policy that
-gives them time to answer.
+gives them time to answer. Replayed under the standard policy it
+scores 96 too: the same ack is on time against the standard 5m
+timeout.
 
 ## Stats
 
@@ -396,8 +412,8 @@ incident_lab/
   stats.py       aggregate saved runs: score spread, mean response
                  times, grade counts, per-scenario means
   whatif.py      what-if replay: re-simulate a saved run with
-                 overridden ack timeouts or difficulty, show how the
-                 score and grade would have changed
+                 overridden ack timeouts, difficulty or policy, show
+                 how the score and grade would have changed
   cli.py         list / run / replay / debrief / compare / stats /
                  what-if
 tests/
@@ -460,12 +476,13 @@ human-readable form.
 
 ## Version
 
-0.19.0 — what-if replay: `what-if <saved-run.json> --ack-timeout N |
---ack-timeouts ... | --difficulty X` re-simulates a saved run with
-overridden parameters (rebuilt from the run's own recorded delays, so
-a seeded run's jitter is not drawn again) and shows how the score and
-grade would have changed, human form or `--json`; the original run
-file is never modified.
+0.20.0 — what-if replay against a different named policy:
+`what-if <saved-run.json> --policy <name>` (built-in, or from
+`--policy-file`) re-simulates the saved run under that policy and
+shows how the score and grade would have changed; the new policy's
+timeouts are scaled to the original run's difficulty unless
+`--difficulty` is also given, an unknown policy name fails with exit
+code 2, and the original run file is never modified.
 
 ## Roadmap
 
@@ -488,3 +505,4 @@ file is never modified.
 - [x] Hints: `run --hints N` asks for N hints during a run, drawn in order from the scenario's known-good next actions (each built-in scenario carries 2-3, scenario files can add their own, `template` prints them); each hint costs 5 points off the final score and is recorded in `run --json` and shown again by `replay` (0.17.0)
 - [x] Stats: `stats <run.json>...` aggregates saved runs (score spread, mean response times, acked/resolved counts, escalations, hints used, grade counts, per-scenario means), human form or `--json`, flags mixed scenarios (0.18.0)
 - [x] What-if replay: `what-if <saved-run.json> --ack-timeout N | --ack-timeouts ... | --difficulty X` re-simulates a saved run with overridden parameters and shows how the score and grade would have changed (human form or `--json`); the incident's behaviour is rebuilt from the saved run's own recorded delays, a seeded run's jitter is not drawn again, hints are kept, and the original run file is never modified (0.19.0)
+- [x] What-if replay against a different named policy: `what-if <saved-run.json> --policy <name>` (built-in, or from `--policy-file`) re-simulates the saved run under that policy and shows how the score and grade would have changed; the new policy's timeouts are scaled to the original run's difficulty unless `--difficulty` is also given, an unknown policy name fails with exit code 2, and the original run file is never modified (0.20.0)

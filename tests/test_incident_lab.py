@@ -17,8 +17,8 @@ from incident_lab.difficulty import (
     parse_difficulty,
 )
 from incident_lab.policy import (
-    DEFAULT_POLICY, get_policy, list_policies, load_policy_file,
-    parse_ack_timeout_overrides,
+    DEFAULT_POLICY, EscalationPolicy, Level, Responder, get_policy,
+    list_policies, load_policy_file, parse_ack_timeout_overrides,
 )
 from incident_lab.replay import load_result
 from incident_lab.scenarios import (
@@ -2384,6 +2384,119 @@ class TestWhatIf(unittest.TestCase):
              for level in outcome.replayed.policy.levels],
             [5, 5, 5])
 
+    def _write_policy_file(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with handle:
+            if isinstance(data, str):
+                handle.write(data)
+            else:
+                json.dump(data, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_policy_override_replays_under_the_named_policy(self):
+        # disk-full on the fast policy scores 48 (D): the 3m ack is
+        # 1m late against the 2m timeout. Under standard the same ack
+        # is on time and the incident scores 96 (A).
+        original = self._run("disk-full", get_policy("fast"))
+        self.assertEqual(original.score.points, 48)
+        outcome = what_if(original, policy=DEFAULT_POLICY)
+        self.assertEqual(outcome.replayed.score.points, 96)
+        self.assertEqual(outcome.replayed.policy.name, "standard")
+        self.assertEqual(
+            [level.ack_timeout_min
+             for level in outcome.replayed.policy.levels],
+            [5, 5, 10])
+        self.assertEqual(outcome.points_delta, 48)
+        self.assertEqual(outcome.grade_delta, "D -> A")
+        self.assertEqual(outcome.overrides,
+                         ["policy: fast -> standard"])
+
+    def test_policy_override_matches_a_fresh_run_at_that_policy(self):
+        original = self._run("latency-spike")
+        outcome = what_if(original, policy=get_policy("fast"))
+        fresh = self._run("latency-spike", get_policy("fast"))
+        self.assertEqual(outcome.replayed.score.points,
+                         fresh.score.points)
+        self.assertEqual(outcome.replayed.timeline.to_dict(),
+                         fresh.timeline.to_dict())
+
+    def test_policy_override_keeps_the_original_difficulty(self):
+        # An easy run replayed under fast stays easy: the fast
+        # timeouts are scaled by the easy factor (2m -> 3m, 5m -> 8m)
+        # instead of being used as-is.
+        original = self._run(
+            "disk-full", apply_difficulty(DEFAULT_POLICY, EASY),
+            difficulty=EASY)
+        self.assertEqual(original.score.points, 99)
+        outcome = what_if(original, policy=get_policy("fast"))
+        self.assertEqual(
+            [level.ack_timeout_min
+             for level in outcome.replayed.policy.levels],
+            [3, 3, 8])
+        self.assertEqual(outcome.replayed.difficulty.name, "easy")
+        fresh = self._run("disk-full",
+                          apply_difficulty(get_policy("fast"), EASY),
+                          difficulty=EASY)
+        self.assertEqual(outcome.replayed.score.points,
+                         fresh.score.points)
+
+    def test_policy_and_difficulty_combine(self):
+        original = self._run("disk-full")
+        outcome = what_if(original, policy=get_policy("fast"),
+                          difficulty=HARD)
+        # Fast timeouts scaled to hard (2m -> 1m, 5m -> 3m); the 3m
+        # ack is 2m late against the 1m timeout, so it keeps no credit.
+        self.assertEqual(
+            [level.ack_timeout_min
+             for level in outcome.replayed.policy.levels],
+            [1, 1, 3])
+        self.assertEqual(outcome.overrides,
+                         ["policy: standard -> fast",
+                          "difficulty: normal -> hard"])
+        fresh = self._run("disk-full",
+                          apply_difficulty(get_policy("fast"), HARD),
+                          difficulty=HARD)
+        self.assertEqual(outcome.replayed.score.points,
+                         fresh.score.points)
+
+    def test_policy_and_ack_timeout_combine_with_timeout_winning(self):
+        original = self._run("disk-full", get_policy("fast"))
+        outcome = what_if(original, policy=DEFAULT_POLICY, ack_timeout=5)
+        self.assertEqual(
+            [level.ack_timeout_min
+             for level in outcome.replayed.policy.levels],
+            [5, 5, 5])
+        self.assertEqual(outcome.replayed.score.points, 96)
+        self.assertEqual(outcome.overrides,
+                         ["policy: fast -> standard",
+                          "ack timeout: every level 5m"])
+
+    def test_policy_override_with_seeded_run_replays_recorded_delays(self):
+        # The seeded ack delay is replayed exactly, not drawn again:
+        # the time-to-ack is unchanged under the new policy.
+        original = self._run("disk-full", get_policy("fast"),
+                             seed=7, jitter=(0, 3))
+        outcome = what_if(original, policy=DEFAULT_POLICY)
+        self.assertEqual(outcome.replayed.score.time_to_ack_min,
+                         original.score.time_to_ack_min)
+        self.assertEqual(outcome.replayed.policy.name, "standard")
+
+    def test_shorter_policy_chain_can_leave_the_incident_unacked(self):
+        # latency-spike is acked by the secondary. Under a one-level
+        # chain there is no secondary, so nobody acks.
+        solo = EscalationPolicy(
+            name="solo",
+            levels=(Level(Responder("ana", "primary"), 5),))
+        original = self._run("latency-spike")
+        self.assertEqual(original.score.points, 67)
+        outcome = what_if(original, policy=solo)
+        self.assertEqual(outcome.replayed.score.points, 0)
+        self.assertFalse(outcome.replayed.score.resolved)
+        self.assertEqual(outcome.overrides,
+                         ["policy: standard -> solo"])
+
     def test_unacked_run_stays_unacked(self):
         ghost = Scenario(
             name="ghost", service="svc", title="ghost", severity="high",
@@ -2477,6 +2590,88 @@ class TestWhatIf(unittest.TestCase):
         out = buf.getvalue()
         self.assertIn("override: difficulty: normal -> hard", out)
         self.assertIn("67/100 (grade C) -> 43/100 (grade D)", out)
+
+    def test_cli_what_if_policy(self):
+        path = self._write_run(self._run("disk-full",
+                                         get_policy("fast")))
+        with open(path, encoding="utf-8") as handle:
+            before = handle.read()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["what-if", path, "--policy",
+                                   "standard"]), 0)
+        out = buf.getvalue()
+        self.assertIn("override: policy: fast -> standard", out)
+        self.assertIn("48/100 (grade D) -> 96/100 (grade A)", out)
+        self.assertIn("delta:            +48 points", out)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["what-if", path, "--policy",
+                                   "standard", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["points_delta"], 48)
+        self.assertEqual(data["what_if"]["score"]["points"], 96)
+        self.assertEqual(data["what_if"]["policy"]["name"], "standard")
+        self.assertEqual(data["overrides"],
+                         ["policy: fast -> standard"])
+        # The original run file is not modified by the what-if.
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_cli_what_if_unknown_policy_fails(self):
+        path = self._write_run(self._run("disk-full"))
+        self.assertEqual(main(["what-if", path, "--policy", "bogus"]),
+                         2)
+
+    def test_cli_what_if_policy_file(self):
+        policy_path = self._write_policy_file({"policies": {
+            "relaxed": {"levels": [
+                {"name": "ana", "role": "primary", "ack_timeout_min": 10},
+                {"name": "ben", "role": "secondary",
+                 "ack_timeout_min": 10},
+                {"name": "carla", "role": "manager",
+                 "ack_timeout_min": 20},
+            ]},
+            "brisk": {"levels": [
+                {"name": "ana", "role": "primary", "ack_timeout_min": 1},
+                {"name": "ben", "role": "secondary", "ack_timeout_min": 1},
+            ]},
+        }})
+        path = self._write_run(self._run("disk-full",
+                                         get_policy("fast")))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["what-if", path, "--policy-file",
+                                   policy_path, "--policy", "relaxed"]),
+                             0)
+        out = buf.getvalue()
+        self.assertIn("override: policy: fast -> relaxed", out)
+        self.assertIn("48/100 (grade D) -> 96/100 (grade A)", out)
+        # A file with exactly one policy needs no --policy flag.
+        single_path = self._write_policy_file({"policies": {
+            "relaxed": {"levels": [
+                {"name": "ana", "role": "primary", "ack_timeout_min": 10},
+                {"name": "ben", "role": "secondary",
+                 "ack_timeout_min": 10},
+                {"name": "carla", "role": "manager",
+                 "ack_timeout_min": 20},
+            ]}}})
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["what-if", path, "--policy-file",
+                                   single_path]), 0)
+        self.assertIn("override: policy: fast -> relaxed",
+                      buf.getvalue())
+        # A file with more than one policy and no --policy flag fails.
+        self.assertEqual(main(["what-if", path, "--policy-file",
+                              policy_path]), 2)
+        # A missing or malformed policy file fails.
+        self.assertEqual(main(["what-if", path, "--policy-file",
+                              "/no/such/policy-file.json",
+                              "--policy", "relaxed"]), 2)
+        bad_path = self._write_policy_file("{not json")
+        self.assertEqual(main(["what-if", path, "--policy-file",
+                              bad_path, "--policy", "relaxed"]), 2)
 
     def test_cli_what_if_bad_files_and_args_fail(self):
         missing = os.path.join(tempfile.gettempdir(), "no-such-run.json")

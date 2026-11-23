@@ -13,13 +13,13 @@ never acked — without the original scenario file:
   mitigate and resolve times in the saved score.
 
 The what-if then re-simulates that behaviour with overridden
-parameters — different ack timeouts, or a different difficulty — and
-shows how the score and grade would have changed. The recorded delays
-are replayed exactly as they happened, so a seeded run's jitter is
-already baked in and is not drawn again; with no overrides the
-what-if reproduces the original run exactly. The original run file is
-never modified: the what-if result lives only in memory (or in the
-`--json` output).
+parameters — different ack timeouts, a different difficulty, or a
+different named policy — and shows how the score and grade would
+have changed. The recorded delays are replayed exactly as they
+happened, so a seeded run's jitter is already baked in and is not
+drawn again; with no overrides the what-if reproduces the original
+run exactly. The original run file is never modified: the what-if
+result lives only in memory (or in the `--json` output).
 """
 
 from dataclasses import dataclass, replace
@@ -182,19 +182,28 @@ def _fmt_maybe(value) -> str:
 
 
 def what_if(original, ack_timeout=None, ack_timeouts=None,
-            difficulty=None) -> WhatIfResult:
+            difficulty=None, policy=None) -> WhatIfResult:
     """Re-simulate a saved run with overridden parameters.
 
     ``ack_timeout`` sets every level's timeout to that many minutes;
     ``ack_timeouts`` is the ``--ack-timeouts`` token list (a positional
     list in level order, or named overrides such as ``primary=120``);
-    ``difficulty`` replays the run at that difficulty. At most one of
-    ``ack_timeout`` and ``ack_timeouts`` may be given. Difficulty
-    scales the recorded timeouts relative to the original run's
-    difficulty (the saved timeouts already carry the original
-    difficulty's scaling), and the scoring targets come from the new
-    difficulty; an explicit ack timeout override still wins for the
-    levels it sets, exactly as in ``run``.
+    ``difficulty`` replays the run at that difficulty; ``policy`` swaps
+    in a different escalation policy (an EscalationPolicy, resolved
+    from a name by the caller). At most one of ``ack_timeout`` and
+    ``ack_timeouts`` may be given. Difficulty scales the recorded
+    timeouts relative to the original run's difficulty (the saved
+    timeouts already carry the original difficulty's scaling), and the
+    scoring targets come from the new difficulty; an explicit ack
+    timeout override still wins for the levels it sets, exactly as in
+    ``run``.
+
+    A swapped-in policy's timeouts are base values, so they are first
+    scaled by the original run's difficulty: the replay stays at the
+    difficulty the run was played at unless ``difficulty`` is also
+    given (the same as ``run --policy X --difficulty D``). Behaviour
+    is replayed by chain position — a miss stays a miss — so if the
+    new chain is shorter than the level that acked, nobody acks.
 
     The original run's hints are kept: they were asked for during the
     run, so they cost the same in the replay. The recorded delays are
@@ -212,10 +221,19 @@ def what_if(original, ack_timeout=None, ack_timeouts=None,
             raise ValueError(
                 "ack timeout must be a positive integer number of minutes")
     scenario = _scenario_from_result(original)
-    policy = original.policy
+    original_difficulty = original.difficulty or NORMAL
     overrides = []
+    if policy is not None:
+        # Swap in the named policy, scaled to the original run's
+        # difficulty first (see the docstring); the difficulty block
+        # below re-scales it again if a new difficulty is given.
+        policy = _scale_timeouts(policy,
+                                 original_difficulty.timeout_factor)
+        overrides.append(
+            f"policy: {original.policy.name} -> {policy.name}")
+    else:
+        policy = original.policy
     if difficulty is not None:
-        original_difficulty = original.difficulty or NORMAL
         if difficulty.name != original_difficulty.name:
             factor = (difficulty.timeout_factor
                       / original_difficulty.timeout_factor)

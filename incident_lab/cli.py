@@ -271,9 +271,9 @@ def main(argv=None) -> int:
     whatif = sub.add_parser(
         "what-if",
         help="replay a saved --json run with overridden parameters "
-             "(ack timeouts, difficulty) and show how the score and "
-             "grade would have changed; the original run file is not "
-             "modified")
+             "(ack timeouts, difficulty, policy) and show how the score "
+             "and grade would have changed; the original run file is "
+             "not modified")
     whatif.add_argument("path", metavar="PATH",
                         help="path to a JSON file saved from run --json")
     whatif.add_argument("--ack-timeout", type=int, default=None,
@@ -290,6 +290,17 @@ def main(argv=None) -> int:
                              "(or 1, 2, 3); scales ack timeouts relative "
                              "to the original run's difficulty and scores "
                              "against the new difficulty's targets")
+    whatif.add_argument("--policy", default=None,
+                        help="replay the run under a different named "
+                             "escalation policy "
+                             f"({', '.join(list_policies())}); the new "
+                             "policy's timeouts are scaled to the "
+                             "original run's difficulty unless "
+                             "--difficulty is also given")
+    whatif.add_argument("--policy-file", default=None, metavar="PATH",
+                        help="load named policies from a JSON file; use "
+                             "one with --policy, or the file's only "
+                             "policy if it has exactly one")
     whatif.add_argument("--json", action="store_true",
                         help="print the what-if result as JSON instead of "
                              "the human-readable report")
@@ -406,10 +417,41 @@ def main(argv=None) -> int:
         except ValueError as exc:
             print(f"invalid what-if file: {exc}", file=sys.stderr)
             return 2
+        policies = dict(POLICIES)
+        if args.policy_file is not None:
+            try:
+                file_policies = load_policy_file(args.policy_file)
+            except OSError as exc:
+                print(f"cannot read policy file: {exc}", file=sys.stderr)
+                return 2
+            except ValueError as exc:
+                print(f"invalid policy file: {exc}", file=sys.stderr)
+                return 2
+            policies.update(file_policies)
+        policy_name = args.policy
+        if policy_name is None:
+            if args.policy_file is not None and len(file_policies) == 1:
+                policy_name = next(iter(file_policies))
+            elif args.policy_file is not None:
+                print("policy file has more than one policy; pick one with "
+                      "--policy", file=sys.stderr)
+                print(f"policies in file: {', '.join(file_policies)}",
+                      file=sys.stderr)
+                return 2
+        policy = None
+        if policy_name is not None:
+            try:
+                policy = policies[policy_name]
+            except KeyError:
+                print(f"unknown policy: {policy_name}", file=sys.stderr)
+                print(f"known policies: {', '.join(policies)}",
+                      file=sys.stderr)
+                return 2
         if (args.ack_timeout is None and args.ack_timeouts is None
-                and args.difficulty is None):
+                and args.difficulty is None and policy is None):
             print("what-if needs an override: --ack-timeout, "
-                  "--ack-timeouts or --difficulty", file=sys.stderr)
+                  "--ack-timeouts, --difficulty or --policy",
+                  file=sys.stderr)
             return 2
         difficulty = None
         if args.difficulty is not None:
@@ -421,7 +463,7 @@ def main(argv=None) -> int:
         try:
             outcome = what_if(result, ack_timeout=args.ack_timeout,
                               ack_timeouts=args.ack_timeouts,
-                              difficulty=difficulty)
+                              difficulty=difficulty, policy=policy)
         except ValueError as exc:
             print(f"invalid what-if: {exc}", file=sys.stderr)
             return 2
