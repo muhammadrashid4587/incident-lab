@@ -10,6 +10,9 @@ All times are simulated minutes. Nothing here pages a real person.
 """
 
 from dataclasses import dataclass
+import json
+
+from .incident import SEVERITIES
 
 
 @dataclass(frozen=True)
@@ -118,3 +121,119 @@ def get(name: str) -> Scenario:
 def list_scenarios() -> list:
     """Scenario names, in definition order."""
     return list(SCENARIOS)
+
+
+def scenario_to_dict(scenario: Scenario) -> dict:
+    """JSON-ready dict of a scenario (its name is the key it sits under).
+
+    The shape matches one entry of a scenario file, so the output of
+    ``template`` can be saved and used with ``--scenario-file`` as-is.
+    """
+    return {
+        "service": scenario.service,
+        "title": scenario.title,
+        "severity": scenario.severity,
+        "description": scenario.description,
+        "ack_delay_min": list(scenario.ack_delay_min),
+        "mitigate_delay_min": scenario.mitigate_delay_min,
+        "resolve_delay_min": scenario.resolve_delay_min,
+    }
+
+
+def _require_string(data: dict, field: str, name: str) -> str:
+    value = data.get(field)
+    if not isinstance(value, str) or not value:
+        raise ValueError(
+            f"scenario {name!r}: {field!r} must be a non-empty string")
+    return value
+
+
+def _require_positive_int(data: dict, field: str, name: str) -> int:
+    value = data.get(field)
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(
+            f"scenario {name!r}: {field!r} must be a positive integer "
+            "number of minutes")
+    return value
+
+
+def _scenario_from_dict(name: str, data) -> Scenario:
+    """Build one scenario from its JSON mapping, validating as we go."""
+    if not isinstance(data, dict):
+        raise ValueError(f"scenario {name!r}: expected an object")
+    severity = _require_string(data, "severity", name)
+    if severity not in SEVERITIES:
+        raise ValueError(
+            f"scenario {name!r}: 'severity' must be one of {SEVERITIES}, "
+            f"got {severity!r}")
+    description = data.get("description", "")
+    if not isinstance(description, str):
+        raise ValueError(
+            f"scenario {name!r}: 'description' must be a string")
+    raw_delays = data.get("ack_delay_min")
+    if not isinstance(raw_delays, list) or not raw_delays:
+        raise ValueError(
+            f"scenario {name!r}: 'ack_delay_min' must be a non-empty list "
+            "of minutes (or null for a responder who never acks)")
+    delays = []
+    for index, raw in enumerate(raw_delays):
+        if raw is None:
+            delays.append(None)
+        elif isinstance(raw, bool) or not isinstance(raw, int) or raw <= 0:
+            raise ValueError(
+                f"scenario {name!r}: 'ack_delay_min' entry {index} must "
+                "be a positive integer number of minutes or null")
+        else:
+            delays.append(raw)
+    return Scenario(
+        name=name,
+        service=_require_string(data, "service", name),
+        title=_require_string(data, "title", name),
+        severity=severity,
+        description=description,
+        ack_delay_min=tuple(delays),
+        mitigate_delay_min=_require_positive_int(
+            data, "mitigate_delay_min", name),
+        resolve_delay_min=_require_positive_int(
+            data, "resolve_delay_min", name),
+    )
+
+
+def load_scenario_file(path: str) -> dict:
+    """Load named scenarios from a JSON file.
+
+    The file is an object with a "scenarios" mapping, each entry a
+    scenario with "service", "title", "severity", "description",
+    "ack_delay_min" (a list of minutes, or null where a responder never
+    acks) and "mitigate_delay_min" / "resolve_delay_min"::
+
+        {"scenarios": {"cache-down": {
+            "service": "sessions-cache",
+            "title": "Cache cluster unreachable",
+            "severity": "high",
+            "description": "Redis cluster stopped accepting writes.",
+            "ack_delay_min": [2, null, null],
+            "mitigate_delay_min": 15,
+            "resolve_delay_min": 10
+        }}}
+
+    Returns a dict of name -> Scenario. Raises FileNotFoundError if the
+    file is missing, json.JSONDecodeError on bad JSON, and ValueError on
+    a wrong shape or an invalid scenario.
+    """
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("scenario file: expected a JSON object")
+    raw_scenarios = data.get("scenarios")
+    if not isinstance(raw_scenarios, dict) or not raw_scenarios:
+        raise ValueError(
+            "scenario file: 'scenarios' must be a non-empty object "
+            "mapping scenario names to scenarios")
+    scenarios = {}
+    for name, raw in raw_scenarios.items():
+        if not isinstance(name, str) or not name:
+            raise ValueError("scenario file: scenario names must be "
+                             "non-empty")
+        scenarios[name] = _scenario_from_dict(name, raw)
+    return scenarios

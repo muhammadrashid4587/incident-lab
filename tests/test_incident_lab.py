@@ -16,7 +16,9 @@ from incident_lab.policy import (
     parse_ack_timeout_overrides,
 )
 from incident_lab.replay import load_result
-from incident_lab.scenarios import Scenario, get, list_scenarios
+from incident_lab.scenarios import (
+    Scenario, get, list_scenarios, load_scenario_file, scenario_to_dict,
+)
 from incident_lab.simulator import simulate, simulate_batch
 from incident_lab.timeline import Timeline
 
@@ -1512,6 +1514,139 @@ class TestDebrief(unittest.TestCase):
 
     def test_cli_debrief_missing_file_fails(self):
         self.assertEqual(main(["debrief", "/tmp/no-such-run.json"]), 2)
+
+
+class TestScenarioTemplates(unittest.TestCase):
+    def _write_scenario_file(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with handle:
+            if isinstance(data, str):
+                handle.write(data)
+            else:
+                json.dump(data, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def _cache_down_data(self):
+        return {"scenarios": {"cache-down": {
+            "service": "sessions-cache",
+            "title": "Cache cluster unreachable",
+            "severity": "high",
+            "description": "The sessions cache stopped accepting writes.",
+            "ack_delay_min": [2, None, None],
+            "mitigate_delay_min": 15,
+            "resolve_delay_min": 10,
+        }}}
+
+    def test_template_prints_shareable_json(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["template", "disk-full"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data, {"scenarios": {
+            "disk-full": scenario_to_dict(get("disk-full"))}})
+
+    def test_template_round_trips_through_scenario_file(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["template", "dns-outage"]), 0)
+        path = self._write_scenario_file(buf.getvalue())
+        scenarios = load_scenario_file(path)
+        self.assertEqual(scenarios["dns-outage"], get("dns-outage"))
+
+    def test_template_unknown_scenario_fails(self):
+        self.assertEqual(main(["template", "no-such-scenario"]), 2)
+
+    def test_loads_named_scenarios(self):
+        scenarios = load_scenario_file(
+            self._write_scenario_file(self._cache_down_data()))
+        self.assertEqual(list(scenarios), ["cache-down"])
+        scenario = scenarios["cache-down"]
+        self.assertEqual(scenario.service, "sessions-cache")
+        self.assertEqual(scenario.severity, "high")
+        self.assertEqual(scenario.ack_delay_min, (2, None, None))
+        self.assertEqual(scenario.mitigate_delay_min, 15)
+        self.assertEqual(scenario.resolve_delay_min, 10)
+
+    def test_missing_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            load_scenario_file("/no/such/scenario-file.json")
+
+    def test_malformed_json_raises(self):
+        path = self._write_scenario_file("{not json")
+        with self.assertRaises(json.JSONDecodeError):
+            load_scenario_file(path)
+
+    def test_missing_scenarios_key_raises(self):
+        path = self._write_scenario_file({"policies": {}})
+        with self.assertRaises(ValueError):
+            load_scenario_file(path)
+
+    def test_empty_scenarios_raises(self):
+        path = self._write_scenario_file({"scenarios": {}})
+        with self.assertRaises(ValueError):
+            load_scenario_file(path)
+
+    def test_bad_severity_raises(self):
+        data = self._cache_down_data()
+        data["scenarios"]["cache-down"]["severity"] = "catastrophic"
+        path = self._write_scenario_file(data)
+        with self.assertRaises(ValueError):
+            load_scenario_file(path)
+
+    def test_empty_ack_delays_raises(self):
+        data = self._cache_down_data()
+        data["scenarios"]["cache-down"]["ack_delay_min"] = []
+        path = self._write_scenario_file(data)
+        with self.assertRaises(ValueError):
+            load_scenario_file(path)
+
+    def test_zero_mitigate_delay_raises(self):
+        data = self._cache_down_data()
+        data["scenarios"]["cache-down"]["mitigate_delay_min"] = 0
+        path = self._write_scenario_file(data)
+        with self.assertRaises(ValueError):
+            load_scenario_file(path)
+
+    def test_cli_runs_file_scenario(self):
+        path = self._write_scenario_file(self._cache_down_data())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "cache-down", "--scenario-file", path]), 0)
+        out = buf.getvalue()
+        self.assertIn("incident: Cache cluster unreachable [high]", out)
+        self.assertIn("service:  sessions-cache", out)
+        self.assertIn("points:           99/100", out)
+
+    def test_cli_file_scenario_overrides_builtin_name(self):
+        # A file scenario called "disk-full" wins over the built-in one.
+        data = self._cache_down_data()
+        data["scenarios"]["disk-full"] = data["scenarios"].pop("cache-down")
+        path = self._write_scenario_file(data)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--scenario-file", path,
+                      "--json"]), 0)
+        result = json.loads(buf.getvalue())
+        self.assertEqual(result["incident"]["service"], "sessions-cache")
+
+    def test_cli_missing_scenario_file_fails(self):
+        self.assertEqual(
+            main(["run", "cache-down", "--scenario-file",
+                  "/no/such/scenario-file.json"]), 2)
+
+    def test_cli_invalid_scenario_file_fails(self):
+        path = self._write_scenario_file("{not json")
+        self.assertEqual(
+            main(["run", "cache-down", "--scenario-file", path]), 2)
+
+    def test_cli_unknown_file_scenario_fails(self):
+        path = self._write_scenario_file(self._cache_down_data())
+        self.assertEqual(
+            main(["run", "no-such-scenario", "--scenario-file", path]), 2)
 
 
 if __name__ == "__main__":

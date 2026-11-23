@@ -10,7 +10,9 @@ from .policy import (
     POLICIES, list_policies, load_policy_file, parse_ack_timeout_overrides,
 )
 from .replay import load_result
-from .scenarios import get, list_scenarios
+from .scenarios import (
+    SCENARIOS, get, list_scenarios, load_scenario_file, scenario_to_dict,
+)
 from .simulator import simulate, simulate_batch
 
 
@@ -156,8 +158,19 @@ def main(argv=None) -> int:
 
     sub.add_parser("list", help="list the built-in scenarios")
 
+    template = sub.add_parser(
+        "template",
+        help="print a scenario as a shareable JSON template, ready to "
+             "save and use with run --scenario-file")
+    template.add_argument("scenario",
+                          help="scenario name (see: incident-lab list)")
+
     run = sub.add_parser("run", help="run one scenario and print the replay")
     run.add_argument("scenario", help="scenario name (see: incident-lab list)")
+    run.add_argument("--scenario-file", default=None, metavar="PATH",
+                     help="load named scenarios from a JSON file; a file "
+                          "scenario with the same name as a built-in one "
+                          "wins (see: incident-lab template)")
     run.add_argument("--ack-timeout", type=int, default=None,
                      help="override the ack timeout (minutes) for every level")
     run.add_argument("--ack-timeouts", nargs="+", default=None,
@@ -212,6 +225,19 @@ def main(argv=None) -> int:
                   f"[{scenario.severity}] {scenario.title}")
         return 0
 
+    if args.command == "template":
+        try:
+            scenario = get(args.scenario)
+        except KeyError:
+            print(f"unknown scenario: {args.scenario}", file=sys.stderr)
+            print(f"known scenarios: {', '.join(list_scenarios())}",
+                  file=sys.stderr)
+            return 2
+        print(json.dumps(
+            {"scenarios": {scenario.name: scenario_to_dict(scenario)}},
+            indent=2))
+        return 0
+
     if args.command == "replay":
         try:
             result = load_result(args.path)
@@ -247,13 +273,32 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "run":
-        try:
-            scenario = get(args.scenario)
-        except KeyError:
-            print(f"unknown scenario: {args.scenario}", file=sys.stderr)
-            print(f"known scenarios: {', '.join(list_scenarios())}",
-                  file=sys.stderr)
-            return 2
+        file_scenarios = {}
+        if args.scenario_file is not None:
+            try:
+                file_scenarios = load_scenario_file(args.scenario_file)
+            except OSError as exc:
+                print(f"cannot read scenario file: {exc}", file=sys.stderr)
+                return 2
+            except json.JSONDecodeError as exc:
+                print(f"invalid scenario file: {exc}", file=sys.stderr)
+                return 2
+            except ValueError as exc:
+                print(f"invalid scenario file: {exc}", file=sys.stderr)
+                return 2
+        if args.scenario in file_scenarios:
+            scenario = file_scenarios[args.scenario]
+        else:
+            try:
+                scenario = get(args.scenario)
+            except KeyError:
+                print(f"unknown scenario: {args.scenario}", file=sys.stderr)
+                known = list_scenarios() + sorted(
+                    name for name in file_scenarios
+                    if name not in SCENARIOS)
+                print(f"known scenarios: {', '.join(known)}",
+                      file=sys.stderr)
+                return 2
         policies = dict(POLICIES)
         if args.policy_file is not None:
             try:

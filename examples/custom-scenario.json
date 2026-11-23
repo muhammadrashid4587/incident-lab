@@ -1,0 +1,17 @@
+{
+    "scenarios": {
+        "cache-down": {
+            "ack_delay_min": [
+                2,
+                null,
+                null
+            ],
+            "description": "The sessions cache stopped accepting writes after a config push.",
+            "mitigate_delay_min": 15,
+            "resolve_delay_min": 10,
+            "service": "sessions-cache",
+            "severity": "high",
+            "title": "Cache cluster unreachable"
+        }
+    }
+}

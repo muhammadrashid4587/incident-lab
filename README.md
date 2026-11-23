@@ -45,6 +45,9 @@ python3 -m incident_lab replay /tmp/dns-outage.json
 python3 -m incident_lab run latency-spike --json > /tmp/latency-spike.json
 python3 -m incident_lab debrief /tmp/latency-spike.json
 python3 -m incident_lab debrief /tmp/latency-spike.json --json
+python3 -m incident_lab template disk-full > my-disk-full.json
+python3 -m incident_lab run disk-full --scenario-file my-disk-full.json
+python3 -m incident_lab run cache-down --scenario-file examples/custom-scenario.json
 python3 scripts/demo.py
 ```
 
@@ -104,6 +107,39 @@ as JSON instead of Markdown.
 python3 -m incident_lab run latency-spike --json > latency-spike.json
 python3 -m incident_lab debrief latency-spike.json
 ```
+
+## Incident templates
+
+`template <scenario>` prints a scenario as a shareable JSON template —
+the same shape a scenario file uses — so you can save it, edit it, and
+hand it to someone else:
+
+```sh
+python3 -m incident_lab template disk-full > my-disk-full.json
+```
+
+`run <name> --scenario-file <path>` loads named scenarios from a JSON
+file, the same way `--policy-file` loads policies. A file scenario with
+the same name as a built-in one wins. The file holds a `"scenarios"`
+mapping, each entry with `service`, `title`, `severity` (`low`,
+`medium`, `high` or `critical`), `description`, `ack_delay_min` (a list
+of minutes per escalation level, `null` where a responder never acks),
+and `mitigate_delay_min` / `resolve_delay_min`:
+
+```json
+{"scenarios": {"cache-down": {
+  "service": "sessions-cache",
+  "title": "Cache cluster unreachable",
+  "severity": "high",
+  "description": "The sessions cache stopped accepting writes.",
+  "ack_delay_min": [2, null, null],
+  "mitigate_delay_min": 15,
+  "resolve_delay_min": 10
+}}}
+```
+
+See `examples/custom-scenario.json`. A missing file, bad JSON, or an
+invalid scenario fails the run with exit code 2 and an error message.
 
 ## Scenarios
 
@@ -187,7 +223,7 @@ incident_lab/
   policy.py      escalation chain: responders, ack timeouts
   incident.py    incident model
   timeline.py    append-only, time-ordered event log
-  scenarios.py   built-in incident scenarios
+  scenarios.py   built-in incident scenarios + scenario files/templates
   simulator.py   deterministic simulation + scoring
   replay.py      rebuild a saved --json run for re-printing
   debrief.py     structured postmortem from a saved run
@@ -198,6 +234,7 @@ scripts/
   demo.py        run every scenario, one-line summary each
 examples/
   custom-policy.json   sample file for --policy-file
+  custom-scenario.json sample file for --scenario-file
 ```
 
 ## Tests
@@ -251,10 +288,11 @@ human-readable form.
 
 ## Version
 
-0.13.0 — debrief/postmortem report generator: `debrief <saved-run.json>`
-writes a structured postmortem (summary with score and grade, timeline,
-what went well / badly, action items with owners) as Markdown or with
-`--json` as JSON, every finding derived from the run itself.
+0.14.0 — shareable incident templates: `template <scenario>` prints a
+scenario as JSON you can save, edit and share, and `run <name>
+--scenario-file <path>` runs scenarios from a JSON file (a file scenario
+with the same name as a built-in one wins), with the same validation and
+exit-code-2 errors as `--policy-file`.
 
 ## Roadmap
 
@@ -271,3 +309,4 @@ what went well / badly, action items with owners) as Markdown or with
 - [x] Seeded jitter for mitigate and resolve delays, recorded in JSON, replay round-trips (0.11.0)
 - [x] Multi-seed batch mode: `--seeds 1,2,3` or `--seeds 1-5` runs the same scenario per seed and reports the score distribution (mean/min/max/median, per-seed scores) in human output and `--json` (0.12.0)
 - [x] Debrief/postmortem report generator: `debrief <saved-run.json>` writes a structured postmortem (summary with score and grade, timeline, what went well / badly, action items with owners) as Markdown or `--json`, every finding derived from the run (0.13.0)
+- [x] Shareable incident templates: `template <scenario>` prints a scenario as JSON, `run --scenario-file` loads named scenarios from a JSON file (file wins over built-in names), validated like `--policy-file` (0.14.0)
