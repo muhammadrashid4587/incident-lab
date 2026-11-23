@@ -19,6 +19,7 @@ from .scenarios import (
 )
 from .simulator import simulate, simulate_batch
 from .stats import aggregate_stats
+from .whatif import what_if
 
 
 def parse_seed_spec(spec: str) -> list:
@@ -267,6 +268,32 @@ def main(argv=None) -> int:
                        help="print the summary as JSON instead of the "
                             "human-readable form")
 
+    whatif = sub.add_parser(
+        "what-if",
+        help="replay a saved --json run with overridden parameters "
+             "(ack timeouts, difficulty) and show how the score and "
+             "grade would have changed; the original run file is not "
+             "modified")
+    whatif.add_argument("path", metavar="PATH",
+                        help="path to a JSON file saved from run --json")
+    whatif.add_argument("--ack-timeout", type=int, default=None,
+                        help="override the ack timeout (minutes) for "
+                             "every level")
+    whatif.add_argument("--ack-timeouts", nargs="+", default=None,
+                        metavar="TIMEOUTS",
+                        help="override ack timeouts per level, in level "
+                             "order (120,300,600) or by name "
+                             "(primary=120 L2=300)")
+    whatif.add_argument("--difficulty", default=None,
+                        help="replay the run at this difficulty level: "
+                             f"{', '.join(list_difficulties())} "
+                             "(or 1, 2, 3); scales ack timeouts relative "
+                             "to the original run's difficulty and scores "
+                             "against the new difficulty's targets")
+    whatif.add_argument("--json", action="store_true",
+                        help="print the what-if result as JSON instead of "
+                             "the human-readable report")
+
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -365,6 +392,43 @@ def main(argv=None) -> int:
             print(json.dumps(summary.to_dict(), indent=2))
         else:
             print(summary.render())
+        return 0
+
+    if args.command == "what-if":
+        try:
+            result = load_result(args.path)
+        except OSError as exc:
+            print(f"cannot read what-if file: {exc}", file=sys.stderr)
+            return 2
+        except json.JSONDecodeError as exc:
+            print(f"invalid what-if file: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"invalid what-if file: {exc}", file=sys.stderr)
+            return 2
+        if (args.ack_timeout is None and args.ack_timeouts is None
+                and args.difficulty is None):
+            print("what-if needs an override: --ack-timeout, "
+                  "--ack-timeouts or --difficulty", file=sys.stderr)
+            return 2
+        difficulty = None
+        if args.difficulty is not None:
+            try:
+                difficulty = parse_difficulty(args.difficulty)
+            except ValueError as exc:
+                print(f"invalid --difficulty: {exc}", file=sys.stderr)
+                return 2
+        try:
+            outcome = what_if(result, ack_timeout=args.ack_timeout,
+                              ack_timeouts=args.ack_timeouts,
+                              difficulty=difficulty)
+        except ValueError as exc:
+            print(f"invalid what-if: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(outcome.to_dict(), indent=2))
+        else:
+            print(outcome.render())
         return 0
 
     if args.command == "run":

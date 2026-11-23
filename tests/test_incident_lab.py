@@ -27,6 +27,7 @@ from incident_lab.scenarios import (
 from incident_lab.simulator import simulate, simulate_batch
 from incident_lab.stats import aggregate_stats
 from incident_lab.timeline import Timeline
+from incident_lab.whatif import WhatIfResult, what_if
 
 
 class TestAckAndEscalation(unittest.TestCase):
@@ -2284,6 +2285,226 @@ class TestStats(unittest.TestCase):
         with self.assertRaises(SystemExit) as caught:
             main(["stats"])
         self.assertEqual(caught.exception.code, 2)
+
+
+class TestWhatIf(unittest.TestCase):
+    def _run(self, scenario, policy=DEFAULT_POLICY, **kwargs):
+        return simulate(get(scenario), policy, **kwargs)
+
+    def _write_run(self, result):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(result.to_dict(), handle)
+        return handle.name
+
+    def test_no_overrides_reproduces_the_original(self):
+        original = self._run("disk-full")
+        outcome = what_if(original)
+        self.assertEqual(outcome.replayed.score.points,
+                         original.score.points)
+        self.assertEqual(outcome.replayed.timeline.to_dict(),
+                         original.timeline.to_dict())
+        self.assertEqual(outcome.points_delta, 0)
+        self.assertEqual(outcome.grade_delta, "A (unchanged)")
+        self.assertEqual(outcome.overrides, [])
+
+    def test_no_overrides_reproduces_a_seeded_run(self):
+        # The recorded delays already carry the seed's jitter, so the
+        # what-if replays them exactly instead of drawing jitter again.
+        original = self._run("disk-full", seed=7, jitter=(0, 3))
+        outcome = what_if(original)
+        self.assertEqual(outcome.replayed.score.points,
+                         original.score.points)
+        self.assertEqual(outcome.replayed.timeline.to_dict(),
+                         original.timeline.to_dict())
+
+    def test_longer_timeout_turns_a_late_ack_into_an_on_time_ack(self):
+        # disk-full on the fast policy: the 3m ack is 1m late against
+        # the 2m timeout, so the credit halves the score to 48 (D).
+        original = self._run("disk-full", get_policy("fast"))
+        self.assertEqual(original.score.points, 48)
+        outcome = what_if(original, ack_timeout=5)
+        self.assertEqual(outcome.replayed.score.points, 96)
+        self.assertEqual(outcome.replayed.score.ack_credit, 1.0)
+        self.assertEqual(outcome.points_delta, 48)
+        self.assertEqual(outcome.grade_delta, "D -> A")
+        self.assertEqual(outcome.overrides,
+                         ["ack timeout: every level 5m"])
+
+    def test_named_ack_timeout_override(self):
+        # latency-spike: the secondary acks 4m after the primary's
+        # 5m timeout. Giving the secondary a 3m timeout makes that ack
+        # late, so the score drops instead of rising.
+        original = self._run("latency-spike")
+        self.assertEqual(original.score.points, 67)
+        outcome = what_if(original, ack_timeouts=["secondary=3"])
+        self.assertEqual(outcome.replayed.score.ack_late_min, 1)
+        self.assertLess(outcome.replayed.score.points,
+                        original.score.points)
+        self.assertEqual(outcome.points_delta,
+                         outcome.replayed.score.points - 67)
+
+    def test_positional_ack_timeout_override(self):
+        original = self._run("disk-full", get_policy("fast"))
+        outcome = what_if(original, ack_timeouts=["5,5,10"])
+        self.assertEqual(outcome.replayed.score.points, 96)
+
+    def test_difficulty_override_matches_a_fresh_run_at_that_difficulty(self):
+        original = self._run("latency-spike")
+        outcome = what_if(original, difficulty=HARD)
+        fresh = self._run("latency-spike", apply_difficulty(
+            DEFAULT_POLICY, HARD), difficulty=HARD)
+        self.assertEqual(outcome.replayed.score.points,
+                         fresh.score.points)
+        self.assertEqual(outcome.replayed.timeline.to_dict(),
+                         fresh.timeline.to_dict())
+        self.assertEqual(outcome.overrides,
+                         ["difficulty: normal -> hard"])
+
+    def test_difficulty_override_from_a_hard_run_back_to_normal(self):
+        original = self._run("disk-full",
+                             apply_difficulty(DEFAULT_POLICY, HARD),
+                             difficulty=HARD)
+        outcome = what_if(original, difficulty=NORMAL)
+        self.assertEqual(outcome.replayed.score.points, 96)
+        self.assertEqual(
+            [level.ack_timeout_min
+             for level in outcome.replayed.policy.levels],
+            [5, 5, 10])
+
+    def test_difficulty_and_ack_timeout_combine_with_timeout_winning(self):
+        original = self._run("disk-full", get_policy("fast"))
+        outcome = what_if(original, ack_timeout=5, difficulty=HARD)
+        # Hard scoring targets still apply (ack grace 3m, mitigate
+        # grace 10m), but every timeout is the explicit 5m.
+        self.assertEqual(outcome.replayed.score.points, 94)
+        self.assertEqual(
+            [level.ack_timeout_min
+             for level in outcome.replayed.policy.levels],
+            [5, 5, 5])
+
+    def test_unacked_run_stays_unacked(self):
+        ghost = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        original = simulate(ghost, DEFAULT_POLICY)
+        outcome = what_if(original, ack_timeout=30)
+        self.assertEqual(outcome.replayed.score.points, 0)
+        self.assertFalse(outcome.replayed.score.resolved)
+        self.assertEqual(outcome.points_delta, 0)
+
+    def test_hints_are_kept_and_still_cost_points(self):
+        original = self._run("disk-full", hints=1)
+        self.assertEqual(original.score.points, 91)
+        outcome = what_if(original, ack_timeout=5)
+        self.assertEqual(outcome.replayed.score.hints_used, 1)
+        self.assertEqual(outcome.replayed.score.points, 91)
+
+    def test_conflicting_ack_overrides_fail(self):
+        original = self._run("disk-full")
+        with self.assertRaises(ValueError):
+            what_if(original, ack_timeout=5, ack_timeouts=["5,5,10"])
+
+    def test_bad_ack_timeout_fails(self):
+        original = self._run("disk-full")
+        with self.assertRaises(ValueError):
+            what_if(original, ack_timeout=0)
+        with self.assertRaises(ValueError):
+            what_if(original, ack_timeouts=["bogus=5"])
+
+    def test_inconsistent_saved_run_fails(self):
+        # latency-spike waits out the primary's 5m timeout before the
+        # secondary acks, so a time-to-ack of 1m cannot be real.
+        original = self._run("latency-spike")
+        tampered = replace(
+            original,
+            score=replace(original.score, time_to_ack_min=1))
+        with self.assertRaises(ValueError):
+            what_if(tampered)
+
+    def test_what_if_result_round_trips_to_json(self):
+        original = self._run("disk-full", get_policy("fast"))
+        outcome = what_if(original, ack_timeout=5)
+        data = outcome.to_dict()
+        self.assertEqual(data["points_delta"], 48)
+        self.assertEqual(data["grade"], "D")
+        self.assertEqual(data["what_if_grade"], "A")
+        self.assertEqual(data["grade_delta"], "D -> A")
+        self.assertEqual(data["what_if"]["score"]["points"], 96)
+        self.assertEqual(data["original"]["score"]["points"], 48)
+        # The JSON round-trips through load_result for both runs.
+        for key in ("original", "what_if"):
+            handle = tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False, encoding="utf-8")
+            with handle:
+                json.dump(data[key], handle)
+            self.assertEqual(load_result(handle.name).score.points,
+                             data[key]["score"]["points"])
+
+    def test_cli_what_if_human_and_json(self):
+        path = self._write_run(self._run("disk-full",
+                                         get_policy("fast")))
+        with open(path, encoding="utf-8") as handle:
+            before = handle.read()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["what-if", path, "--ack-timeout", "5"]),
+                             0)
+        out = buf.getvalue()
+        self.assertIn("48/100 (grade D) -> 96/100 (grade A)", out)
+        self.assertIn("delta:            +48 points", out)
+        self.assertIn("what-if timeline:", out)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["what-if", path, "--ack-timeout", "5",
+                                   "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["points_delta"], 48)
+        self.assertEqual(data["what_if"]["score"]["points"], 96)
+        # The original run file is not modified by the what-if.
+        with open(path, encoding="utf-8") as handle:
+            self.assertEqual(handle.read(), before)
+
+    def test_cli_what_if_difficulty(self):
+        path = self._write_run(self._run("latency-spike"))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["what-if", path, "--difficulty",
+                                   "hard"]), 0)
+        out = buf.getvalue()
+        self.assertIn("override: difficulty: normal -> hard", out)
+        self.assertIn("67/100 (grade C) -> 43/100 (grade D)", out)
+
+    def test_cli_what_if_bad_files_and_args_fail(self):
+        missing = os.path.join(tempfile.gettempdir(), "no-such-run.json")
+        self.assertEqual(main(["what-if", missing, "--ack-timeout", "5"]),
+                         2)
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            handle.write("{not json")
+        self.assertEqual(main(["what-if", handle.name, "--ack-timeout",
+                              "5"]), 2)
+        path = self._write_run(self._run("disk-full"))
+        # No override at all is not a what-if.
+        self.assertEqual(main(["what-if", path]), 2)
+        # Both ack override forms conflict.
+        self.assertEqual(main(["what-if", path, "--ack-timeout", "5",
+                               "--ack-timeouts", "5,5,10"]), 2)
+        # Unknown difficulty.
+        self.assertEqual(main(["what-if", path, "--difficulty",
+                              "brutal"]), 2)
+        # A batch file is not a single run.
+        batch = simulate_batch(get("disk-full"), DEFAULT_POLICY, [1, 2])
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(batch.to_dict(), handle)
+        self.assertEqual(main(["what-if", handle.name, "--ack-timeout",
+                              "5"]), 2)
 
 
 if __name__ == "__main__":
