@@ -4,9 +4,10 @@ import io
 import json
 import os
 import statistics
+import sys
 import tempfile
 import unittest
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 
 from incident_lab.cli import main, parse_jitter_range, parse_seed_spec
@@ -16,6 +17,7 @@ from incident_lab.difficulty import (
     EASY, HARD, NORMAL, apply_difficulty, list_difficulties,
     parse_difficulty,
 )
+from incident_lab.drill import run_drill
 from incident_lab.policy import (
     DEFAULT_POLICY, EscalationPolicy, Level, Responder, get_policy,
     list_policies, load_policy_file, parse_ack_timeout_overrides,
@@ -2934,6 +2936,287 @@ class TestWhatIfInCompareAndStats(unittest.TestCase):
         self.assertEqual(data["what_if_runs"], 1)
         self.assertEqual(data["runs"][1]["what_if"]["points_delta"], 48)
         self.assertIsNone(data["runs"][0]["what_if"])
+class TestDrill(unittest.TestCase):
+    def _drill(self, scenario, policy=DEFAULT_POLICY, decisions="",
+               **kwargs):
+        return run_drill(
+            scenario, policy,
+            input_stream=io.StringIO(decisions),
+            prompt_stream=io.StringIO(),
+            **kwargs)
+
+    def _write_decisions(self, decisions):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".txt", delete=False, encoding="utf-8")
+        with handle:
+            handle.write(decisions)
+        return handle.name
+
+    def _write_json(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(data, handle)
+        return handle.name
+
+    def test_scripted_drill_matches_run_for_same_decisions(self):
+        # disk-full on run: ack 3m, mitigate 23m, resolve 35m, 96
+        # points. A drill making the same decisions scores the same.
+        drill = self._drill(get("disk-full"), decisions=(
+            "ack 3\nmitigate 20\nresolve 12\n"))
+        run = simulate(get("disk-full"), DEFAULT_POLICY)
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 96)
+
+    def test_drill_with_escalation_matches_run(self):
+        # latency-spike: primary misses, secondary acks 4m after the
+        # 5m timeout, mitigates 35m later, resolves 20m after that.
+        drill = self._drill(get("latency-spike"), decisions=(
+            "wait\nack 4\nmitigate 35\nresolve 20\n"))
+        run = simulate(get("latency-spike"), DEFAULT_POLICY)
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.escalations, 1)
+        self.assertEqual(drill.score.time_to_ack_min, 9)
+
+    def test_drill_late_ack_matches_run(self):
+        scenario = Scenario(
+            name="slow", service="svc", title="slow", severity="low",
+            description="", ack_delay_min=(7, None, None),
+            mitigate_delay_min=20, resolve_delay_min=12,
+        )
+        drill = self._drill(scenario, decisions=(
+            "ack 7\nmitigate 20\nresolve 12\n"))
+        run = simulate(scenario, DEFAULT_POLICY)
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.ack_late_min, 2)
+        self.assertEqual(drill.score.ack_credit, 0.6)
+        self.assertEqual(drill.score.points, 55)
+
+    def test_drill_on_hard_matches_run(self):
+        # Hard scales the timeouts (5m -> 3m) and tightens the graces
+        # (ack 3m, mitigate 10m): ack 3m is on time, mitigation at 23m
+        # is 13m past the grace, so 100 - 13 // 2 = 94.
+        policy = apply_difficulty(DEFAULT_POLICY, HARD)
+        drill = self._drill(get("disk-full"), policy, difficulty=HARD,
+                            decisions="ack 3\nmitigate 20\nresolve 12\n")
+        run = simulate(get("disk-full"), policy, difficulty=HARD)
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 94)
+
+    def test_drill_hints_cost_points_like_run(self):
+        # disk-full with one hint: 96 - 5 = 91, hint recorded.
+        drill = self._drill(get("disk-full"), hints=1, decisions=(
+            "ack 3\nmitigate 20\nresolve 12\n"))
+        run = simulate(get("disk-full"), DEFAULT_POLICY, hints=1)
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 91)
+        self.assertEqual(drill.score.hints_used, 1)
+
+    def test_drill_too_many_hints_fails(self):
+        with self.assertRaises(ValueError):
+            self._drill(get("disk-full"), hints=99, decisions="")
+
+    def test_drill_wait_on_every_level_is_unacked(self):
+        drill = self._drill(get("disk-full"),
+                            decisions="wait\nwait\nwait\n")
+        self.assertFalse(drill.score.resolved)
+        self.assertEqual(drill.score.points, 0)
+        self.assertEqual(drill.score.escalations, 2)
+        self.assertIsNone(drill.score.time_to_ack_min)
+        self.assertIn("unacked", drill.timeline.kinds())
+        self.assertNotIn("abandoned", drill.timeline.kinds())
+
+    def test_drill_quit_after_ack_records_partial_run(self):
+        drill = self._drill(get("disk-full"),
+                            decisions="ack 3\nquit\n")
+        self.assertFalse(drill.score.resolved)
+        self.assertEqual(drill.score.time_to_ack_min, 3)
+        self.assertIsNone(drill.score.time_to_mitigate_min)
+        self.assertIsNone(drill.score.time_to_resolve_min)
+        self.assertIn("abandoned", drill.timeline.kinds())
+        abandoned = [event for event in drill.timeline.events
+                     if event.kind == "abandoned"][0]
+        self.assertEqual(abandoned.t_min, 3)
+        self.assertIn("ended by operator", abandoned.detail)
+        # Scored on the milestones reached: acked at 3m, inside the
+        # 5m grace, no escalations, so the partial run keeps 100.
+        self.assertEqual(drill.score.points, 100)
+
+    def test_drill_quit_after_mitigate_records_partial_run(self):
+        drill = self._drill(get("disk-full"),
+                            decisions="ack 3\nmitigate 20\nquit\n")
+        self.assertFalse(drill.score.resolved)
+        self.assertEqual(drill.score.time_to_ack_min, 3)
+        self.assertEqual(drill.score.time_to_mitigate_min, 23)
+        self.assertIsNone(drill.score.time_to_resolve_min)
+        self.assertEqual(drill.score.mitigate_delay_min, 20)
+        self.assertIsNone(drill.score.resolve_delay_min)
+        self.assertIn("abandoned", drill.timeline.kinds())
+
+    def test_drill_eof_records_partial_run(self):
+        # Input ends mid-drill: same as quit, with the input ending
+        # named as the reason.
+        drill = self._drill(get("disk-full"), decisions="ack 3\n")
+        self.assertFalse(drill.score.resolved)
+        self.assertEqual(drill.score.time_to_ack_min, 3)
+        self.assertIn("abandoned", drill.timeline.kinds())
+        abandoned = [event for event in drill.timeline.events
+                     if event.kind == "abandoned"][0]
+        self.assertIn("input ended", abandoned.detail)
+
+    def test_drill_eof_before_any_decision_is_unacked(self):
+        drill = self._drill(get("disk-full"), decisions="")
+        self.assertFalse(drill.score.resolved)
+        self.assertEqual(drill.score.points, 0)
+        self.assertIsNone(drill.score.time_to_ack_min)
+        self.assertIn("abandoned", drill.timeline.kinds())
+        self.assertNotIn("unacked", drill.timeline.kinds())
+
+    def test_drill_invalid_answer_is_reprompted(self):
+        prompts = io.StringIO()
+        drill = run_drill(
+            get("disk-full"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "bogus\nack notanumber\nack -1\n"
+                "ack 3\nmitigate 20\nresolve 12\n"),
+            prompt_stream=prompts)
+        self.assertEqual(drill.score.points, 96)
+        self.assertTrue(drill.score.resolved)
+        self.assertIn("unknown answer 'bogus'", prompts.getvalue())
+        self.assertIn("takes a number of minutes", prompts.getvalue())
+        self.assertIn("non-negative", prompts.getvalue())
+
+    def test_drill_bare_commands_mean_now(self):
+        drill = self._drill(get("cert-expiry"),
+                            decisions="ack\nmitigate\nresolve\n")
+        self.assertEqual(drill.score.time_to_ack_min, 0)
+        self.assertEqual(drill.score.time_to_mitigate_min, 0)
+        self.assertEqual(drill.score.time_to_resolve_min, 0)
+        self.assertEqual(drill.score.points, 100)
+
+    def test_drill_result_round_trips_through_replay(self):
+        drill = self._drill(get("disk-full"), decisions=(
+            "ack 3\nmitigate 20\nresolve 12\n"))
+        loaded = load_result(self._write_json(drill.to_dict()))
+        self.assertEqual(loaded.to_dict(), drill.to_dict())
+
+    def test_drill_run_works_with_compare_stats_and_debrief(self):
+        drill = self._drill(get("disk-full"), decisions=(
+            "ack 3\nmitigate 20\nresolve 12\n"))
+        run = simulate(get("disk-full"), DEFAULT_POLICY)
+        drill_path = self._write_json(drill.to_dict())
+        run_path = self._write_json(run.to_dict())
+        loaded = load_result(drill_path)
+        comparison = compare_results(loaded, run)
+        self.assertTrue(comparison.timelines_identical)
+        self.assertEqual(
+            comparison.score_rows[0]["delta"], 0)
+        summary = aggregate_stats(
+            [loaded, run], labels=[drill_path, run_path])
+        self.assertEqual(summary.count, 2)
+        self.assertEqual(summary.points_mean, 96)
+        self.assertEqual(summary.resolved, 2)
+        debrief = generate_debrief(loaded)
+        self.assertEqual(debrief.points, 96)
+        self.assertIn("Incident resolved in 35m", debrief.went_well)
+
+    def test_debrief_of_partial_drill_run(self):
+        drill = self._drill(get("disk-full"),
+                            decisions="ack 3\nquit\n")
+        debrief = generate_debrief(load_result(
+            self._write_json(drill.to_dict())))
+        self.assertEqual(debrief.time_to_ack_min, 3)
+        self.assertFalse(debrief.resolved)
+        self.assertIn("never mitigated",
+                      " ".join(debrief.went_badly))
+        self.assertNotIn("Nobody acked", debrief.render())
+        self.assertIn("Re-run the drill",
+                      " ".join(item["action"]
+                               for item in debrief.action_items))
+
+    def test_debrief_of_partial_drill_run_after_mitigate(self):
+        drill = self._drill(get("disk-full"),
+                            decisions="ack 3\nmitigate 20\nquit\n")
+        debrief = generate_debrief(drill)
+        self.assertEqual(debrief.time_to_mitigate_min, 23)
+        self.assertFalse(debrief.resolved)
+        self.assertIn("mitigated but never resolved",
+                      " ".join(debrief.went_badly))
+
+    def test_cli_drill_scripted_json(self):
+        path = self._write_decisions("ack 3\nmitigate 20\nresolve 12\n")
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(
+                main(["drill", "disk-full", "--input", path, "--json"]), 0)
+        # Prompts go to stderr, so stdout is clean JSON.
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["score"]["points"], 96)
+        self.assertEqual(data["score"]["time_to_ack_min"], 3)
+        self.assertIn("paged ana", err.getvalue())
+
+    def test_cli_drill_scripted_human_output(self):
+        path = self._write_decisions("wait\nack 4\nmitigate 35\nresolve 20\n")
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["drill", "latency-spike", "--input", path]), 0)
+        self.assertIn("acked", out.getvalue())
+        self.assertIn("escalations:      1", out.getvalue())
+
+    def test_cli_drill_reads_piped_stdin(self):
+        from unittest import mock
+        out = io.StringIO()
+        with mock.patch.object(
+                sys, "stdin",
+                io.StringIO("ack 3\nmitigate 20\nresolve 12\n")), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(main(["drill", "disk-full"]), 0)
+        self.assertIn("96/100", out.getvalue())
+
+    def test_cli_drill_out_writes_file(self):
+        decisions = self._write_decisions("ack 3\nmitigate 20\nresolve 12\n")
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        handle.close()
+        with redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["drill", "disk-full", "--input", decisions,
+                      "--out", handle.name]), 0)
+        with open(handle.name, encoding="utf-8") as saved:
+            data = json.load(saved)
+        self.assertEqual(data["score"]["points"], 96)
+
+    def test_cli_drill_unknown_scenario_fails(self):
+        self.assertEqual(main(["drill", "no-such-scenario"]), 2)
+
+    def test_cli_drill_missing_input_file_fails(self):
+        self.assertEqual(
+            main(["drill", "disk-full", "--input", "/no-such-file.txt"]), 2)
+
+    def test_cli_drill_unwritable_out_fails(self):
+        decisions = self._write_decisions("ack 3\nmitigate 20\nresolve 12\n")
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["drill", "disk-full", "--input", decisions,
+                      "--out", "/no-such-dir/out.json"]), 2)
+
+    def test_cli_drill_too_many_hints_fails(self):
+        self.assertEqual(
+            main(["drill", "disk-full", "--hints", "99"]), 2)
+
+    def test_cli_drill_difficulty_changes_scoring(self):
+        path = self._write_decisions("ack 3\nmitigate 20\nresolve 12\n")
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["drill", "disk-full", "--input", path,
+                      "--difficulty", "hard", "--json"]), 0)
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["difficulty"], "hard")
+        self.assertEqual(data["score"]["points"], 94)
 
 
 if __name__ == "__main__":

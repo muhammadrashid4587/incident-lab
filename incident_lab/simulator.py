@@ -51,6 +51,34 @@ HINT_COST_POINTS = 5
 DEFAULT_JITTER_RANGE = (0, 1)
 
 
+def compute_points(*, escalations: int, acked_at, ack_credit: float,
+                   mitigated_at, difficulty, hint_cost: int) -> int:
+    """Score a run from the milestones it reached, the run's own rule.
+
+    Shared by `simulate` and the interactive drill, so a drill that
+    makes the same decisions as a `run` scores the same: start at 100,
+    minus 15 per escalation, minus 1 per minute of time-to-ack past
+    the difficulty's ack grace, minus 1 per 2 minutes of
+    time-to-mitigate past the mitigate grace, scaled by the ack credit
+    (1.0 for an on-time ack), minus the hint cost, floored at 0. A run
+    nobody acked scores 0; a run that stopped early (a drill ended
+    with quit or EOF) is scored on the milestones it reached — a
+    milestone never reached costs nothing, because it never happened.
+    """
+    if acked_at is None:
+        return 0
+    points = 100
+    points -= ESCALATION_PENALTY * escalations
+    points -= max(0, acked_at - difficulty.ack_grace_min)
+    if mitigated_at is not None:
+        points -= max(0, mitigated_at - difficulty.mitigate_grace_min) // 2
+    # A late ack keeps only part of the score: the effective score is
+    # the base score scaled by the ack credit (1.0 for an on-time ack).
+    # Hints come off after that scaling, so asking for help costs the
+    # same whether the ack was on time or late.
+    return max(0, round(points * ack_credit) - hint_cost)
+
+
 def _jitter_delay(rng, delay_min: int, jitter_range: tuple) -> int:
     """Shift a delay by a magnitude in ``jitter_range`` with a random sign.
 
@@ -412,15 +440,10 @@ def simulate(
     timeline.record(mitigated_at, "mitigated", acked_by)
     timeline.record(resolved_at, "resolved", acked_by)
 
-    points = 100
-    points -= ESCALATION_PENALTY * escalations
-    points -= max(0, acked_at - difficulty.ack_grace_min)
-    points -= max(0, mitigated_at - difficulty.mitigate_grace_min) // 2
-    # A late ack keeps only part of the score: the effective score is the
-    # base score scaled by the ack credit (1.0 for an on-time ack).
-    # Hints come off after that scaling, so asking for help costs the
-    # same whether the ack was on time or late.
-    points = max(0, round(points * ack_credit) - hint_cost)
+    points = compute_points(
+        escalations=escalations, acked_at=acked_at, ack_credit=ack_credit,
+        mitigated_at=mitigated_at, difficulty=difficulty,
+        hint_cost=hint_cost)
     score = Score(
         time_to_ack_min=acked_at,
         time_to_mitigate_min=mitigated_at,

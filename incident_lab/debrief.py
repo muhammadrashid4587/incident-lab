@@ -132,6 +132,115 @@ class Debrief:
         return "\n".join(lines)
 
 
+def _partial_debrief(result: SimulationResult, ack_grace_min: int,
+                     mitigate_grace_min: int) -> Debrief:
+    """Postmortem for a run that acked but never resolved.
+
+    Only a drill ended early (quit or EOF) produces this shape: the
+    ack happened, so the missed pages and the ack are judged the same
+    way as in a resolved run, and the missing mitigation / resolution
+    are findings of their own, with an action to finish the drill.
+    """
+    score = result.score
+    incident = result.incident
+    went_well = []
+    went_badly = []
+    action_items = []
+    # The first `escalations` levels missed; the next level acked.
+    missed = result.policy.levels[:score.escalations]
+    acking = result.policy.levels[score.escalations]
+    # Minutes from when the acking level was paged to its ack: the
+    # time-to-ack minus the timeouts waited out on the missed levels.
+    ack_delay_min = (score.time_to_ack_min
+                     - sum(level.ack_timeout_min for level in missed))
+    for level in missed:
+        went_badly.append(
+            f"{level.responder.name} ({level.responder.role}) missed "
+            f"the page — no ack within {level.ack_timeout_min}m")
+        action_items.append({
+            "action": (
+                f"Check {level.responder.name}'s paging delivery and "
+                f"alert routing — the page went unanswered for "
+                f"{level.ack_timeout_min}m"),
+            "owner": level.responder.name,
+        })
+    if score.escalations == 0:
+        went_well.append(
+            f"{acking.responder.name} ({acking.responder.role}) acked "
+            "first time, with no escalation")
+    if score.ack_late_min == 0:
+        went_well.append(
+            f"Ack arrived on time ({acking.responder.name} acked "
+            f"{ack_delay_min}m after being paged, within the "
+            f"{acking.ack_timeout_min}m timeout)")
+    else:
+        went_badly.append(
+            f"Ack was {score.ack_late_min}m late, keeping only "
+            f"{score.ack_credit:.0%} of the score")
+        action_items.append({
+            "action": (
+                f"Review why {acking.responder.name} acked "
+                f"{score.ack_late_min}m late and whether the "
+                f"{acking.ack_timeout_min}m {acking.responder.role} "
+                "timeout still fits"),
+            "owner": acking.responder.name,
+        })
+    if score.time_to_ack_min <= ack_grace_min:
+        went_well.append(
+            f"Time-to-ack ({score.time_to_ack_min}m) was inside the "
+            f"{ack_grace_min}m target")
+    if score.time_to_mitigate_min is not None:
+        if score.time_to_mitigate_min <= mitigate_grace_min:
+            went_well.append(
+                f"Mitigated within the {mitigate_grace_min}m target "
+                f"({score.time_to_mitigate_min}m)")
+        else:
+            over = score.time_to_mitigate_min - mitigate_grace_min
+            went_badly.append(
+                f"Mitigation took {score.time_to_mitigate_min}m, {over}m "
+                f"past the {mitigate_grace_min}m target")
+            action_items.append({
+                "action": (
+                    f"Write or rehearse a runbook for {incident.title} on "
+                    f"{incident.service} — mitigation took "
+                    f"{score.time_to_mitigate_min}m against a "
+                    f"{mitigate_grace_min}m target"),
+                "owner": "on-call lead",
+            })
+        went_badly.append(
+            "The incident was mitigated but never resolved — the drill "
+            "ended before the resolve step")
+    else:
+        went_badly.append(
+            "The incident was never mitigated — the drill ended after "
+            "the ack, before mitigation")
+    action_items.append({
+        "action": (
+            "Re-run the drill to completion: a drill ended early "
+            "leaves the incident unmitigated and unresolved, so the "
+            "response was never practised end to end"),
+        "owner": "on-call lead",
+    })
+    return Debrief(
+        incident_id=incident.id,
+        service=incident.service,
+        title=incident.title,
+        severity=incident.severity,
+        points=score.points,
+        grade=grade(score.points),
+        time_to_ack_min=score.time_to_ack_min,
+        time_to_mitigate_min=score.time_to_mitigate_min,
+        time_to_resolve_min=None,
+        escalations=score.escalations,
+        resolved=False,
+        went_well=went_well,
+        went_badly=went_badly,
+        action_items=action_items,
+        timeline=result.timeline.render(),
+        difficulty=result.difficulty,
+    )
+
+
 def generate_debrief(result: SimulationResult) -> Debrief:
     """Build the postmortem for one simulated run.
 
@@ -156,6 +265,13 @@ def generate_debrief(result: SimulationResult) -> Debrief:
     action_items = []
 
     if not score.resolved:
+        if score.time_to_ack_min is not None:
+            # A drill ended early: someone acked, but the incident was
+            # never mitigated or resolved. Judge what happened — the
+            # missed pages and the ack — and say plainly that the rest
+            # never happened, instead of claiming nobody acked.
+            return _partial_debrief(result, ack_grace_min,
+                                    mitigate_grace_min)
         # Nobody acked: every level in the chain missed the page.
         for level in result.policy.levels:
             went_badly.append(

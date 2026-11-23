@@ -71,6 +71,11 @@ python3 -m incident_lab what-if /tmp/disk-full.json --policy fast --difficulty h
 python3 -m incident_lab what-if /tmp/disk-full.json --ack-timeout 5 --json > /tmp/disk-full-whatif.json
 python3 -m incident_lab compare /tmp/disk-full.json /tmp/disk-full-whatif.json
 python3 -m incident_lab stats /tmp/run-seed-1.json /tmp/disk-full-whatif.json
+python3 -m incident_lab drill disk-full
+printf 'ack 3\nmitigate 20\nresolve 12\n' | python3 -m incident_lab drill disk-full --json > /tmp/drill.json
+python3 -m incident_lab drill latency-spike --difficulty hard
+python3 -m incident_lab replay /tmp/drill.json
+python3 -m incident_lab debrief /tmp/drill.json
 python3 scripts/demo.py
 ```
 
@@ -425,6 +430,84 @@ python3 -m incident_lab run disk-full --hints 2 --json
 Example: `disk-full` with one hint scores 96 - 5 = 91, and the hint
 ("Check WAL archiving...") is printed with the run.
 
+## Interactive drills
+
+`drill <scenario>` plays an incident step by step with you as the
+responder, instead of playing the scenario's fixed behaviour the way
+`run` does. At each page you decide when to ack (or let the timeout
+lapse and escalate), then when to mitigate and resolve, one decision
+per line:
+
+```sh
+$ python3 -m incident_lab drill disk-full
+drill: Disk 97% full on payments-db [high]
+service:  payments-db
+policy:   standard (ana (primary) 5m, ben (secondary) 5m, carla (manager) 10m)
+difficulty: normal
+The primary database disk is 97% full and growing. WAL archiving stalled after a bad deploy.
+
+[t=0m] paged ana (primary) — ack timeout 5m.
+  ack in how many minutes?
+  [ack N, wait] > ack 3
+  ana acked at 3m. mitigate in how many minutes?
+  [mitigate N] > mitigate 20
+  mitigated at 23m. resolve in how many minutes?
+  [resolve N] > resolve 12
+```
+
+The answers are:
+
+- `ack N` — ack N minutes after the page (`ack` alone means now).
+  A delay past the level's timeout is a late ack, with the same
+  partial credit `run` gives (see Scoring).
+- `wait` — let the timeout lapse and escalate to the next level (on
+  the last level the incident goes unacked, exactly as in `run`).
+- `mitigate N` / `resolve N` — minutes after the ack / mitigation
+  (`mitigate` / `resolve` alone mean now).
+- `quit` — end the drill cleanly at any prompt.
+- `help` — list the answers the current prompt accepts.
+
+The timeouts, the late-ack credit and the scoring are the same as
+`run`: a drill that makes the same decisions as a `run` scores the
+same. `disk-full` drilled as `ack 3`, `mitigate 20`, `resolve 12`
+scores 96, the same as `run disk-full`. The scenario's fixed
+ack/mitigate/resolve delays are the behaviour `run` plays, not the
+drill's — the drill's delays are your decisions. `drill` takes the
+same `--policy`, `--policy-file`, `--scenario-file`,
+`--ack-timeout(s)`, `--difficulty` and `--hints N` as `run` (hints
+are asked for up front, in order, 5 points each); it takes no
+`--seed`, because there is nothing to jitter — your decisions are
+the delays.
+
+A drill needs no TTY. Read the decisions from a file with
+`--input PATH`, or pipe them in on stdin — a scripted drill is just
+a list of decisions, which is how drills are tested:
+
+```sh
+printf 'ack 3\nmitigate 20\nresolve 12\n' | python3 -m incident_lab drill disk-full --json > drill.json
+python3 -m incident_lab drill disk-full --input decisions.txt --out drill.json
+```
+
+Prompts always go to stderr, never to stdout, so `drill --json`
+output stays parseable JSON. `--out PATH` writes the result as JSON
+to a file as well as printing it.
+
+Quitting, or running out of input (EOF), ends the drill cleanly and
+records a partial run: the timeline so far, plus an `abandoned`
+event, scored on the milestones it reached (a milestone never
+reached costs nothing, because it never happened). The partial run
+is the same JSON shape as `run --json`, so `replay`, `debrief`,
+`compare` and `stats` all work on drill runs — including partial
+ones, whose debrief says plainly that the incident was never
+mitigated or resolved instead of claiming nobody acked.
+
+```sh
+python3 -m incident_lab drill disk-full --input decisions.txt --json > drill.json
+python3 -m incident_lab replay drill.json
+python3 -m incident_lab debrief drill.json
+python3 -m incident_lab compare drill.json run.json
+```
+
 ## Difficulty ladder
 
 `run <scenario> --difficulty <level>` plays the same scenario harder or
@@ -472,8 +555,13 @@ incident_lab/
   whatif.py      what-if replay: re-simulate a saved run with
                  overridden ack timeouts, difficulty or policy, show
                  how the score and grade would have changed
-  cli.py         list / template / policy-template / run / replay /
-                 debrief / compare / stats / what-if
+  drill.py       interactive drill: the operator decides when to ack,
+                 mitigate and resolve, one decision per line; same
+                 timeouts, late-ack credit and scoring as run, with
+                 scripted input (--input / piped stdin) and a clean
+                 quit/EOF path that records a partial run
+  cli.py         list / template / policy-template / run / drill /
+                 replay / debrief / compare / stats / what-if
 tests/
   test_incident_lab.py
 scripts/
@@ -534,12 +622,19 @@ human-readable form.
 
 ## Version
 
-0.22.0 — `policy-template` command: `incident-lab policy-template
-[name]` prints a built-in policy as a starter JSON policy file (or
-writes it with `--out PATH`), ready to edit and pass back with
-`--policy-file`; the template is validated through the policy loader
-so it always loads cleanly, and an edited template used in a run
-applies its timeouts.
+0.23.0 — interactive drill mode: `incident-lab drill <scenario>`
+plays an incident step by step with the operator deciding when to
+ack, mitigate and resolve (`ack N` / `wait`, `mitigate N`,
+`resolve N`, `quit`), with the same timeouts, late-ack credit and
+scoring as `run` — a drill making the same decisions as a `run`
+scores the same; scripted input via `--input PATH` or piped stdin,
+prompts on stderr so `drill --json` stays parseable, `--out PATH`
+writes the result as JSON, and quit/EOF ends the drill cleanly with
+a partial run (timeline plus an `abandoned` event, scored on the
+milestones reached) in the same JSON shape as `run`, so `replay`,
+`debrief`, `compare` and `stats` all work on drill runs, and a
+debrief of a partial drill says the incident was never mitigated or
+resolved instead of claiming nobody acked.
 
 ## Roadmap
 
@@ -565,3 +660,5 @@ applies its timeouts.
 - [x] What-if replay against a different named policy: `what-if <saved-run.json> --policy <name>` (built-in, or from `--policy-file`) re-simulates the saved run under that policy and shows how the score and grade would have changed; the new policy's timeouts are scaled to the original run's difficulty unless `--difficulty` is also given, an unknown policy name fails with exit code 2, and the original run file is never modified (0.20.0)
 - [x] Compare and stats accept what-if replay outputs: `compare` and `stats` take saved `what-if --json` files alongside normal runs, compare what-if replays against each other and against their base runs, and aggregate what-if runs in stats, flagging them as what-if with their overrides and points delta recorded; a what-if file whose points delta does not match its runs' scores is rejected (0.21.0)
 - [x] Policy template command: `policy-template [name]` prints a built-in policy as a starter JSON policy file (or writes it with `--out PATH`), ready to edit and pass back with `--policy-file`; the template is validated through the policy loader so it always loads cleanly (0.22.0)
+- [x] Interactive drill mode: `drill <scenario>` plays an incident step by step with the operator deciding when to ack, mitigate and resolve (`ack N` / `wait`, `mitigate N`, `resolve N`, `quit`), same timeouts, late-ack credit and scoring as `run`; scripted input via `--input PATH` or piped stdin, prompts on stderr so `drill --json` stays parseable, `--out PATH` writes the JSON result, and quit/EOF ends the drill cleanly with a partial run (timeline plus an `abandoned` event, scored on the milestones reached) in the same JSON shape as `run`, so `replay`, `debrief`, `compare` and `stats` all work on drill runs (0.23.0)
+- [ ] Interactive `hint` during a drill: ask for the scenario's next known-good action mid-drill when stuck (costs 5 points, like `run --hints`), instead of only up front
