@@ -509,6 +509,8 @@ class TestJsonOutput(unittest.TestCase):
             "ack_credit": 1.0,
             "mitigate_delay_min": 20,
             "resolve_delay_min": 12,
+            "hints_used": 0,
+            "hint_cost_points": 0,
         })
 
     def test_result_to_dict_unacked_serializes_nulls(self):
@@ -1932,6 +1934,200 @@ class TestCompare(unittest.TestCase):
         with handle:
             handle.write("{not json")
         self.assertEqual(main(["compare", path, handle.name]), 2)
+
+
+class TestHints(unittest.TestCase):
+    def test_every_builtin_scenario_has_hints(self):
+        for name in list_scenarios():
+            hints = get(name).hints
+            self.assertGreaterEqual(len(hints), 1, name)
+            for hint in hints:
+                self.assertIsInstance(hint, str)
+                self.assertTrue(hint, name)
+
+    def test_one_hint_costs_five_points(self):
+        # disk-full scores 96 with no hints; one hint costs 5.
+        result = simulate(get("disk-full"), DEFAULT_POLICY, hints=1)
+        self.assertEqual(result.score.points, 91)
+        self.assertEqual(result.score.hints_used, 1)
+        self.assertEqual(result.score.hint_cost_points, 5)
+        self.assertEqual(len(result.hints), 1)
+        self.assertEqual(result.hints[0].text, get("disk-full").hints[0])
+        self.assertEqual(result.hints[0].cost_points, 5)
+
+    def test_hints_drawn_in_order(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY, hints=2)
+        self.assertEqual(result.score.points, 86)
+        self.assertEqual(result.score.hints_used, 2)
+        self.assertEqual(result.score.hint_cost_points, 10)
+        self.assertEqual([hint.text for hint in result.hints],
+                         list(get("disk-full").hints[:2]))
+
+    def test_no_hints_by_default(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY)
+        self.assertEqual(result.score.points, 96)
+        self.assertEqual(result.score.hints_used, 0)
+        self.assertEqual(result.score.hint_cost_points, 0)
+        self.assertEqual(result.hints, [])
+        self.assertEqual(result.to_dict()["hints"], [])
+        self.assertEqual(result.to_dict()["score"]["hints_used"], 0)
+
+    def test_hint_cost_applies_after_late_ack_credit(self):
+        # disk-full on the fast policy: base 96 scaled by 0.5 credit is
+        # 48, then one hint costs 5 more.
+        from incident_lab.policy import get_policy
+        result = simulate(get("disk-full"), get_policy("fast"), hints=1)
+        self.assertEqual(result.score.ack_credit, 0.5)
+        self.assertEqual(result.score.points, 43)
+        self.assertEqual(result.score.hint_cost_points, 5)
+
+    def test_hint_cost_floors_at_zero(self):
+        scenario = Scenario(
+            name="costly", service="svc", title="costly", severity="low",
+            description="", ack_delay_min=(30, None, None),
+            mitigate_delay_min=100, resolve_delay_min=100,
+            hints=("Check the obvious first.", "Check it again."),
+        )
+        result = simulate(scenario, DEFAULT_POLICY, hints=2)
+        self.assertEqual(result.score.points, 0)
+        self.assertEqual(result.score.hints_used, 2)
+        self.assertEqual(result.score.hint_cost_points, 10)
+
+    def test_unacked_run_records_hints_but_still_scores_zero(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+            hints=("Page the manager directly.",),
+        )
+        result = simulate(scenario, DEFAULT_POLICY, hints=1)
+        self.assertFalse(result.score.resolved)
+        self.assertEqual(result.score.points, 0)
+        self.assertEqual(result.score.hints_used, 1)
+        self.assertEqual(result.score.hint_cost_points, 5)
+        self.assertEqual(len(result.hints), 1)
+
+    def test_more_hints_than_available_fails(self):
+        with self.assertRaises(ValueError):
+            simulate(get("cert-expiry"), DEFAULT_POLICY, hints=3)
+
+    def test_negative_hints_fails(self):
+        with self.assertRaises(ValueError):
+            simulate(get("disk-full"), DEFAULT_POLICY, hints=-1)
+
+    def test_scenario_without_hints_rejects_any_hint(self):
+        scenario = Scenario(
+            name="plain", service="svc", title="plain", severity="low",
+            description="", ack_delay_min=(2, None, None),
+            mitigate_delay_min=5, resolve_delay_min=5,
+        )
+        self.assertEqual(scenario.hints, ())
+        with self.assertRaises(ValueError):
+            simulate(scenario, DEFAULT_POLICY, hints=1)
+
+    def test_cli_run_hints_prints_hint_and_reduced_score(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "disk-full", "--hints", "1"]), 0)
+        out = buf.getvalue()
+        self.assertIn("hints used (1", out)
+        self.assertIn(get("disk-full").hints[0], out)
+        self.assertIn("hint cost:        -5 pts (1 hint(s))", out)
+        self.assertIn("points:           91/100", out)
+
+    def test_cli_run_hints_json_records_hints(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--hints", "2", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["score"]["points"], 86)
+        self.assertEqual(data["score"]["hints_used"], 2)
+        self.assertEqual(data["score"]["hint_cost_points"], 10)
+        self.assertEqual(
+            [hint["text"] for hint in data["hints"]],
+            list(get("disk-full").hints[:2]))
+        self.assertTrue(all(hint["cost_points"] == 5
+                            for hint in data["hints"]))
+
+    def test_cli_run_too_many_hints_fails(self):
+        self.assertEqual(main(["run", "cert-expiry", "--hints", "3"]), 2)
+
+    def test_cli_run_negative_hints_fails(self):
+        self.assertEqual(main(["run", "disk-full", "--hints", "-1"]), 2)
+
+    def test_cli_run_hints_with_seeds_fails(self):
+        self.assertEqual(
+            main(["run", "disk-full", "--hints", "1", "--seeds", "1,2"]), 2)
+
+    def test_replay_round_trips_hints(self):
+        original = simulate(get("disk-full"), DEFAULT_POLICY, hints=2)
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(original.to_dict(), handle)
+        loaded = load_result(handle.name)
+        self.assertEqual(loaded.to_dict(), original.to_dict())
+        self.assertEqual(loaded.score.hints_used, 2)
+        self.assertEqual([hint.text for hint in loaded.hints],
+                         list(get("disk-full").hints[:2]))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["replay", handle.name]), 0)
+        self.assertIn(get("disk-full").hints[0], buf.getvalue())
+        self.assertIn("points:           86/100", buf.getvalue())
+
+    def test_replay_of_old_run_without_hints_defaults_to_none(self):
+        data = simulate(get("disk-full"), DEFAULT_POLICY).to_dict()
+        del data["hints"]
+        del data["score"]["hints_used"]
+        del data["score"]["hint_cost_points"]
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(data, handle)
+        loaded = load_result(handle.name)
+        self.assertEqual(loaded.hints, [])
+        self.assertEqual(loaded.score.hints_used, 0)
+        self.assertEqual(loaded.score.hint_cost_points, 0)
+
+    def test_template_includes_hints(self):
+        data = scenario_to_dict(get("disk-full"))
+        self.assertEqual(data["hints"], list(get("disk-full").hints))
+
+    def test_scenario_file_hints_load_and_validate(self):
+        payload = {"scenarios": {"cache-down": {
+            "service": "sessions-cache",
+            "title": "Cache cluster unreachable",
+            "severity": "high",
+            "description": "The sessions cache stopped accepting writes.",
+            "ack_delay_min": [2, None, None],
+            "mitigate_delay_min": 15,
+            "resolve_delay_min": 10,
+            "hints": ["Check the cache cluster health endpoint first."],
+        }}}
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(payload, handle)
+        scenarios = load_scenario_file(handle.name)
+        self.assertEqual(scenarios["cache-down"].hints,
+                         ("Check the cache cluster health endpoint first.",))
+        result = simulate(scenarios["cache-down"], DEFAULT_POLICY, hints=1)
+        self.assertEqual(result.score.points, 94)
+
+        bad = {"scenarios": {"broken": dict(
+            payload["scenarios"]["cache-down"], hints=["ok", ""])}}
+        with open(handle.name, "w", encoding="utf-8") as out:
+            json.dump(bad, out)
+        with self.assertRaises(ValueError):
+            load_scenario_file(handle.name)
+        bad = {"scenarios": {"broken": dict(
+            payload["scenarios"]["cache-down"], hints="not a list")}}
+        with open(handle.name, "w", encoding="utf-8") as out:
+            json.dump(bad, out)
+        with self.assertRaises(ValueError):
+            load_scenario_file(handle.name)
 
 
 if __name__ == "__main__":

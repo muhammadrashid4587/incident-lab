@@ -27,6 +27,11 @@ class Scenario:
     # Minutes from ack to mitigated, and from mitigated to resolved.
     mitigate_delay_min: int
     resolve_delay_min: int
+    # Known-good next actions for this incident, in the order they help:
+    # what an operator who is stuck should check or do first. Asked for
+    # with `run --hints N`; each hint costs score, so they are guidance,
+    # not a free answer.
+    hints: tuple = ()
 
 
 SCENARIOS = {
@@ -42,6 +47,14 @@ SCENARIOS = {
         ack_delay_min=(3, None, None),
         mitigate_delay_min=20,
         resolve_delay_min=12,
+        hints=(
+            "Check WAL archiving: a stalled archiver is the usual cause "
+            "of disk growth after a deploy.",
+            "Free space now by rotating old WAL segments, then confirm "
+            "the bad deploy is rolled back before adding disk.",
+            "Watch the disk-free metric for 10m after the fix; if it "
+            "keeps falling, the leak is still running.",
+        ),
     ),
     "latency-spike": Scenario(
         name="latency-spike",
@@ -55,6 +68,14 @@ SCENARIOS = {
         ack_delay_min=(None, 4, None),
         mitigate_delay_min=35,
         resolve_delay_min=20,
+        hints=(
+            "Check the downstream dependency first: a latency spike "
+            "with no deploys is usually a slow database or queue.",
+            "Compare p99 by endpoint: if only checkout is slow, the "
+            "problem is in checkout, not the shared stack.",
+            "Shed load before tuning: enable the circuit breaker or "
+            "rate-limit non-critical traffic while you dig.",
+        ),
     ),
     "cert-expiry": Scenario(
         name="cert-expiry",
@@ -68,6 +89,12 @@ SCENARIOS = {
         ack_delay_min=(2, None, None),
         mitigate_delay_min=8,
         resolve_delay_min=5,
+        hints=(
+            "Renew the certificate by hand first; fix the silent renewal "
+            "job after the incident is over.",
+            "Check the renewal job's logs: a week of silent failures "
+            "means its alerting is broken too.",
+        ),
     ),
     "deploy-regression": Scenario(
         name="deploy-regression",
@@ -81,6 +108,14 @@ SCENARIOS = {
         ack_delay_min=(None, None, 6),
         mitigate_delay_min=45,
         resolve_delay_min=30,
+        hints=(
+            "Roll back the deploy first: an 18% error rate starting "
+            "right after a deploy is the deploy until proven otherwise.",
+            "Compare the error rate by version: if only the new version "
+            "errors, the rollback will confirm it.",
+            "Freeze further deploys until the bad one is out; a second "
+            "deploy on top of a regression hides the cause.",
+        ),
     ),
     "queue-backlog": Scenario(
         name="queue-backlog",
@@ -95,6 +130,15 @@ SCENARIOS = {
         ack_delay_min=(4, None, None),
         mitigate_delay_min=25,
         resolve_delay_min=15,
+        hints=(
+            "Scale the consumers up before anything else: lag drains "
+            "only as fast as consumption, and the backlog is the "
+            "incident.",
+            "Check the downstream first: a slow downstream caps how "
+            "fast extra consumers can drain the queue.",
+            "Confirm the lag is actually falling after scaling; if it "
+            "is flat, the consumers are stuck, not short-handed.",
+        ),
     ),
     "dns-outage": Scenario(
         name="dns-outage",
@@ -109,6 +153,17 @@ SCENARIOS = {
         ack_delay_min=(None, 3, None),
         mitigate_delay_min=40,
         resolve_delay_min=25,
+        hints=(
+            "Fail over to the backup DNS provider first; DNS is "
+            "foundational, and every minute down blocks everything "
+            "else.",
+            "Check whether the SERVFAIL is everywhere or one region: "
+            "a regional failure points at one nameserver, not the "
+            "whole provider.",
+            "Verify the failover actually resolves before declaring "
+            "the incident mitigated; a bad failover looks fixed "
+            "until the TTLs expire.",
+        ),
     ),
 }
 
@@ -137,6 +192,7 @@ def scenario_to_dict(scenario: Scenario) -> dict:
         "ack_delay_min": list(scenario.ack_delay_min),
         "mitigate_delay_min": scenario.mitigate_delay_min,
         "resolve_delay_min": scenario.resolve_delay_min,
+        "hints": list(scenario.hints),
     }
 
 
@@ -196,7 +252,27 @@ def _scenario_from_dict(name: str, data) -> Scenario:
             data, "mitigate_delay_min", name),
         resolve_delay_min=_require_positive_int(
             data, "resolve_delay_min", name),
+        hints=tuple(_require_hints(data, name)),
     )
+
+
+def _require_hints(data: dict, name: str) -> list:
+    """Validate a scenario file's optional ``hints`` list.
+
+    Hints are the scenario's known-good next actions, asked for with
+    ``run --hints N``. Absent means no hints; present it must be a list
+    of non-empty strings.
+    """
+    raw = data.get("hints", [])
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"scenario {name!r}: 'hints' must be a list of strings")
+    for index, hint in enumerate(raw):
+        if not isinstance(hint, str) or not hint:
+            raise ValueError(
+                f"scenario {name!r}: 'hints' entry {index} must be a "
+                "non-empty string")
+    return raw
 
 
 def load_scenario_file(path: str) -> dict:

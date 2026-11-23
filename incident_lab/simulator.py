@@ -16,9 +16,11 @@ Scoring (0-100, documented in README.md):
 - a late ack (after its level's timeout) still counts, but the score is
   scaled by partial credit: full credit up to the timeout, then linear
   decay to zero at twice the timeout
+- minus HINT_COST_POINTS per hint asked for (`run --hints N`), after the
+  late-ack credit scaling, floored at 0
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import random
 import statistics
 
@@ -34,6 +36,10 @@ ESCALATION_PENALTY = 15
 # A late ack earns partial credit that decays linearly to zero when the
 # ack delay reaches this many times the level's ack timeout.
 LATE_ACK_CREDIT_WINDOW = 2
+# Points one hint costs. Hints are the scenario's known-good next actions,
+# asked for with `run --hints N`; they are guidance, not a free answer,
+# so each one comes off the final score.
+HINT_COST_POINTS = 5
 # With --seed, each ack delay is jittered by a magnitude drawn from this
 # range (minutes) with a random sign, from a seeded RNG, so the same
 # seed replays the same run while different seeds vary the response
@@ -69,6 +75,20 @@ def late_ack_credit(ack_delay_min: int, ack_timeout_min: int) -> float:
 
 
 @dataclass(frozen=True)
+class Hint:
+    """One hint the operator asked for during the run.
+
+    The text is one of the scenario's known-good next actions, drawn in
+    order; ``cost_points`` is what it took off the final score.
+    """
+    text: str
+    cost_points: int = HINT_COST_POINTS
+
+    def to_dict(self) -> dict:
+        return {"text": self.text, "cost_points": self.cost_points}
+
+
+@dataclass(frozen=True)
 class Score:
     time_to_ack_min: object  # int, or None if nobody acked
     time_to_mitigate_min: object  # int, or None if never mitigated
@@ -87,6 +107,10 @@ class Score:
     # incident was never mitigated / resolved.
     mitigate_delay_min: object = None
     resolve_delay_min: object = None
+    # Hints asked for during the run (0 if none) and what they cost in
+    # total; the cost is already deducted from ``points``.
+    hints_used: int = 0
+    hint_cost_points: int = 0
 
     def to_dict(self) -> dict:
         """JSON-ready dict; unreached milestones serialize as null."""
@@ -101,6 +125,8 @@ class Score:
             "ack_credit": self.ack_credit,
             "mitigate_delay_min": self.mitigate_delay_min,
             "resolve_delay_min": self.resolve_delay_min,
+            "hints_used": self.hints_used,
+            "hint_cost_points": self.hint_cost_points,
         }
 
 
@@ -119,6 +145,9 @@ class SimulationResult:
     # Difficulty the run was played at, or None for a saved run from
     # before difficulties existed. Recorded in --json output.
     difficulty: object = None
+    # Hints the operator asked for during the run, in the order asked
+    # (empty when none were asked). Recorded in --json output.
+    hints: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """JSON-ready dict of the whole result: incident, policy, timeline, score."""
@@ -128,6 +157,7 @@ class SimulationResult:
                        else None),
             "difficulty": (self.difficulty.name
                            if self.difficulty is not None else None),
+            "hints": [hint.to_dict() for hint in self.hints],
             "incident": {
                 "id": self.incident.id,
                 "service": self.incident.service,
@@ -244,6 +274,7 @@ def simulate(
     seed: object = None,
     jitter: object = None,
     difficulty: object = None,
+    hints: int = 0,
 ) -> SimulationResult:
     """Run one scenario against one policy and return the full result.
 
@@ -266,9 +297,25 @@ def simulate(
     difficulty, so the same incident scores differently at different
     difficulties. The difficulty is recorded on the result and in its
     ``--json`` output.
+
+    ``hints`` asks for that many hints during the run: the operator asks
+    for help while triaging, and the hints are drawn in order from the
+    scenario's known-good next actions. Each hint costs
+    ``HINT_COST_POINTS`` off the final score (after the late-ack credit
+    scaling, floored at 0), and is recorded on the result and in its
+    ``--json`` output. Raises ValueError if ``hints`` is negative or
+    more than the scenario has.
     """
     if difficulty is None:
         difficulty = NORMAL
+    if isinstance(hints, bool) or not isinstance(hints, int) or hints < 0:
+        raise ValueError("hints must be a non-negative integer")
+    if hints > len(scenario.hints):
+        raise ValueError(
+            f"scenario {scenario.name!r} has only "
+            f"{len(scenario.hints)} hint(s), asked for {hints}")
+    used_hints = [Hint(text) for text in scenario.hints[:hints]]
+    hint_cost = len(used_hints) * HINT_COST_POINTS
     if seed is not None:
         if jitter is None:
             jitter_range = difficulty.default_jitter_range
@@ -334,15 +381,19 @@ def simulate(
             timeline.record(t, "unacked", "monitor", "nobody acked the page")
             return SimulationResult(
                 incident, policy, timeline,
-                Score(None, None, None, escalations, False, 0),
+                Score(None, None, None, escalations, False, 0,
+                      hints_used=len(used_hints), hint_cost_points=hint_cost),
                 seed=seed, jitter=jitter_range, difficulty=difficulty,
+                hints=used_hints,
             )
         if t > max_duration_min:
             timeline.record(t, "unacked", "monitor", "max duration reached")
             return SimulationResult(
                 incident, policy, timeline,
-                Score(None, None, None, escalations, False, 0),
+                Score(None, None, None, escalations, False, 0,
+                      hints_used=len(used_hints), hint_cost_points=hint_cost),
                 seed=seed, jitter=jitter_range, difficulty=difficulty,
+                hints=used_hints,
             )
 
     if rng is not None:
@@ -367,7 +418,9 @@ def simulate(
     points -= max(0, mitigated_at - difficulty.mitigate_grace_min) // 2
     # A late ack keeps only part of the score: the effective score is the
     # base score scaled by the ack credit (1.0 for an on-time ack).
-    points = max(0, round(points * ack_credit))
+    # Hints come off after that scaling, so asking for help costs the
+    # same whether the ack was on time or late.
+    points = max(0, round(points * ack_credit) - hint_cost)
     score = Score(
         time_to_ack_min=acked_at,
         time_to_mitigate_min=mitigated_at,
@@ -379,6 +432,9 @@ def simulate(
         ack_credit=ack_credit,
         mitigate_delay_min=mitigate_delay,
         resolve_delay_min=resolve_delay,
+        hints_used=len(used_hints),
+        hint_cost_points=hint_cost,
     )
     return SimulationResult(incident, policy, timeline, score, seed=seed,
-                            jitter=jitter_range, difficulty=difficulty)
+                            jitter=jitter_range, difficulty=difficulty,
+                            hints=used_hints)

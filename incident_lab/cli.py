@@ -127,7 +127,16 @@ def _print_result(result) -> None:
           else "  time-to-resolve:  -")
     print(f"  escalations:      {score.escalations}")
     print(f"  resolved:         {'yes' if score.resolved else 'no'}")
+    if score.hints_used:
+        print(f"  hint cost:        -{score.hint_cost_points} pts "
+              f"({score.hints_used} hint(s))")
     print(f"  points:           {score.points}/100")
+    if result.hints:
+        print()
+        print(f"hints used ({len(result.hints)} × "
+              f"{result.hints[0].cost_points} pts):")
+        for hint in result.hints:
+            print(f"  - {hint.text}")
 
 
 def _print_batch_result(batch) -> None:
@@ -211,6 +220,12 @@ def main(argv=None) -> int:
                           "e.g. 0-3: each ack delay shifts by a magnitude "
                           "in that range, random sign; requires --seed or "
                           "--seeds, default 0-1; recorded in --json output")
+    run.add_argument("--hints", type=int, default=0, metavar="N",
+                     help="ask for N hints during the run, drawn in order "
+                          "from the scenario's known-good next actions; "
+                          "each hint costs 5 points off the final score "
+                          "and is recorded in --json output; cannot be "
+                          "combined with --seeds")
     run.add_argument("--json", action="store_true",
                      help="print the result as JSON instead of the replay")
 
@@ -408,6 +423,19 @@ def main(argv=None) -> int:
         if args.seed is not None and args.seeds is not None:
             print("use only one of --seed and --seeds", file=sys.stderr)
             return 2
+        if args.hints < 0:
+            print("--hints must be a non-negative number of hints",
+                  file=sys.stderr)
+            return 2
+        if args.hints and args.seeds is not None:
+            print("--hints cannot be combined with --seeds: hints are "
+                  "asked for during one run", file=sys.stderr)
+            return 2
+        if args.hints > len(scenario.hints):
+            print(f"scenario {scenario.name!r} has only "
+                  f"{len(scenario.hints)} hint(s), asked for {args.hints}",
+                  file=sys.stderr)
+            return 2
         jitter = None
         if args.jitter is not None:
             if args.seed is None and args.seeds is None:
@@ -432,7 +460,7 @@ def main(argv=None) -> int:
                 _print_batch_result(batch)
             return 0
         result = simulate(scenario, policy, seed=args.seed, jitter=jitter,
-                          difficulty=difficulty)
+                          difficulty=difficulty, hints=args.hints)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:

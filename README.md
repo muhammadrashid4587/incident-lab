@@ -52,6 +52,8 @@ python3 -m incident_lab run disk-full --seed 1 --json > /tmp/run-seed-1.json
 python3 -m incident_lab run disk-full --seed 7 --json > /tmp/run-seed-7.json
 python3 -m incident_lab compare /tmp/run-seed-1.json /tmp/run-seed-7.json
 python3 -m incident_lab compare /tmp/run-seed-1.json /tmp/run-seed-7.json --json
+python3 -m incident_lab run disk-full --hints 1
+python3 -m incident_lab run disk-full --hints 2 --json
 python3 -m incident_lab template disk-full > my-disk-full.json
 python3 -m incident_lab run disk-full --scenario-file my-disk-full.json
 python3 -m incident_lab run cache-down --scenario-file examples/custom-scenario.json
@@ -62,7 +64,8 @@ python3 scripts/demo.py
 
 `run --json` prints the whole result as machine-readable JSON instead of
 the human replay: incident, policy (levels with responders and ack
-timeouts), the timeline in time order, and the score. The score carries
+timeouts), the timeline in time order, the score, and any hints asked for
+(each with its text and cost). The score carries
 the acking level's lateness (`ack_late_min`, 0 for an on-time ack) and
 the partial credit it kept (`ack_credit`, 1.0 on time). The score also
 carries the effective mitigate and resolve delays
@@ -156,7 +159,9 @@ the same name as a built-in one wins. The file holds a `"scenarios"`
 mapping, each entry with `service`, `title`, `severity` (`low`,
 `medium`, `high` or `critical`), `description`, `ack_delay_min` (a list
 of minutes per escalation level, `null` where a responder never acks),
-and `mitigate_delay_min` / `resolve_delay_min`:
+and `mitigate_delay_min` / `resolve_delay_min`. An entry can also carry
+an optional `hints` list of known-good next actions, asked for with
+`run --hints N` (see Hints):
 
 ```json
 {"scenarios": {"cache-down": {
@@ -237,6 +242,7 @@ Points start at 100 and are subtracted:
 - 1 point per 2 minutes of time-to-mitigate past the mitigate grace
   (15 minutes on normal; the difficulty sets it)
 - an incident nobody acks scores 0
+- 5 points per hint asked for (`run --hints N`)
 
 A late ack still counts, but it only keeps part of the score. The ack
 credit is 1.0 up to the acking level's timeout, then decays linearly to
@@ -249,6 +255,31 @@ Example: `disk-full` acks in 3m and mitigates in 23m with no escalations,
 so 100 - 0 - (23-15)//2 = 96. On the `fast` policy the primary's 2m
 timeout makes that a 1m-late ack, so the credit is 1 - 1/2 = 0.5 and the
 effective score is 96 × 0.5 = 48.
+
+## Hints
+
+`run <scenario> --hints N` asks for N hints during the run: the operator
+is stuck while triaging and asks for help. Each hint is one of the
+scenario's known-good next actions, drawn in order (the first hint is
+the most useful thing to check first), and each one costs 5 points off
+the final score, after the late-ack credit scaling, floored at 0. The
+hints used are printed after the score, recorded in the `run --json`
+output (a top-level `hints` list of `{"text", "cost_points"}` entries,
+plus `score.hints_used` and `score.hint_cost_points`), and shown again
+by `replay`. Asking for more hints than the scenario has fails the run
+with exit code 2 and an error message, as does a negative count;
+`--hints` cannot be combined with `--seeds`, since hints are asked for
+during one run. Custom scenarios loaded with `--scenario-file` can
+carry their own `hints` list; `template` prints a scenario's hints
+with it.
+
+```sh
+python3 -m incident_lab run disk-full --hints 1
+python3 -m incident_lab run disk-full --hints 2 --json
+```
+
+Example: `disk-full` with one hint scores 96 - 5 = 91, and the hint
+("Check WAL archiving...") is printed with the run.
 
 ## Difficulty ladder
 
@@ -351,11 +382,11 @@ human-readable form.
 
 ## Version
 
-0.16.0 — run comparison: `compare <run-a.json> <run-b.json>` diffs two
-saved runs side by side (score deltas per metric and a timeline diff
-of shared-event time shifts plus events only one run has), in human
-form or `--json`; flags different scenarios and policies, and shows
-unreached milestones as `-` with no delta.
+0.17.0 — hints: `run --hints N` asks for N hints during a run, drawn in
+order from the scenario's known-good next actions (each scenario carries
+its own, and scenario files can add theirs); each hint costs 5 points
+off the final score and is recorded in `run --json` and shown again by
+`replay`.
 
 ## Roadmap
 
@@ -375,3 +406,4 @@ unreached milestones as `-` with no delta.
 - [x] Shareable incident templates: `template <scenario>` prints a scenario as JSON, `run --scenario-file` loads named scenarios from a JSON file (file wins over built-in names), validated like `--policy-file` (0.14.0)
 - [x] Difficulty ladder: `run --difficulty easy|normal|hard` (or 1/2/3) scales ack timeouts (×1.5 / ×1.0 / ×0.6), scoring targets (ack grace 8/5/3m, mitigate grace 20/15/10m) and the default seeded jitter (0-0 / 0-1 / 0-3), records the difficulty in `run --json`, and `replay`/`debrief` show it (0.15.0)
 - [x] Run comparison: `compare <run-a.json> <run-b.json>` diffs two saved runs side by side (score deltas per metric, timeline diff of shared-event time shifts plus events only one run has), human form or `--json`, flags different scenarios/policies, unreached milestones show as `-` (0.16.0)
+- [x] Hints: `run --hints N` asks for N hints during a run, drawn in order from the scenario's known-good next actions (each built-in scenario carries 2-3, scenario files can add their own, `template` prints them); each hint costs 5 points off the final score and is recorded in `run --json` and shown again by `replay` (0.17.0)

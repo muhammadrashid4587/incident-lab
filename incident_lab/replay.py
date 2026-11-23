@@ -14,7 +14,7 @@ import json
 from .difficulty import parse_difficulty
 from .incident import Incident
 from .policy import EscalationPolicy, Level, Responder
-from .simulator import Score, SimulationResult
+from .simulator import Hint, Score, SimulationResult
 from .timeline import Timeline
 
 
@@ -150,7 +150,45 @@ def _score_from_dict(raw) -> Score:
             data, "mitigate_delay_min", "score"),
         resolve_delay_min=_require_int_or_none(
             data, "resolve_delay_min", "score"),
+        # Saved runs from before 0.17.0 have no hint fields; they
+        # round-trip as zero hints at zero cost.
+        hints_used=_require_hint_count(data, "hints_used"),
+        hint_cost_points=_require_hint_count(data, "hint_cost_points"),
     )
+
+
+def _require_hint_count(data: dict, key: str) -> int:
+    """Parse an optional score hint count; missing means no hints."""
+    value = data.get(key)
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            f"replay file: score {key!r} must be a non-negative integer")
+    return value
+
+
+def _hints_from_dict(raw) -> list:
+    """Parse an optional top-level ``hints`` list of used hints.
+
+    Saved runs from before 0.17.0 have no hints key; they round-trip
+    as no hints.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError("replay file: 'hints' must be a list or null")
+    hints = []
+    for index, raw_hint in enumerate(raw):
+        hint_data = _require_mapping(raw_hint, f"hint {index}")
+        text = _require_str(hint_data, "text", f"hint {index}")
+        cost = hint_data.get("cost_points")
+        if isinstance(cost, bool) or not isinstance(cost, int) or cost < 0:
+            raise ValueError(
+                f"replay file: hint {index} 'cost_points' must be a "
+                "non-negative integer")
+        hints.append(Hint(text=text, cost_points=cost))
+    return hints
 
 
 def load_result(path: str) -> SimulationResult:
@@ -191,4 +229,5 @@ def load_result(path: str) -> SimulationResult:
         seed=seed,
         jitter=jitter,
         difficulty=difficulty,
+        hints=_hints_from_dict(data.get("hints")),
     )
