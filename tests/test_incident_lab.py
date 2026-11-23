@@ -3,19 +3,20 @@
 import io
 import json
 import os
+import statistics
 import tempfile
 import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
 
-from incident_lab.cli import main, parse_jitter_range
+from incident_lab.cli import main, parse_jitter_range, parse_seed_spec
 from incident_lab.policy import (
     DEFAULT_POLICY, get_policy, list_policies, load_policy_file,
     parse_ack_timeout_overrides,
 )
 from incident_lab.replay import load_result
 from incident_lab.scenarios import Scenario, get, list_scenarios
-from incident_lab.simulator import simulate
+from incident_lab.simulator import simulate, simulate_batch
 from incident_lab.timeline import Timeline
 
 
@@ -1247,6 +1248,134 @@ class TestSeededMitigateResolveDelays(unittest.TestCase):
         loaded = load_result(path.name)
         self.assertIsNone(loaded.score.mitigate_delay_min)
         self.assertIsNone(loaded.score.resolve_delay_min)
+
+
+class TestSeedBatch(unittest.TestCase):
+    def test_seed_spec_parses_comma_list(self):
+        self.assertEqual(parse_seed_spec("1,2,3"), [1, 2, 3])
+        self.assertEqual(parse_seed_spec("1, 2, 3"), [1, 2, 3])
+
+    def test_seed_spec_parses_range(self):
+        self.assertEqual(parse_seed_spec("1-5"), [1, 2, 3, 4, 5])
+        self.assertEqual(parse_seed_spec("3-3"), [3])
+
+    def test_seed_spec_parses_single_seed(self):
+        self.assertEqual(parse_seed_spec("7"), [7])
+
+    def test_seed_spec_dedupes_keeping_order(self):
+        self.assertEqual(parse_seed_spec("2,1,2"), [2, 1])
+
+    def test_seed_spec_rejects_bad_specs(self):
+        for bad in ("", "3-1", "abc", "1,,2", "1-2-3", "-1", "1,-2",
+                    "1.5", "1-", "1,"):
+            with self.assertRaises(ValueError, msg=bad):
+                parse_seed_spec(bad)
+
+    def test_batch_runs_once_per_seed(self):
+        batch = simulate_batch(get("disk-full"), DEFAULT_POLICY, [1, 2, 3])
+        self.assertEqual(batch.seeds, [1, 2, 3])
+        self.assertEqual(len(batch.runs), 3)
+        for run, seed in zip(batch.runs, [1, 2, 3]):
+            self.assertEqual(run.seed, seed)
+            self.assertEqual(run.score.points,
+                             simulate(get("disk-full"), DEFAULT_POLICY,
+                                      seed=seed).score.points)
+
+    def test_batch_is_deterministic(self):
+        first = simulate_batch(get("disk-full"), DEFAULT_POLICY, [1, 2, 3])
+        second = simulate_batch(get("disk-full"), DEFAULT_POLICY, [1, 2, 3])
+        self.assertEqual(first.to_dict(), second.to_dict())
+
+    def test_batch_distribution_matches_individual_runs(self):
+        seeds = [1, 2, 3, 4]
+        batch = simulate_batch(get("disk-full"), DEFAULT_POLICY, seeds)
+        points = [simulate(get("disk-full"), DEFAULT_POLICY, seed=seed)
+                  .score.points for seed in seeds]
+        dist = batch.score_distribution()
+        self.assertEqual(dist["min"], min(points))
+        self.assertEqual(dist["max"], max(points))
+        self.assertAlmostEqual(dist["mean"], sum(points) / len(points))
+        self.assertEqual(dist["median"], statistics.median(points))
+        self.assertEqual([entry["seed"] for entry in dist["per_seed"]],
+                         seeds)
+        self.assertEqual([entry["points"] for entry in dist["per_seed"]],
+                         points)
+
+    def test_batch_rejects_empty_seeds(self):
+        with self.assertRaises(ValueError):
+            simulate_batch(get("disk-full"), DEFAULT_POLICY, [])
+
+    def test_batch_records_default_jitter(self):
+        batch = simulate_batch(get("disk-full"), DEFAULT_POLICY, [1, 2])
+        self.assertEqual(batch.jitter, (0, 1))
+
+    def test_batch_json_output(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--seeds", "1,2,3", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["seeds"], [1, 2, 3])
+        self.assertEqual(data["jitter"], [0, 1])
+        self.assertEqual(len(data["runs"]), 3)
+        self.assertEqual([run["seed"] for run in data["runs"]], [1, 2, 3])
+        dist = data["score_distribution"]
+        self.assertEqual(len(dist["per_seed"]), 3)
+        self.assertEqual([entry["seed"] for entry in dist["per_seed"]],
+                         [1, 2, 3])
+        self.assertEqual(dist["min"], min(dist["per_seed"],
+                                          key=lambda e: e["points"])["points"])
+        self.assertEqual(dist["max"], max(dist["per_seed"],
+                                          key=lambda e: e["points"])["points"])
+
+    def test_batch_range_spec_via_cli(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--seeds", "1-3", "--json"]), 0)
+        self.assertEqual(json.loads(buf.getvalue())["seeds"], [1, 2, 3])
+
+    def test_batch_human_output_shows_distribution(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--seeds", "1,2,3"]), 0)
+        out = buf.getvalue()
+        self.assertIn("seeds:    1, 2, 3", out)
+        self.assertIn("score distribution (3 runs):", out)
+        self.assertIn("mean:", out)
+        self.assertIn("median:", out)
+        self.assertIn("min:", out)
+        self.assertIn("max:", out)
+        for seed in (1, 2, 3):
+            self.assertIn(f"seed {seed}:", out)
+
+    def test_batch_with_jitter(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--seeds", "1,2",
+                      "--jitter", "0-3", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["jitter"], [0, 3])
+        self.assertEqual([run["jitter"] for run in data["runs"]],
+                         [[0, 3], [0, 3]])
+
+    def test_seed_and_seeds_cannot_combine(self):
+        self.assertEqual(
+            main(["run", "disk-full", "--seed", "7", "--seeds", "1,2"]), 2)
+
+    def test_cli_bad_seeds_fails(self):
+        for bad in ("3-1", "abc", "1,,2", "-1"):
+            with self.subTest(bad=bad):
+                # --seeds=<spec> so a leading "-" reaches the validator
+                # instead of being read as an option flag by argparse.
+                self.assertEqual(
+                    main(["run", "disk-full", f"--seeds={bad}"]), 2)
+
+    def test_jitter_without_seed_or_seeds_fails(self):
+        self.assertEqual(
+            main(["run", "disk-full", "--jitter", "0-3"]), 2)
 
 
 if __name__ == "__main__":

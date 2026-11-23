@@ -38,6 +38,8 @@ python3 -m incident_lab run disk-full --policy-file examples/custom-policy.json
 python3 -m incident_lab run dns-outage --json > /tmp/dns-outage.json
 python3 -m incident_lab run disk-full --seed 7 --json
 python3 -m incident_lab run disk-full --seed 7 --jitter 0-3 --json
+python3 -m incident_lab run disk-full --seeds 1,2,3
+python3 -m incident_lab run disk-full --seeds 1-5 --json
 python3 -m incident_lab replay /tmp/dns-outage.json
 python3 scripts/demo.py
 ```
@@ -57,6 +59,12 @@ serialize as `null` (for example, an incident nobody acks has
 the `--seed` value used for the run, or `null` for an unseeded run, and the
 top-level `jitter` records the `--jitter` range as `[lo, hi]`, or `null`
 for an unseeded run.
+
+A batch run (`--seeds`, below) prints a different JSON shape: `seeds`
+(the seed list), `jitter`, the shared `incident` and `policy`, every
+run in full under `runs` (each one a single-run result as above), and
+`score_distribution` with the mean, min, max and median points plus a
+`per_seed` list of `{"seed": N, "points": P}` entries.
 
 ## Replay
 
@@ -194,21 +202,34 @@ each ack, mitigate and resolve delay shifts by a magnitude drawn from
 `LO` to `HI` minutes, with a random sign, from the same seeded
 generator, so reproducibility holds for any range. `--jitter 0-0` means
 no jitter at all. The default is `0-1`, the same as `--seed` alone.
-`--jitter` requires `--seed`, and a bad range (negative bounds, or `LO`
+`--jitter` requires `--seed` or `--seeds`, and a bad range (negative bounds, or `LO`
 greater than `HI`) fails the run with exit code 2 and an error
 message. The range is recorded in the `run --json` output (top-level
 `jitter`, `[lo, hi]`) and shown in the human-readable output, and
 `replay` re-prints it from a saved run.
 
+## Multi-seed batch mode
+
+`run <scenario> --seeds 1,2,3` (or `--seeds 1-5` for an inclusive
+range) runs the same scenario once per seed and reports the score
+distribution instead of a single timeline: the mean, min, max and
+median points across runs, plus the score for each seed. `--seeds`
+cannot be combined with `--seed`; `--jitter` works with `--seeds`
+and applies the same range to every run. A bad spec (empty entries,
+non-integer or negative seeds, a reversed range) fails the run with
+exit code 2 and an error message. With `--json` the batch prints
+`seeds`, the shared incident and policy, every run in full under
+`runs`, and `score_distribution` (mean/min/max/median and a
+`per_seed` list); without it the same distribution is printed in
+human-readable form.
+
 ## Version
 
-0.11.0 — seeded jitter now also applies to the mitigate and resolve
-delays: each step shifts by a magnitude in the `--jitter` range with a
-random sign, drawn from the same seeded generator after the ack draws,
-so the whole incident varies with the seed and stays reproducible; the
-effective delays are recorded in `run --json` as
-`score.mitigate_delay_min` / `score.resolve_delay_min` and round-trip
-through `replay`.
+0.12.0 — multi-seed batch mode: `--seeds 1,2,3` or `--seeds 1-5`
+runs the same scenario once per seed and reports the score
+distribution (mean/min/max/median and per-seed scores) in both the
+human output and `--json`, where each run is also kept in full under
+`runs`.
 
 ## Roadmap
 
@@ -223,3 +244,4 @@ through `replay`.
 - [x] `--seed N` for randomized ack delays: reproducible runs (0.9.0)
 - [x] `--jitter LO-HI` for a configurable seeded ack-delay jitter range (0.10.0)
 - [x] Seeded jitter for mitigate and resolve delays, recorded in JSON, replay round-trips (0.11.0)
+- [x] Multi-seed batch mode: `--seeds 1,2,3` or `--seeds 1-5` runs the same scenario per seed and reports the score distribution (mean/min/max/median, per-seed scores) in human output and `--json` (0.12.0)

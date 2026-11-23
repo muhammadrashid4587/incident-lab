@@ -10,7 +10,59 @@ from .policy import (
 )
 from .replay import load_result
 from .scenarios import get, list_scenarios
-from .simulator import simulate
+from .simulator import simulate, simulate_batch
+
+
+def parse_seed_spec(spec: str) -> list:
+    """Parse a --seeds spec into a list of seed integers.
+
+    Either a comma-separated list ("1,2,3"), an inclusive range
+    ("1-5"), or a single seed ("7"). Seeds must be non-negative
+    integers; duplicates are dropped, order is kept. Raises
+    ValueError on a bad spec.
+    """
+    spec = spec.strip()
+    if not spec:
+        raise ValueError("seed spec must not be empty")
+    if "," in spec:
+        parts = [part.strip() for part in spec.split(",")]
+        if any(part == "" for part in parts):
+            raise ValueError(
+                f"seed list must not have empty entries (got {spec!r})")
+        seeds = [_parse_seed_int(part, spec) for part in parts]
+    elif "-" in spec:
+        parts = [part.strip() for part in spec.split("-")]
+        if len(parts) != 2:
+            raise ValueError(
+                f"seed range must look like LO-HI (got {spec!r})")
+        lo = _parse_seed_int(parts[0], spec)
+        hi = _parse_seed_int(parts[1], spec)
+        if lo > hi:
+            raise ValueError(
+                f"seed range must have LO <= HI (got {spec!r})")
+        seeds = list(range(lo, hi + 1))
+    else:
+        seeds = [_parse_seed_int(spec, spec)]
+    seen = set()
+    out = []
+    for seed in seeds:
+        if seed not in seen:
+            seen.add(seed)
+            out.append(seed)
+    return out
+
+
+def _parse_seed_int(text: str, spec: str) -> int:
+    """Parse one seed from a --seeds spec; non-negative integers only."""
+    try:
+        seed = int(text)
+    except ValueError:
+        raise ValueError(
+            f"seeds must be integers (got {spec!r})")
+    if seed < 0:
+        raise ValueError(
+            f"seeds must be non-negative integers (got {spec!r})")
+    return seed
 
 
 def parse_jitter_range(spec: str) -> tuple:
@@ -69,6 +121,29 @@ def _print_result(result) -> None:
     print(f"  points:           {score.points}/100")
 
 
+def _print_batch_result(batch) -> None:
+    incident = batch.incident
+    dist = batch.score_distribution()
+    print(f"incident: {incident.title} [{incident.severity}]")
+    print(f"service:  {incident.service}")
+    print(f"policy:   {batch.policy.name}")
+    print(f"seeds:    {', '.join(str(seed) for seed in batch.seeds)}")
+    if batch.jitter is not None:
+        print(f"jitter:   {batch.jitter[0]}-{batch.jitter[1]}m")
+    print("timeouts: " + ", ".join(
+        f"{level.responder.name} ({level.responder.role}) "
+        f"{level.ack_timeout_min}m" for level in batch.policy.levels))
+    print()
+    print(f"score distribution ({len(batch.runs)} runs):")
+    print(f"  mean:   {dist['mean']:.1f}/100")
+    print(f"  median: {dist['median']}/100")
+    print(f"  min:    {dist['min']}/100")
+    print(f"  max:    {dist['max']}/100")
+    print("per-seed scores:")
+    for entry in dist["per_seed"]:
+        print(f"  seed {entry['seed']}: {entry['points']}/100")
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="incident-lab",
@@ -99,11 +174,16 @@ def main(argv=None) -> int:
                      help="seed the RNG that jitters ack delays by up to "
                           "1 minute, so the same seed replays the same run "
                           "exactly; recorded in --json output")
+    run.add_argument("--seeds", default=None, metavar="SEEDS",
+                     help="run the scenario once per seed and report the "
+                          "score distribution, as a comma list (1,2,3) or "
+                          "an inclusive range (1-5); cannot be combined "
+                          "with --seed")
     run.add_argument("--jitter", default=None, metavar="LO-HI",
                      help="jitter range in minutes for seeded ack delays, "
                           "e.g. 0-3: each ack delay shifts by a magnitude "
-                          "in that range, random sign; requires --seed, "
-                          "default 0-1; recorded in --json output")
+                          "in that range, random sign; requires --seed or "
+                          "--seeds, default 0-1; recorded in --json output")
     run.add_argument("--json", action="store_true",
                      help="print the result as JSON instead of the replay")
 
@@ -193,16 +273,31 @@ def main(argv=None) -> int:
             except ValueError as exc:
                 print(f"invalid --ack-timeouts: {exc}", file=sys.stderr)
                 return 2
+        if args.seed is not None and args.seeds is not None:
+            print("use only one of --seed and --seeds", file=sys.stderr)
+            return 2
         jitter = None
         if args.jitter is not None:
-            if args.seed is None:
-                print("--jitter requires --seed", file=sys.stderr)
+            if args.seed is None and args.seeds is None:
+                print("--jitter requires --seed or --seeds", file=sys.stderr)
                 return 2
             try:
                 jitter = parse_jitter_range(args.jitter)
             except ValueError as exc:
                 print(f"invalid --jitter: {exc}", file=sys.stderr)
                 return 2
+        if args.seeds is not None:
+            try:
+                seeds = parse_seed_spec(args.seeds)
+            except ValueError as exc:
+                print(f"invalid --seeds: {exc}", file=sys.stderr)
+                return 2
+            batch = simulate_batch(scenario, policy, seeds, jitter=jitter)
+            if args.json:
+                print(json.dumps(batch.to_dict(), indent=2))
+            else:
+                _print_batch_result(batch)
+            return 0
         result = simulate(scenario, policy, seed=args.seed, jitter=jitter)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))

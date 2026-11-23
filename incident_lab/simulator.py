@@ -18,6 +18,7 @@ Scoring (0-100, documented in README.md):
 
 from dataclasses import dataclass
 import random
+import statistics
 
 from .incident import Incident
 from .policy import EscalationPolicy
@@ -142,6 +143,83 @@ class SimulationResult:
             "timeline": self.timeline.to_dict(),
             "score": self.score.to_dict(),
         }
+
+
+@dataclass
+class BatchResult:
+    """The result of running one scenario across several seeds.
+
+    Each run is a full SimulationResult for one seed, so a batch keeps
+    every timeline; the score distribution summarises the points across
+    runs so a batch answers "how much does this response vary?" at a
+    glance.
+    """
+    incident: Incident
+    policy: EscalationPolicy
+    runs: list  # one SimulationResult per seed, in seed order
+    # Jitter range (lo, hi) in minutes applied to every run, or None
+    # for an unseeded batch (a batch always has seeds, so this is the
+    # effective range, defaulting to DEFAULT_JITTER_RANGE).
+    jitter: object = None
+
+    @property
+    def seeds(self) -> list:
+        return [run.seed for run in self.runs]
+
+    @property
+    def points(self) -> list:
+        return [run.score.points for run in self.runs]
+
+    def score_distribution(self) -> dict:
+        """Mean/min/max/median points across runs, plus per-seed scores."""
+        points = self.points
+        return {
+            "mean": statistics.mean(points),
+            "min": min(points),
+            "max": max(points),
+            "median": statistics.median(points),
+            "per_seed": [
+                {"seed": run.seed, "points": run.score.points}
+                for run in self.runs
+            ],
+        }
+
+    def to_dict(self) -> dict:
+        """JSON-ready dict: incident, policy, every run, distribution."""
+        # Incident and policy are the same for every run, so reuse the
+        # first run's rendering instead of duplicating the shape.
+        first = self.runs[0].to_dict()
+        return {
+            "seeds": self.seeds,
+            "jitter": (list(self.jitter) if self.jitter is not None
+                       else None),
+            "incident": first["incident"],
+            "policy": first["policy"],
+            "runs": [run.to_dict() for run in self.runs],
+            "score_distribution": self.score_distribution(),
+        }
+
+
+def simulate_batch(
+    scenario: Scenario,
+    policy: EscalationPolicy,
+    seeds: list,
+    jitter: object = None,
+) -> BatchResult:
+    """Run one scenario against one policy once per seed.
+
+    Each seed gets its own seeded run (same jitter range for all), so
+    the batch is reproducible for the same seed list. Raises
+    ValueError on an empty seed list.
+    """
+    seeds = list(seeds)
+    if not seeds:
+        raise ValueError("batch needs at least one seed")
+    runs = [simulate(scenario, policy, seed=seed, jitter=jitter)
+            for seed in seeds]
+    first = runs[0]
+    return BatchResult(first.incident, first.policy, runs,
+                       jitter=first.jitter)
 
 
 def simulate(
