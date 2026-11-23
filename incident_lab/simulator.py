@@ -8,8 +8,10 @@ it walks through mitigate and resolve.
 Scoring (0-100, documented in README.md):
 - start at 100
 - minus 15 per escalation
-- minus 1 per minute of time-to-ack past 5 minutes
-- minus 1 per 2 minutes of time-to-mitigate past 15 minutes
+- minus 1 per minute of time-to-ack past the difficulty's ack grace
+  (5 minutes on normal)
+- minus 1 per 2 minutes of time-to-mitigate past the difficulty's
+  mitigate grace (15 minutes on normal)
 - an incident nobody acks scores 0
 - a late ack (after its level's timeout) still counts, but the score is
   scaled by partial credit: full credit up to the timeout, then linear
@@ -20,6 +22,7 @@ from dataclasses import dataclass
 import random
 import statistics
 
+from .difficulty import NORMAL
 from .incident import Incident
 from .policy import EscalationPolicy
 from .scenarios import Scenario
@@ -113,6 +116,9 @@ class SimulationResult:
     # Jitter range (lo, hi) in minutes applied to ack delays, or None
     # for an unseeded run. Recorded alongside the seed for replay.
     jitter: object = None
+    # Difficulty the run was played at, or None for a saved run from
+    # before difficulties existed. Recorded in --json output.
+    difficulty: object = None
 
     def to_dict(self) -> dict:
         """JSON-ready dict of the whole result: incident, policy, timeline, score."""
@@ -120,6 +126,8 @@ class SimulationResult:
             "seed": self.seed,
             "jitter": (list(self.jitter) if self.jitter is not None
                        else None),
+            "difficulty": (self.difficulty.name
+                           if self.difficulty is not None else None),
             "incident": {
                 "id": self.incident.id,
                 "service": self.incident.service,
@@ -161,6 +169,8 @@ class BatchResult:
     # for an unseeded batch (a batch always has seeds, so this is the
     # effective range, defaulting to DEFAULT_JITTER_RANGE).
     jitter: object = None
+    # Difficulty every run in the batch was played at.
+    difficulty: object = None
 
     @property
     def seeds(self) -> list:
@@ -193,6 +203,8 @@ class BatchResult:
             "seeds": self.seeds,
             "jitter": (list(self.jitter) if self.jitter is not None
                        else None),
+            "difficulty": (self.difficulty.name
+                           if self.difficulty is not None else None),
             "incident": first["incident"],
             "policy": first["policy"],
             "runs": [run.to_dict() for run in self.runs],
@@ -205,6 +217,7 @@ def simulate_batch(
     policy: EscalationPolicy,
     seeds: list,
     jitter: object = None,
+    difficulty: object = None,
 ) -> BatchResult:
     """Run one scenario against one policy once per seed.
 
@@ -215,11 +228,13 @@ def simulate_batch(
     seeds = list(seeds)
     if not seeds:
         raise ValueError("batch needs at least one seed")
-    runs = [simulate(scenario, policy, seed=seed, jitter=jitter)
+    runs = [simulate(scenario, policy, seed=seed, jitter=jitter,
+                     difficulty=difficulty)
             for seed in seeds]
     first = runs[0]
     return BatchResult(first.incident, first.policy, runs,
-                       jitter=first.jitter)
+                       jitter=first.jitter,
+                       difficulty=first.difficulty)
 
 
 def simulate(
@@ -228,25 +243,35 @@ def simulate(
     max_duration_min: int = 240,
     seed: object = None,
     jitter: object = None,
+    difficulty: object = None,
 ) -> SimulationResult:
     """Run one scenario against one policy and return the full result.
 
     With ``seed`` given, each ack delay is jittered by a magnitude drawn
-    from ``jitter`` (a ``(lo, hi)`` pair of minutes, default
-    ``DEFAULT_JITTER_RANGE``) with a random sign, drawn from a
-    ``random.Random`` seeded with ``seed`` — so the same seed replays
-    the same run exactly while different seeds vary the response times.
-    A miss (``None`` delay) stays a miss, so the scenario's escalation
-    structure is unchanged. The same seeded jitter also applies to the
-    mitigate and resolve delays once someone acks, drawn from the same
-    RNG after the ack draws, so the whole incident varies with the seed
-    and stays reproducible; the effective delays are recorded in the
-    score (``mitigate_delay_min`` / ``resolve_delay_min``). Without a
-    seed the scenario's fixed delays are used and ``jitter`` is ignored.
+    from ``jitter`` (a ``(lo, hi)`` pair of minutes, defaulting to the
+    difficulty's default range — normal: ``DEFAULT_JITTER_RANGE``) with
+    a random sign, drawn from a ``random.Random`` seeded with ``seed`` — so
+    the same seed replays the same run exactly while different seeds
+    vary the response times. A miss (``None`` delay) stays a miss, so the
+    scenario's escalation structure is unchanged. The same seeded jitter
+    also applies to the mitigate and resolve delays once someone acks,
+    drawn from the same RNG after the ack draws, so the whole incident
+    varies with the seed and stays reproducible; the effective delays
+    are recorded in the score (``mitigate_delay_min`` /
+    ``resolve_delay_min``). Without a seed the scenario's fixed delays
+    are used and ``jitter`` is ignored.
+
+    ``difficulty`` (a ``Difficulty``, defaulting to normal) scales the
+    scoring targets: the ack and mitigate grace minutes come from the
+    difficulty, so the same incident scores differently at different
+    difficulties. The difficulty is recorded on the result and in its
+    ``--json`` output.
     """
+    if difficulty is None:
+        difficulty = NORMAL
     if seed is not None:
         if jitter is None:
-            jitter_range = DEFAULT_JITTER_RANGE
+            jitter_range = difficulty.default_jitter_range
         else:
             jitter_range = tuple(jitter)
             if (len(jitter_range) != 2
@@ -310,14 +335,14 @@ def simulate(
             return SimulationResult(
                 incident, policy, timeline,
                 Score(None, None, None, escalations, False, 0),
-                seed=seed, jitter=jitter_range,
+                seed=seed, jitter=jitter_range, difficulty=difficulty,
             )
         if t > max_duration_min:
             timeline.record(t, "unacked", "monitor", "max duration reached")
             return SimulationResult(
                 incident, policy, timeline,
                 Score(None, None, None, escalations, False, 0),
-                seed=seed, jitter=jitter_range,
+                seed=seed, jitter=jitter_range, difficulty=difficulty,
             )
 
     if rng is not None:
@@ -338,8 +363,8 @@ def simulate(
 
     points = 100
     points -= ESCALATION_PENALTY * escalations
-    points -= max(0, acked_at - ACK_GRACE_MIN)
-    points -= max(0, mitigated_at - MITIGATE_GRACE_MIN) // 2
+    points -= max(0, acked_at - difficulty.ack_grace_min)
+    points -= max(0, mitigated_at - difficulty.mitigate_grace_min) // 2
     # A late ack keeps only part of the score: the effective score is the
     # base score scaled by the ack credit (1.0 for an on-time ack).
     points = max(0, round(points * ack_credit))
@@ -356,4 +381,4 @@ def simulate(
         resolve_delay_min=resolve_delay,
     )
     return SimulationResult(incident, policy, timeline, score, seed=seed,
-                            jitter=jitter_range)
+                            jitter=jitter_range, difficulty=difficulty)

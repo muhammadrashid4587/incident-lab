@@ -6,6 +6,9 @@ import sys
 
 from . import __version__
 from .debrief import generate_debrief
+from .difficulty import (
+    apply_difficulty, list_difficulties, parse_difficulty,
+)
 from .policy import (
     POLICIES, list_policies, load_policy_file, parse_ack_timeout_overrides,
 )
@@ -96,6 +99,8 @@ def _print_result(result) -> None:
     print(f"incident: {incident.title} [{incident.severity}]")
     print(f"service:  {incident.service}")
     print(f"policy:   {result.policy.name}")
+    if result.difficulty is not None:
+        print(f"difficulty: {result.difficulty.name}")
     if result.seed is not None:
         print(f"seed:     {result.seed}")
     if result.jitter is not None:
@@ -130,6 +135,8 @@ def _print_batch_result(batch) -> None:
     print(f"incident: {incident.title} [{incident.severity}]")
     print(f"service:  {incident.service}")
     print(f"policy:   {batch.policy.name}")
+    if batch.difficulty is not None:
+        print(f"difficulty: {batch.difficulty.name}")
     print(f"seeds:    {', '.join(str(seed) for seed in batch.seeds)}")
     if batch.jitter is not None:
         print(f"jitter:   {batch.jitter[0]}-{batch.jitter[1]}m")
@@ -184,6 +191,11 @@ def main(argv=None) -> int:
                      help="load named policies from a JSON file; use one "
                           "with --policy, or the file's only policy if it "
                           "has exactly one")
+    run.add_argument("--difficulty", default=None,
+                     help="difficulty level: "
+                          f"{', '.join(list_difficulties())} (or 1, 2, 3); "
+                          "scales ack timeouts, scoring targets and the "
+                          "default seeded jitter; default normal")
     run.add_argument("--seed", type=int, default=None, metavar="N",
                      help="seed the RNG that jitters ack delays by up to "
                           "1 minute, so the same seed replays the same run "
@@ -333,6 +345,16 @@ def main(argv=None) -> int:
             print("use only one of --ack-timeout and --ack-timeouts",
                   file=sys.stderr)
             return 2
+        difficulty = None
+        if args.difficulty is not None:
+            try:
+                difficulty = parse_difficulty(args.difficulty)
+            except ValueError as exc:
+                print(f"invalid --difficulty: {exc}", file=sys.stderr)
+                return 2
+            # Difficulty scales the policy's timeouts first; an explicit
+            # --ack-timeout(s) override below still wins for its levels.
+            policy = apply_difficulty(policy, difficulty)
         if args.ack_timeout is not None:
             from dataclasses import replace
             levels = tuple(
@@ -366,13 +388,15 @@ def main(argv=None) -> int:
             except ValueError as exc:
                 print(f"invalid --seeds: {exc}", file=sys.stderr)
                 return 2
-            batch = simulate_batch(scenario, policy, seeds, jitter=jitter)
+            batch = simulate_batch(scenario, policy, seeds, jitter=jitter,
+                                   difficulty=difficulty)
             if args.json:
                 print(json.dumps(batch.to_dict(), indent=2))
             else:
                 _print_batch_result(batch)
             return 0
-        result = simulate(scenario, policy, seed=args.seed, jitter=jitter)
+        result = simulate(scenario, policy, seed=args.seed, jitter=jitter,
+                          difficulty=difficulty)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:

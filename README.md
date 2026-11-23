@@ -33,6 +33,9 @@ python3 -m incident_lab run disk-full
 python3 -m incident_lab run latency-spike
 python3 -m incident_lab run disk-full --json
 python3 -m incident_lab run latency-spike --policy fast
+python3 -m incident_lab run disk-full --difficulty easy
+python3 -m incident_lab run disk-full --difficulty hard
+python3 -m incident_lab run latency-spike --difficulty 3 --seed 7 --json
 python3 -m incident_lab run latency-spike --ack-timeouts 120,300,600
 python3 -m incident_lab run latency-spike --ack-timeouts primary=120 L2=300
 python3 -m incident_lab run disk-full --policy-file examples/custom-policy.json
@@ -65,13 +68,14 @@ serialize as `null` (for example, an incident nobody acks has
 `"time_to_ack_min": null` and `"points": 0`). The top-level `seed` records
 the `--seed` value used for the run, or `null` for an unseeded run, and the
 top-level `jitter` records the `--jitter` range as `[lo, hi]`, or `null`
-for an unseeded run.
+for an unseeded run. The top-level `difficulty` records the difficulty
+the run was played at (`easy`, `normal` or `hard`; see below).
 
 A batch run (`--seeds`, below) prints a different JSON shape: `seeds`
-(the seed list), `jitter`, the shared `incident` and `policy`, every
-run in full under `runs` (each one a single-run result as above), and
-`score_distribution` with the mean, min, max and median points plus a
-`per_seed` list of `{"seed": N, "points": P}` entries.
+(the seed list), `jitter`, `difficulty`, the shared `incident` and
+`policy`, every run in full under `runs` (each one a single-run result
+as above), and `score_distribution` with the mean, min, max and median
+points plus a `per_seed` list of `{"seed": N, "points": P}` entries.
 
 ## Replay
 
@@ -200,8 +204,10 @@ with exit code 2 and an error message.
 Points start at 100 and are subtracted:
 
 - 15 points per escalation
-- 1 point per minute of time-to-ack past 5 minutes
-- 1 point per 2 minutes of time-to-mitigate past 15 minutes
+- 1 point per minute of time-to-ack past the ack grace (5 minutes on
+  normal; the difficulty sets it)
+- 1 point per 2 minutes of time-to-mitigate past the mitigate grace
+  (15 minutes on normal; the difficulty sets it)
 - an incident nobody acks scores 0
 
 A late ack still counts, but it only keeps part of the score. The ack
@@ -216,6 +222,32 @@ so 100 - 0 - (23-15)//2 = 96. On the `fast` policy the primary's 2m
 timeout makes that a 1m-late ack, so the credit is 1 - 1/2 = 0.5 and the
 effective score is 96 × 0.5 = 48.
 
+## Difficulty ladder
+
+`run <scenario> --difficulty <level>` plays the same scenario harder or
+easier. Levels are `easy`, `normal` (the default) and `hard`, or the
+numbers `1`, `2`, `3`; an unknown level fails the run with exit code 2
+and an error message. A difficulty scales three things at once:
+
+| | easy | normal | hard |
+| - | ---- | ------ | ---- |
+| ack timeouts | ×1.5 (5m → 8m) | ×1.0 | ×0.6 (5m → 3m) |
+| ack grace | 8m | 5m | 3m |
+| mitigate grace | 20m | 15m | 10m |
+| default seeded jitter | 0-0 | 0-1 | 0-3 |
+
+Tighter timeouts mean faster escalation on hard (the secondary is paged
+sooner), and the stricter graces mean the same incident scores lower:
+`disk-full` scores 99 on easy, 96 on normal and 94 on hard. The
+difficulty is printed in the human-readable output, recorded in the
+`run --json` output (top-level `difficulty`), and shown again by
+`replay` and `debrief` — a debrief also judges mitigation against the
+difficulty's own target, so a hard run is not marked against the
+normal 15m target. An explicit `--ack-timeout` or `--ack-timeouts`
+still wins for the timeouts it sets, but the difficulty's scoring
+targets keep applying. With `--seeds` the same difficulty applies to
+every run in the batch.
+
 ## Layout
 
 ```
@@ -225,6 +257,7 @@ incident_lab/
   timeline.py    append-only, time-ordered event log
   scenarios.py   built-in incident scenarios + scenario files/templates
   simulator.py   deterministic simulation + scoring
+  difficulty.py  difficulty ladder: easy / normal / hard scaling
   replay.py      rebuild a saved --json run for re-printing
   debrief.py     structured postmortem from a saved run
   cli.py         list / run / replay / debrief
@@ -288,11 +321,11 @@ human-readable form.
 
 ## Version
 
-0.14.0 — shareable incident templates: `template <scenario>` prints a
-scenario as JSON you can save, edit and share, and `run <name>
---scenario-file <path>` runs scenarios from a JSON file (a file scenario
-with the same name as a built-in one wins), with the same validation and
-exit-code-2 errors as `--policy-file`.
+0.15.0 — difficulty ladder: `run --difficulty easy|normal|hard` (or
+1/2/3) scales ack timeouts, scoring targets and the default seeded
+jitter, records the difficulty in `run --json`, and `replay`/`debrief`
+show it (a debrief judges the run against the difficulty's own
+targets).
 
 ## Roadmap
 
@@ -310,3 +343,4 @@ exit-code-2 errors as `--policy-file`.
 - [x] Multi-seed batch mode: `--seeds 1,2,3` or `--seeds 1-5` runs the same scenario per seed and reports the score distribution (mean/min/max/median, per-seed scores) in human output and `--json` (0.12.0)
 - [x] Debrief/postmortem report generator: `debrief <saved-run.json>` writes a structured postmortem (summary with score and grade, timeline, what went well / badly, action items with owners) as Markdown or `--json`, every finding derived from the run (0.13.0)
 - [x] Shareable incident templates: `template <scenario>` prints a scenario as JSON, `run --scenario-file` loads named scenarios from a JSON file (file wins over built-in names), validated like `--policy-file` (0.14.0)
+- [x] Difficulty ladder: `run --difficulty easy|normal|hard` (or 1/2/3) scales ack timeouts (×1.5 / ×1.0 / ×0.6), scoring targets (ack grace 8/5/3m, mitigate grace 20/15/10m) and the default seeded jitter (0-0 / 0-1 / 0-3), records the difficulty in `run --json`, and `replay`/`debrief` show it (0.15.0)

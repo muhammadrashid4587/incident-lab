@@ -11,6 +11,7 @@ bad JSON, and ValueError on a wrong shape or an invalid value.
 
 import json
 
+from .difficulty import parse_difficulty
 from .incident import Incident
 from .policy import EscalationPolicy, Level, Responder
 from .simulator import Score, SimulationResult
@@ -172,6 +173,16 @@ def load_result(path: str) -> SimulationResult:
             raise ValueError(
                 "replay file: 'jitter' must be [lo, hi] minutes or null")
         jitter = tuple(raw_jitter)
+    raw_difficulty = data.get("difficulty")
+    difficulty = None
+    if raw_difficulty is not None:
+        if not isinstance(raw_difficulty, str):
+            raise ValueError(
+                "replay file: 'difficulty' must be a string or null")
+        try:
+            difficulty = parse_difficulty(raw_difficulty)
+        except ValueError as exc:
+            raise ValueError(f"replay file: {exc}")
     return SimulationResult(
         incident=_incident_from_dict(data.get("incident")),
         policy=_policy_from_dict(data.get("policy")),
@@ -179,4 +190,5 @@ def load_result(path: str) -> SimulationResult:
         score=_score_from_dict(data.get("score")),
         seed=seed,
         jitter=jitter,
+        difficulty=difficulty,
     )

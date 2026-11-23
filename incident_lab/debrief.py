@@ -48,6 +48,9 @@ class Debrief:
     # list[{"action": str, "owner": str}]
     action_items: list
     timeline: str  # rendered timeline, as replay prints it
+    # Difficulty the run was played at, or None for a saved run from
+    # before difficulties existed.
+    difficulty: object = None
 
     def to_dict(self) -> dict:
         """JSON-ready dict: summary, findings, action items, timeline."""
@@ -61,6 +64,8 @@ class Debrief:
             "summary": {
                 "points": self.points,
                 "grade": self.grade,
+                "difficulty": (self.difficulty.name
+                               if self.difficulty is not None else None),
                 "time_to_ack_min": self.time_to_ack_min,
                 "time_to_mitigate_min": self.time_to_mitigate_min,
                 "time_to_resolve_min": self.time_to_resolve_min,
@@ -83,6 +88,10 @@ class Debrief:
             "",
             f"Service: {self.service} [{self.severity}]",
             f"Score: {self.points}/100 (grade {self.grade})",
+        ]
+        if self.difficulty is not None:
+            lines.append(f"Difficulty: {self.difficulty.name}")
+        lines += [
             ("Time-to-ack: "
              f"{self.time_to_ack_min}m" if self.time_to_ack_min is not None
              else "Time-to-ack: nobody acked"),
@@ -133,6 +142,15 @@ def generate_debrief(result: SimulationResult) -> Debrief:
     """
     score = result.score
     incident = result.incident
+    # Scoring targets come from the run's difficulty (normal's 5m / 15m
+    # when the run predates difficulties), so the findings judge the run
+    # against the targets it was actually played at.
+    if result.difficulty is not None:
+        ack_grace_min = result.difficulty.ack_grace_min
+        mitigate_grace_min = result.difficulty.mitigate_grace_min
+    else:
+        ack_grace_min = ACK_GRACE_MIN
+        mitigate_grace_min = MITIGATE_GRACE_MIN
     went_well = []
     went_badly = []
     action_items = []
@@ -176,6 +194,7 @@ def generate_debrief(result: SimulationResult) -> Debrief:
             went_badly=went_badly,
             action_items=action_items,
             timeline=result.timeline.render(),
+            difficulty=result.difficulty,
         )
 
     # The first `escalations` levels missed; the next level acked.
@@ -220,28 +239,28 @@ def generate_debrief(result: SimulationResult) -> Debrief:
             "owner": acking.responder.name,
         })
 
-    if score.time_to_mitigate_min <= MITIGATE_GRACE_MIN:
+    if score.time_to_mitigate_min <= mitigate_grace_min:
         went_well.append(
-            f"Mitigated within the {MITIGATE_GRACE_MIN}m target "
+            f"Mitigated within the {mitigate_grace_min}m target "
             f"({score.time_to_mitigate_min}m)")
     else:
-        over = score.time_to_mitigate_min - MITIGATE_GRACE_MIN
+        over = score.time_to_mitigate_min - mitigate_grace_min
         went_badly.append(
             f"Mitigation took {score.time_to_mitigate_min}m, {over}m "
-            f"past the {MITIGATE_GRACE_MIN}m target")
+            f"past the {mitigate_grace_min}m target")
         action_items.append({
             "action": (
                 f"Write or rehearse a runbook for {incident.title} on "
                 f"{incident.service} — mitigation took "
                 f"{score.time_to_mitigate_min}m against a "
-                f"{MITIGATE_GRACE_MIN}m target"),
+                f"{mitigate_grace_min}m target"),
             "owner": "on-call lead",
         })
 
-    if score.time_to_ack_min <= ACK_GRACE_MIN:
+    if score.time_to_ack_min <= ack_grace_min:
         went_well.append(
             f"Time-to-ack ({score.time_to_ack_min}m) was inside the "
-            f"{ACK_GRACE_MIN}m target")
+            f"{ack_grace_min}m target")
 
     went_well.append(
         f"Incident resolved in {score.time_to_resolve_min}m")
@@ -262,4 +281,5 @@ def generate_debrief(result: SimulationResult) -> Debrief:
         went_badly=went_badly,
         action_items=action_items,
         timeline=result.timeline.render(),
+        difficulty=result.difficulty,
     )

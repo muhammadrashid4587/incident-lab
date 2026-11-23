@@ -11,6 +11,10 @@ from dataclasses import replace
 
 from incident_lab.cli import main, parse_jitter_range, parse_seed_spec
 from incident_lab.debrief import generate_debrief, grade
+from incident_lab.difficulty import (
+    EASY, HARD, NORMAL, apply_difficulty, list_difficulties,
+    parse_difficulty,
+)
 from incident_lab.policy import (
     DEFAULT_POLICY, get_policy, list_policies, load_policy_file,
     parse_ack_timeout_overrides,
@@ -1647,6 +1651,179 @@ class TestScenarioTemplates(unittest.TestCase):
         path = self._write_scenario_file(self._cache_down_data())
         self.assertEqual(
             main(["run", "no-such-scenario", "--scenario-file", path]), 2)
+
+
+class TestDifficulty(unittest.TestCase):
+    def _run(self, scenario, difficulty):
+        policy = apply_difficulty(DEFAULT_POLICY, difficulty)
+        return simulate(get(scenario), policy, difficulty=difficulty)
+
+    def test_parse_names_and_aliases(self):
+        self.assertIs(parse_difficulty("easy"), EASY)
+        self.assertIs(parse_difficulty("normal"), NORMAL)
+        self.assertIs(parse_difficulty("hard"), HARD)
+        self.assertIs(parse_difficulty("1"), EASY)
+        self.assertIs(parse_difficulty("2"), NORMAL)
+        self.assertIs(parse_difficulty("3"), HARD)
+        self.assertIs(parse_difficulty(" HARD "), HARD)
+
+    def test_parse_unknown_difficulty_raises(self):
+        for bad in ("brutal", "0", "4", "", "medium"):
+            with self.assertRaises(ValueError):
+                parse_difficulty(bad)
+
+    def test_list_difficulties_is_easiest_first(self):
+        self.assertEqual(list_difficulties(), ["easy", "normal", "hard"])
+
+    def test_easy_widens_timeouts_and_hard_tightens_them(self):
+        easy = apply_difficulty(DEFAULT_POLICY, EASY)
+        self.assertEqual(
+            [level.ack_timeout_min for level in easy.levels], [8, 8, 15])
+        hard = apply_difficulty(DEFAULT_POLICY, HARD)
+        self.assertEqual(
+            [level.ack_timeout_min for level in hard.levels], [3, 3, 6])
+        normal = apply_difficulty(DEFAULT_POLICY, NORMAL)
+        self.assertEqual(
+            [level.ack_timeout_min for level in normal.levels], [5, 5, 10])
+
+    def test_same_scenario_scores_differently_per_difficulty(self):
+        # disk-full: ack 3m, mitigate 23m. Only the grace minutes move:
+        # easy 100 - (23-20)//2 = 99, normal 100 - (23-15)//2 = 96,
+        # hard 100 - (23-10)//2 = 94.
+        self.assertEqual(self._run("disk-full", EASY).score.points, 99)
+        self.assertEqual(self._run("disk-full", NORMAL).score.points, 96)
+        self.assertEqual(self._run("disk-full", HARD).score.points, 94)
+
+    def test_hard_escalates_faster_and_scores_lower(self):
+        # latency-spike on hard: primary's timeout is 3m not 5m, so the
+        # secondary is paged at 3m and acks at 7m; the ack is 1m late
+        # (delay 4m vs a 3m timeout), so the base 65 keeps 2/3 credit.
+        hard = self._run("latency-spike", HARD)
+        self.assertEqual(hard.score.time_to_ack_min, 7)
+        self.assertEqual(hard.score.points, 43)
+        normal = self._run("latency-spike", NORMAL)
+        self.assertEqual(normal.score.time_to_ack_min, 9)
+        self.assertEqual(normal.score.points, 67)
+        self.assertLess(hard.score.points, normal.score.points)
+
+    def test_difficulty_defaults_to_normal(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY)
+        self.assertIs(result.difficulty, NORMAL)
+        self.assertEqual(result.score.points, 96)
+
+    def test_seeded_default_jitter_widens_with_difficulty(self):
+        self.assertEqual(
+            simulate(get("disk-full"), DEFAULT_POLICY, seed=7,
+                     difficulty=EASY).jitter, (0, 0))
+        self.assertEqual(
+            simulate(get("disk-full"), DEFAULT_POLICY, seed=7,
+                     difficulty=NORMAL).jitter, (0, 1))
+        self.assertEqual(
+            simulate(get("disk-full"), DEFAULT_POLICY, seed=7,
+                     difficulty=HARD).jitter, (0, 3))
+
+    def test_explicit_jitter_overrides_difficulty_default(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY, seed=7,
+                          jitter=(0, 0), difficulty=HARD)
+        self.assertEqual(result.jitter, (0, 0))
+
+    def test_json_carries_the_difficulty(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--difficulty", "hard",
+                      "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["difficulty"], "hard")
+
+    def test_human_output_shows_difficulty_and_scaled_timeouts(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--difficulty", "hard"]), 0)
+        out = buf.getvalue()
+        self.assertIn("difficulty: hard", out)
+        self.assertIn("ana (primary) 3m", out)
+        self.assertIn("points:           94/100", out)
+
+    def test_invalid_difficulty_fails_with_exit_code_2(self):
+        self.assertEqual(
+            main(["run", "disk-full", "--difficulty", "brutal"]), 2)
+
+    def test_ack_timeout_override_still_wins_over_difficulty(self):
+        # Hard scales the timeouts to 3/3/6, but an explicit override
+        # sets them back to 5/5/10. The difficulty's scoring targets
+        # still apply, so disk-full scores 94 (hard's 10m mitigate
+        # grace) rather than the normal 96.
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--difficulty", "hard",
+                      "--ack-timeouts", "5,5,10"]), 0)
+        out = buf.getvalue()
+        self.assertIn("ana (primary) 5m", out)
+        self.assertIn("points:           94/100", out)
+
+    def test_difficulty_replay_round_trip(self):
+        result = self._run("disk-full", HARD)
+        path = self._write_run(result)
+        loaded = load_result(path)
+        self.assertIs(loaded.difficulty, HARD)
+        self.assertEqual(loaded.score.points, 94)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["replay", path]), 0)
+        self.assertIn("difficulty: hard", buf.getvalue())
+
+    def test_bad_difficulty_in_replay_file_raises(self):
+        result = self._run("disk-full", HARD)
+        data = result.to_dict()
+        data["difficulty"] = "brutal"
+        path = self._write_json(data)
+        with self.assertRaises(ValueError):
+            load_result(path)
+
+    def test_old_run_without_difficulty_replays_as_none(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY)
+        data = result.to_dict()
+        del data["difficulty"]
+        path = self._write_json(data)
+        loaded = load_result(path)
+        self.assertIsNone(loaded.difficulty)
+
+    def test_debrief_shows_difficulty_and_uses_its_targets(self):
+        result = self._run("cert-expiry", EASY)
+        debrief = generate_debrief(result)
+        self.assertIs(debrief.difficulty, EASY)
+        self.assertIn("Difficulty: easy", debrief.render())
+        self.assertEqual(debrief.to_dict()["summary"]["difficulty"], "easy")
+        # cert-expiry mitigates in 10m: inside easy's 20m target.
+        self.assertIn("Mitigated within the 20m target",
+                      " ".join(debrief.went_well))
+        hard = generate_debrief(self._run("disk-full", HARD))
+        self.assertIn("past the 10m target",
+                      " ".join(hard.went_badly))
+
+    def test_batch_json_carries_the_difficulty(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--seeds", "1,2",
+                      "--difficulty", "hard", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["difficulty"], "hard")
+        self.assertTrue(
+            all(run["difficulty"] == "hard" for run in data["runs"]))
+
+    def _write_run(self, result):
+        return self._write_json(result.to_dict())
+
+    def _write_json(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(data, handle)
+        return handle.name
 
 
 if __name__ == "__main__":
