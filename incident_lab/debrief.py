@@ -132,6 +132,42 @@ class Debrief:
         return "\n".join(lines)
 
 
+def _impact_growth(result: SimulationResult) -> tuple:
+    """Findings for impact that grew while the page went unanswered.
+
+    Returns ``(went_badly, action_items)``: one bad finding per stage
+    the impact grew to, plus a single action to escalate sooner,
+    naming the worst impact reached. A run whose impact never grew
+    (no impact stages, or an ack on the first page) reports nothing.
+    The chain records the impact in effect when each level was paged,
+    so a step whose impact differs from the previous step's is a
+    stage the incident grew to while paging.
+    """
+    chain = result.escalation_chain or []
+    went_badly = []
+    action_items = []
+    previous = None
+    worst = None
+    for step in chain:
+        if not step.impact:
+            continue
+        if previous is not None and step.impact != previous:
+            went_badly.append(
+                "Impact grew while the page went unanswered: "
+                f"{step.impact}")
+        previous = step.impact
+        worst = step.impact
+    if went_badly:
+        action_items.append({
+            "action": (
+                "Escalate sooner: the impact grew to "
+                f"{worst!r} before anyone acked — tighten the early "
+                "ack timeouts or page the next level sooner"),
+            "owner": "on-call lead",
+        })
+    return went_badly, action_items
+
+
 def _partial_debrief(result: SimulationResult, ack_grace_min: int,
                      mitigate_grace_min: int) -> Debrief:
     """Postmortem for a run that acked but never resolved.
@@ -164,6 +200,10 @@ def _partial_debrief(result: SimulationResult, ack_grace_min: int,
                 f"{level.ack_timeout_min}m"),
             "owner": level.responder.name,
         })
+    # The impact may have grown while the page went unanswered.
+    badly, actions = _impact_growth(result)
+    went_badly.extend(badly)
+    action_items.extend(actions)
     if score.escalations == 0:
         went_well.append(
             f"{acking.responder.name} ({acking.responder.role}) acked "
@@ -285,6 +325,10 @@ def generate_debrief(result: SimulationResult) -> Debrief:
                     f"{level.ack_timeout_min}m"),
                 "owner": level.responder.name,
             })
+        # The impact may have grown while the page went unanswered.
+        badly, actions = _impact_growth(result)
+        went_badly.extend(badly)
+        action_items.extend(actions)
         went_badly.append(
             "Nobody acked the page; the incident was never mitigated "
             "or resolved")
@@ -331,6 +375,11 @@ def generate_debrief(result: SimulationResult) -> Debrief:
                 f"{level.ack_timeout_min}m"),
             "owner": level.responder.name,
         })
+
+    # The impact may have grown while the page went unanswered.
+    badly, actions = _impact_growth(result)
+    went_badly.extend(badly)
+    action_items.extend(actions)
 
     if score.escalations == 0:
         went_well.append(

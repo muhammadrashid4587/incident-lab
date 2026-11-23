@@ -18,6 +18,12 @@ Scoring (0-100, documented in README.md):
   decay to zero at twice the timeout
 - minus HINT_COST_POINTS per hint asked for (`run --hints N`), after the
   late-ack credit scaling, floored at 0
+- the escalation chain is recorded on the result: one step per level
+  walked, with the responder, the ack timeout, whether they acked or
+  missed, and the impact in effect when they were paged — so a SEV-1
+  whose impact grew while the page went unanswered shows that growth
+  in the run JSON, and `replay`, `debrief`, `compare` and `stats` all
+  see it
 """
 
 from dataclasses import dataclass, field
@@ -103,6 +109,59 @@ def late_ack_credit(ack_delay_min: int, ack_timeout_min: int) -> float:
 
 
 @dataclass(frozen=True)
+class EscalationStep:
+    """One level of the escalation chain as it was actually walked.
+
+    ``level`` is 1-based; ``outcome`` is ``"acked"`` or ``"missed"``;
+    ``impact`` is the impact in effect when this level was paged —
+    the scenario's impact stage at that escalation count, or ``""``
+    when the scenario has no impact stages. A missed step's impact
+    is the stage the incident had already reached, so the chain
+    shows the impact growing level by level when pages go unanswered.
+    """
+    level: int
+    responder_name: str
+    responder_role: str
+    ack_timeout_min: int
+    paged_at_min: int
+    outcome: str
+    acked_at_min: object = None  # int, or None when the level missed
+    ack_late_min: object = None  # int, or None when the level missed
+    impact: str = ""
+
+    def to_dict(self) -> dict:
+        """JSON-ready dict; an unacked level serializes its ack fields
+        as null."""
+        return {
+            "level": self.level,
+            "responder": {
+                "name": self.responder_name,
+                "role": self.responder_role,
+            },
+            "ack_timeout_min": self.ack_timeout_min,
+            "paged_at_min": self.paged_at_min,
+            "outcome": self.outcome,
+            "acked_at_min": self.acked_at_min,
+            "ack_late_min": self.ack_late_min,
+            "impact": self.impact,
+        }
+
+
+def impact_at(scenario: Scenario, escalations: int) -> str:
+    """The impact in effect after ``escalations`` missed levels.
+
+    Stage 0 is the impact when the incident is declared; each missed
+    level moves to the next stage, and once the stages run out the
+    last (worst) stage stays in effect. Scenarios without stages have
+    no impact progression, so this is ``""`` for them.
+    """
+    stages = scenario.impact_stages
+    if not stages:
+        return ""
+    return stages[min(escalations, len(stages) - 1)]
+
+
+@dataclass(frozen=True)
 class Hint:
     """One hint the operator asked for during the run.
 
@@ -176,6 +235,12 @@ class SimulationResult:
     # Hints the operator asked for during the run, in the order asked
     # (empty when none were asked). Recorded in --json output.
     hints: list = field(default_factory=list)
+    # The escalation chain as it was actually walked: one step per
+    # level paged, with the responder, the ack timeout, whether they
+    # acked or missed, and the impact in effect when they were paged.
+    # Recorded in --json output; runs saved before 0.26.0 have no
+    # chain and round-trip as an empty list.
+    escalation_chain: list = field(default_factory=list)
 
     def to_dict(self) -> dict:
         """JSON-ready dict of the whole result: incident, policy, timeline, score."""
@@ -186,6 +251,9 @@ class SimulationResult:
             "difficulty": (self.difficulty.name
                            if self.difficulty is not None else None),
             "hints": [hint.to_dict() for hint in self.hints],
+            "escalation_chain": [
+                step.to_dict() for step in self.escalation_chain
+            ],
             "incident": {
                 "id": self.incident.id,
                 "service": self.incident.service,
@@ -374,6 +442,7 @@ def simulate(
     escalations = 0
     acked_at = None
     acked_by = None
+    chain = []
 
     for i, level in enumerate(policy.levels):
         timeline.record(t, "paged", level.responder.name, level.responder.role)
@@ -394,16 +463,46 @@ def simulate(
             if ack_late_min:
                 detail = (f"late by {ack_late_min}m "
                           f"(ack credit {ack_credit:.0%})")
+            chain.append(EscalationStep(
+                level=i + 1,
+                responder_name=level.responder.name,
+                responder_role=level.responder.role,
+                ack_timeout_min=level.ack_timeout_min,
+                paged_at_min=t,
+                outcome="acked",
+                acked_at_min=acked_at,
+                ack_late_min=ack_late_min,
+                impact=impact_at(scenario, escalations),
+            ))
             timeline.record(acked_at, "acked", acked_by, detail)
             break
         # Missed ack: wait out the timeout, then escalate (or give up).
+        paged_at = t
         t += level.ack_timeout_min
+        # The impact in effect when this level was paged, before the
+        # miss made it worse.
+        impact_before = impact_at(scenario, escalations)
+        chain.append(EscalationStep(
+            level=i + 1,
+            responder_name=level.responder.name,
+            responder_role=level.responder.role,
+            ack_timeout_min=level.ack_timeout_min,
+            paged_at_min=paged_at,
+            outcome="missed",
+            impact=impact_before,
+        ))
         if i + 1 < len(policy.levels):
             escalations += 1
+            detail = (f"no ack from {level.responder.name} in "
+                      f"{level.ack_timeout_min}m")
+            # A missed page can make the impact worse: say so on the
+            # escalation event when the stage actually grew.
+            impact_now = impact_at(scenario, escalations)
+            if impact_now and impact_now != impact_before:
+                detail += f"; impact now: {impact_now}"
             timeline.record(
                 t, "escalated", policy.levels[i + 1].responder.name,
-                f"no ack from {level.responder.name} in "
-                f"{level.ack_timeout_min}m",
+                detail,
             )
         else:
             timeline.record(t, "unacked", "monitor", "nobody acked the page")
@@ -412,7 +511,7 @@ def simulate(
                 Score(None, None, None, escalations, False, 0,
                       hints_used=len(used_hints), hint_cost_points=hint_cost),
                 seed=seed, jitter=jitter_range, difficulty=difficulty,
-                hints=used_hints,
+                hints=used_hints, escalation_chain=chain,
             )
         if t > max_duration_min:
             timeline.record(t, "unacked", "monitor", "max duration reached")
@@ -421,7 +520,7 @@ def simulate(
                 Score(None, None, None, escalations, False, 0,
                       hints_used=len(used_hints), hint_cost_points=hint_cost),
                 seed=seed, jitter=jitter_range, difficulty=difficulty,
-                hints=used_hints,
+                hints=used_hints, escalation_chain=chain,
             )
 
     if rng is not None:
@@ -460,4 +559,4 @@ def simulate(
     )
     return SimulationResult(incident, policy, timeline, score, seed=seed,
                             jitter=jitter_range, difficulty=difficulty,
-                            hints=used_hints)
+                            hints=used_hints, escalation_chain=chain)

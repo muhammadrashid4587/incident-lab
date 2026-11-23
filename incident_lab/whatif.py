@@ -89,6 +89,15 @@ def _scenario_from_result(original) -> Scenario:
         mitigate_delay_min=mitigate_delay,
         resolve_delay_min=resolve_delay,
         hints=tuple(hint.text for hint in original.hints),
+        # The impact stages the original run walked through, read off
+        # its recorded escalation chain: one stage per level paged,
+        # in order. The replay walks the same levels (a miss stays a
+        # miss), so these are exactly the stages it needs; a run
+        # saved before chains existed has none, and a replay under a
+        # longer policy keeps the last (worst) stage past the end.
+        impact_stages=tuple(
+            step.impact for step in original.escalation_chain
+            if step.impact),
     )
 
 

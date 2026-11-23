@@ -119,6 +119,25 @@ def _print_result(result) -> None:
         f"{level.ack_timeout_min}m" for level in result.policy.levels))
     print()
     print(result.timeline.render())
+    if result.escalation_chain:
+        print()
+        print("escalation chain:")
+        for step in result.escalation_chain:
+            if step.outcome == "acked":
+                line = (f"  L{step.level} {step.responder_name} "
+                        f"({step.responder_role}) paged "
+                        f"{step.paged_at_min}m, "
+                        f"acked {step.acked_at_min}m")
+                if step.ack_late_min:
+                    line += f" (late by {step.ack_late_min}m)"
+            else:
+                line = (f"  L{step.level} {step.responder_name} "
+                        f"({step.responder_role}) paged "
+                        f"{step.paged_at_min}m, "
+                        f"missed after {step.ack_timeout_min}m")
+            if step.impact:
+                line += f" — impact: {step.impact}"
+            print(line)
     print()
     print("score:")
     print(f"  time-to-ack:      {score.time_to_ack_min}m"

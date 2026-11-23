@@ -7,6 +7,14 @@ escalation chain in order, so the behaviour list lines up with the policy
 levels: index 0 is the primary, 1 the secondary, 2 the manager.
 
 All times are simulated minutes. Nothing here pages a real person.
+
+A scenario may also carry ``impact_stages``: the impact in effect at
+each escalation count — stage 0 when the incident is declared, stage 1
+after the first missed level, and so on. When a level misses its page
+the impact grows to the next stage, so a SEV-1 that nobody acks
+quickly gets worse while the chain walks. Scenarios without stages
+have no impact progression; the chain records an empty impact for
+them.
 """
 
 from dataclasses import dataclass
@@ -32,6 +40,10 @@ class Scenario:
     # with `run --hints N`; each hint costs score, so they are guidance,
     # not a free answer.
     hints: tuple = ()
+    # Impact in effect at each escalation count: index 0 when the
+    # incident is declared, index 1 after the first missed level, and
+    # so on. Empty means the scenario has no impact progression.
+    impact_stages: tuple = ()
 
 
 SCENARIOS = {
@@ -165,6 +177,37 @@ SCENARIOS = {
             "until the TTLs expire.",
         ),
     ),
+    "payments-outage": Scenario(
+        name="payments-outage",
+        service="payments-api",
+        title="Payments API fully down — SEV-1",
+        severity="critical",
+        description=(
+            "The payments API is returning 500s on every request and "
+            "checkout is down. The on-call and the senior both miss "
+            "the page; the incident commander picks it up. While the "
+            "page goes unanswered the impact grows: degraded checkout, "
+            "then checkout down, then payments fully down."
+        ),
+        ack_delay_min=(None, None, 4),
+        mitigate_delay_min=50,
+        resolve_delay_min=30,
+        hints=(
+            "Fail over to the standby payments cluster first; "
+            "checkout is down and every minute costs revenue.",
+            "Check the payment provider's status page: a full outage "
+            "with no deploys is usually the provider, not us.",
+            "Freeze refunds until checkout is back; a second failure "
+            "mode on top of the outage hides the cause.",
+        ),
+        impact_stages=(
+            "Checkout degraded: 5% of payments failing",
+            "Checkout down: all payments failing, customers cannot "
+            "check out",
+            "Payments fully down: checkout and refunds failing, "
+            "revenue impact growing",
+        ),
+    ),
 }
 
 
@@ -193,6 +236,7 @@ def scenario_to_dict(scenario: Scenario) -> dict:
         "mitigate_delay_min": scenario.mitigate_delay_min,
         "resolve_delay_min": scenario.resolve_delay_min,
         "hints": list(scenario.hints),
+        "impact_stages": list(scenario.impact_stages),
     }
 
 
@@ -253,7 +297,30 @@ def _scenario_from_dict(name: str, data) -> Scenario:
         resolve_delay_min=_require_positive_int(
             data, "resolve_delay_min", name),
         hints=tuple(_require_hints(data, name)),
+        impact_stages=tuple(_require_impact_stages(data, name)),
     )
+
+
+def _require_impact_stages(data: dict, name: str) -> list:
+    """Validate a scenario file's optional ``impact_stages`` list.
+
+    Impact stages are the impact in effect at each escalation count
+    (stage 0 when the incident is declared, stage 1 after the first
+    missed level, and so on), so a SEV-1 that nobody acks quickly
+    gets worse while the chain walks. Absent means no impact
+    progression; present it must be a list of non-empty strings.
+    """
+    raw = data.get("impact_stages", [])
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"scenario {name!r}: 'impact_stages' must be a list of "
+            "strings")
+    for index, stage in enumerate(raw):
+        if not isinstance(stage, str) or not stage:
+            raise ValueError(
+                f"scenario {name!r}: 'impact_stages' entry {index} must "
+                "be a non-empty string")
+    return raw
 
 
 def _require_hints(data: dict, name: str) -> list:

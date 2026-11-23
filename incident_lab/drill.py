@@ -45,8 +45,8 @@ from .incident import Incident
 from .policy import EscalationPolicy
 from .scenarios import Scenario
 from .simulator import (
-    HINT_COST_POINTS, Hint, Score, SimulationResult, compute_points,
-    late_ack_credit,
+    HINT_COST_POINTS, EscalationStep, Hint, Score, SimulationResult,
+    compute_points, impact_at, late_ack_credit,
 )
 from .timeline import Timeline
 
@@ -148,12 +148,14 @@ def _read_decision(prompt_stream, input_stream, prompt: str,
 def _partial_result(incident, policy, timeline, *, escalations,
                     acked_at, acked_by, ack_late_min, ack_credit,
                     mitigated_at, mitigate_delay_min, difficulty,
-                    used_hints, hint_cost) -> SimulationResult:
+                    used_hints, hint_cost, escalation_chain=None) -> SimulationResult:
     """Build the result for a drill that stopped early.
 
     The timeline holds the events so far (plus the ``abandoned``
     event the caller recorded); the score covers the milestones
     reached, with the unreached ones as null and ``resolved`` false.
+    The escalation chain holds one step per level the drill actually
+    walked — a level quit on before any decision records no step.
     """
     points = compute_points(
         escalations=escalations, acked_at=acked_at, ack_credit=ack_credit,
@@ -177,6 +179,8 @@ def _partial_result(incident, policy, timeline, *, escalations,
         ),
         difficulty=difficulty,
         hints=used_hints,
+        escalation_chain=(list(escalation_chain)
+                          if escalation_chain is not None else []),
     )
 
 
@@ -289,6 +293,11 @@ def run_drill(
     acked_by = None
     ack_late_min = None
     ack_credit = None
+    # The escalation chain as walked: one step per level the drill
+    # actually decided on — a level quit on before any decision
+    # records no step. Same shape as `run` records, so `replay`,
+    # `debrief`, `compare` and `stats` all see it.
+    chain = []
 
     for i, level in enumerate(policy.levels):
         timeline.record(t, "paged", level.responder.name,
@@ -318,18 +327,38 @@ def run_drill(
                 acked_at=None, acked_by=None, ack_late_min=None,
                 ack_credit=None, mitigated_at=None,
                 mitigate_delay_min=None, difficulty=difficulty,
-                used_hints=used_hints, hint_cost=_hint_cost())
+                used_hints=used_hints, hint_cost=_hint_cost(),
+                escalation_chain=chain)
         if command == "wait":
             # Missed ack: wait out the timeout, then escalate (or give
             # up, exactly as `run` does when nobody acks).
+            paged_at = t
             t += level.ack_timeout_min
+            # The impact in effect when this level was paged, before
+            # the miss made it worse.
+            impact_before = impact_at(scenario, escalations)
+            chain.append(EscalationStep(
+                level=i + 1,
+                responder_name=level.responder.name,
+                responder_role=level.responder.role,
+                ack_timeout_min=level.ack_timeout_min,
+                paged_at_min=paged_at,
+                outcome="missed",
+                impact=impact_before,
+            ))
             if i + 1 < len(policy.levels):
                 escalations += 1
+                detail = (f"no ack from {level.responder.name} in "
+                          f"{level.ack_timeout_min}m")
+                # A missed page can make the impact worse: say so on
+                # the escalation event when the stage actually grew.
+                impact_now = impact_at(scenario, escalations)
+                if impact_now and impact_now != impact_before:
+                    detail += f"; impact now: {impact_now}"
                 timeline.record(
                     t, "escalated",
                     policy.levels[i + 1].responder.name,
-                    f"no ack from {level.responder.name} in "
-                    f"{level.ack_timeout_min}m",
+                    detail,
                 )
                 continue
             timeline.record(t, "unacked", "monitor",
@@ -339,7 +368,8 @@ def run_drill(
                 acked_at=None, acked_by=None, ack_late_min=None,
                 ack_credit=None, mitigated_at=None,
                 mitigate_delay_min=None, difficulty=difficulty,
-                used_hints=used_hints, hint_cost=_hint_cost())
+                used_hints=used_hints, hint_cost=_hint_cost(),
+                escalation_chain=chain)
         # The operator acks, on time or late: the same late-ack credit
         # `run` gives for an ack past its level's timeout.
         delay = arg
@@ -347,6 +377,17 @@ def run_drill(
         ack_credit = late_ack_credit(delay, level.ack_timeout_min)
         acked_at = t + delay
         acked_by = level.responder.name
+        chain.append(EscalationStep(
+            level=i + 1,
+            responder_name=level.responder.name,
+            responder_role=level.responder.role,
+            ack_timeout_min=level.ack_timeout_min,
+            paged_at_min=t,
+            outcome="acked",
+            acked_at_min=acked_at,
+            ack_late_min=ack_late_min,
+            impact=impact_at(scenario, escalations),
+        ))
         detail = ""
         if ack_late_min:
             detail = (f"late by {ack_late_min}m "
@@ -373,7 +414,7 @@ def run_drill(
             ack_late_min=ack_late_min, ack_credit=ack_credit,
             mitigated_at=None, mitigate_delay_min=None,
             difficulty=difficulty, used_hints=used_hints,
-            hint_cost=_hint_cost())
+            hint_cost=_hint_cost(), escalation_chain=chain)
     mitigate_delay = arg
     mitigated_at = acked_at + mitigate_delay
     timeline.record(mitigated_at, "mitigated", acked_by)
@@ -395,7 +436,8 @@ def run_drill(
             ack_late_min=ack_late_min, ack_credit=ack_credit,
             mitigated_at=mitigated_at,
             mitigate_delay_min=mitigate_delay, difficulty=difficulty,
-            used_hints=used_hints, hint_cost=_hint_cost())
+            used_hints=used_hints, hint_cost=_hint_cost(),
+            escalation_chain=chain)
     resolve_delay = arg
     resolved_at = mitigated_at + resolve_delay
     timeline.record(resolved_at, "resolved", acked_by)
@@ -422,4 +464,5 @@ def run_drill(
         ),
         difficulty=difficulty,
         hints=used_hints,
+        escalation_chain=chain,
     )

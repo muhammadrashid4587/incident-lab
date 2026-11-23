@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from .difficulty import parse_difficulty
 from .incident import Incident
 from .policy import EscalationPolicy, Level, Responder
-from .simulator import Hint, Score, SimulationResult
+from .simulator import EscalationStep, Hint, Score, SimulationResult
 from .timeline import Timeline
 
 
@@ -192,6 +192,70 @@ def _hints_from_dict(raw) -> list:
     return hints
 
 
+def _escalation_chain_from_dict(raw) -> list:
+    """Parse an optional top-level ``escalation_chain`` list.
+
+    Saved runs from before 0.26.0 have no chain key; they round-trip
+    as an empty chain. Each step records the level walked, the
+    responder, the ack timeout, whether they acked or missed, and the
+    impact in effect when they were paged.
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        raise ValueError(
+            "replay file: 'escalation_chain' must be a list or null")
+    chain = []
+    for index, raw_step in enumerate(raw):
+        step = _require_mapping(raw_step, f"escalation step {index}")
+        level = step.get("level")
+        if isinstance(level, bool) or not isinstance(level, int) \
+                or level < 1:
+            raise ValueError(
+                f"replay file: escalation step {index} 'level' must be "
+                "a positive integer")
+        responder = _require_mapping(
+            step.get("responder"), f"escalation step {index} responder")
+        timeout = step.get("ack_timeout_min")
+        if isinstance(timeout, bool) or not isinstance(timeout, int) \
+                or timeout <= 0:
+            raise ValueError(
+                f"replay file: escalation step {index} 'ack_timeout_min' "
+                "must be a positive integer number of minutes")
+        paged_at = step.get("paged_at_min")
+        if isinstance(paged_at, bool) or not isinstance(paged_at, int) \
+                or paged_at < 0:
+            raise ValueError(
+                f"replay file: escalation step {index} 'paged_at_min' "
+                "must be a non-negative integer number of minutes")
+        outcome = step.get("outcome")
+        if outcome not in ("acked", "missed"):
+            raise ValueError(
+                f"replay file: escalation step {index} 'outcome' must "
+                "be 'acked' or 'missed'")
+        impact = step.get("impact", "")
+        if not isinstance(impact, str):
+            raise ValueError(
+                f"replay file: escalation step {index} 'impact' must be "
+                "a string")
+        chain.append(EscalationStep(
+            level=level,
+            responder_name=_require_str(
+                responder, "name", f"escalation step {index} responder"),
+            responder_role=_require_str(
+                responder, "role", f"escalation step {index} responder"),
+            ack_timeout_min=timeout,
+            paged_at_min=paged_at,
+            outcome=outcome,
+            acked_at_min=_require_int_or_none(
+                step, "acked_at_min", f"escalation step {index}"),
+            ack_late_min=_require_int_or_none(
+                step, "ack_late_min", f"escalation step {index}"),
+            impact=impact,
+        ))
+    return chain
+
+
 def load_result(path: str) -> SimulationResult:
     """Load a saved `run --json` result and rebuild it for re-printing."""
     with open(path, encoding="utf-8") as handle:
@@ -325,4 +389,6 @@ def _result_from_dict(data: dict) -> SimulationResult:
         jitter=jitter,
         difficulty=difficulty,
         hints=_hints_from_dict(data.get("hints")),
+        escalation_chain=_escalation_chain_from_dict(
+            data.get("escalation_chain")),
     )

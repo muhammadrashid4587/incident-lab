@@ -56,6 +56,16 @@ class Comparison:
     # file instead of a `run --json` file.
     whatif_a: object = None
     whatif_b: object = None
+    # Each side's escalation chain, as a list of step dicts (the same
+    # shape as `run --json`'s "escalation_chain"); an empty list when
+    # that side's run predates chains (before 0.26.0).
+    chain_a: list = None
+    chain_b: list = None
+
+    @property
+    def chains_identical(self) -> bool:
+        """True when both runs walked the same escalation chain."""
+        return self.chain_a == self.chain_b
 
     @property
     def timelines_identical(self) -> bool:
@@ -95,6 +105,11 @@ class Comparison:
                 "only_in_a": list(self.timeline_only_a),
                 "only_in_b": list(self.timeline_only_b),
                 "identical": self.timelines_identical,
+            },
+            "escalation_chain": {
+                "a": list(self.chain_a or []),
+                "b": list(self.chain_b or []),
+                "identical": self.chains_identical,
             },
         }
 
@@ -153,6 +168,13 @@ class Comparison:
                     f"  only in B ({len(self.timeline_only_b)}):")
                 for event in self.timeline_only_b:
                     lines.append(f"    {_fmt_event(event)}")
+        if not self.chains_identical:
+            lines.append("")
+            lines.append("escalation chain:")
+            summary_a = _chain_summary_dicts(self.chain_a)
+            summary_b = _chain_summary_dicts(self.chain_b)
+            lines.append(f"  A: {summary_a or 'no chain recorded'}")
+            lines.append(f"  B: {summary_b or 'no chain recorded'}")
         return "\n".join(lines)
 
 
@@ -239,6 +261,22 @@ def _timeline_diff(a: SimulationResult, b: SimulationResult) -> tuple:
     return matched, only_a, only_b
 
 
+def _chain_summary_dicts(chain) -> str:
+    """One-line summary of an escalation chain (a list of step dicts),
+    or None when the run recorded no chain (saved before 0.26.0)."""
+    if not chain:
+        return None
+    parts = []
+    for step in chain:
+        responder = step["responder"]
+        name = f"{responder['name']} ({responder['role']})"
+        if step["outcome"] == "acked":
+            parts.append(f"{name} acked {step['acked_at_min']}m")
+        else:
+            parts.append(f"{name} missed {step['ack_timeout_min']}m")
+    return " → ".join(parts)
+
+
 def _same_policy(a: SimulationResult, b: SimulationResult) -> bool:
     if a.policy.name != b.policy.name:
         return False
@@ -271,4 +309,6 @@ def compare_results(a: SimulationResult, b: SimulationResult,
         timeline_only_b=only_b,
         whatif_a=whatif_a,
         whatif_b=whatif_b,
+        chain_a=[step.to_dict() for step in a.escalation_chain],
+        chain_b=[step.to_dict() for step in b.escalation_chain],
     )

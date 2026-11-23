@@ -62,9 +62,23 @@ FAST_POLICY = EscalationPolicy(
     ),
 )
 
+#: The SEV-1 chain: on-call, then a senior, then the incident
+#: commander, each with a short ack timeout — a SEV-1 cannot wait
+#: for a slow page, and the impact grows with every missed level, so
+#: the chain is short and the timeouts are tight.
+SEV1_POLICY = EscalationPolicy(
+    name="sev1",
+    levels=(
+        Level(Responder("ana", "on-call"), 3),
+        Level(Responder("ben", "senior"), 5),
+        Level(Responder("carla", "incident-commander"), 10),
+    ),
+)
+
 POLICIES = {
     DEFAULT_POLICY.name: DEFAULT_POLICY,
     FAST_POLICY.name: FAST_POLICY,
+    SEV1_POLICY.name: SEV1_POLICY,
 }
 
 

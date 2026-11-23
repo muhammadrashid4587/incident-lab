@@ -86,8 +86,8 @@ class TestAckAndEscalation(unittest.TestCase):
 
 
 class TestPolicies(unittest.TestCase):
-    def test_registry_lists_both_policies(self):
-        self.assertEqual(list_policies(), ["standard", "fast"])
+    def test_registry_lists_all_policies(self):
+        self.assertEqual(list_policies(), ["standard", "fast", "sev1"])
         self.assertIs(get_policy("standard"), DEFAULT_POLICY)
 
     def test_unknown_policy_raises_key_error(self):
@@ -3629,6 +3629,264 @@ class TestHistory(unittest.TestCase):
             self.assertEqual(
                 main(["history", "--operator", "ben",
                       "--history-file", history_path]), 2)
+
+
+class TestSev1EscalationChain(unittest.TestCase):
+    def _run(self, scenario="payments-outage", policy=None, **kwargs):
+        if policy is None:
+            policy = get_policy("sev1")
+        return simulate(get(scenario), policy, **kwargs)
+
+    def _write_run(self, result):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(result.to_dict(), handle)
+        return handle.name
+
+    def test_sev1_policy_chain(self):
+        policy = get_policy("sev1")
+        self.assertEqual(
+            [level.responder.role for level in policy.levels],
+            ["on-call", "senior", "incident-commander"])
+        self.assertEqual(
+            [level.ack_timeout_min for level in policy.levels],
+            [3, 5, 10])
+
+    def test_payments_outage_scenario(self):
+        scenario = get("payments-outage")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.ack_delay_min, (None, None, 4))
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertGreaterEqual(len(scenario.hints), 1)
+
+    def test_full_run_walks_the_whole_chain(self):
+        result = self._run()
+        score = result.score
+        self.assertEqual(score.escalations, 2)
+        # 3m on-call timeout + 5m senior timeout + 4m commander ack.
+        self.assertEqual(score.time_to_ack_min, 12)
+        self.assertEqual(score.time_to_mitigate_min, 62)
+        self.assertEqual(score.time_to_resolve_min, 92)
+        self.assertTrue(score.resolved)
+        # 100 - 30 (two escalations) - 7 (ack past the 5m grace) -
+        # (62-15)//2 = 23 -> 40.
+        self.assertEqual(score.points, 40)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 3)
+        self.assertEqual([step.outcome for step in chain],
+                         ["missed", "missed", "acked"])
+        self.assertEqual(
+            [step.responder_role for step in chain],
+            ["on-call", "senior", "incident-commander"])
+        self.assertEqual([step.paged_at_min for step in chain], [0, 3, 8])
+        self.assertEqual(chain[2].acked_at_min, 12)
+        self.assertEqual(chain[2].ack_late_min, 0)
+        self.assertIsNone(chain[0].acked_at_min)
+        self.assertIsNone(chain[0].ack_late_min)
+        self.assertEqual(
+            [step.impact for step in chain],
+            list(get("payments-outage").impact_stages))
+
+    def test_impact_grows_on_escalation_events(self):
+        result = self._run()
+        escalated = [event for event in result.timeline.events
+                     if event.kind == "escalated"]
+        self.assertEqual(len(escalated), 2)
+        self.assertIn("impact now: Checkout down:",
+                      escalated[0].detail)
+        self.assertIn("impact now: Payments fully down:",
+                      escalated[1].detail)
+
+    def test_chain_in_json_and_replay_round_trip(self):
+        result = self._run()
+        data = result.to_dict()
+        self.assertEqual(len(data["escalation_chain"]), 3)
+        self.assertEqual(data["escalation_chain"][0]["outcome"],
+                         "missed")
+        self.assertEqual(data["escalation_chain"][2]["acked_at_min"], 12)
+        self.assertEqual(
+            data["escalation_chain"][2]["impact"],
+            "Payments fully down: checkout and refunds failing, "
+            "revenue impact growing")
+        path = self._write_run(result)
+        loaded = load_result(path)
+        self.assertEqual(loaded.escalation_chain,
+                         result.escalation_chain)
+        self.assertEqual(loaded.to_dict(), data)
+
+    def test_old_run_without_chain_loads_as_empty(self):
+        data = self._run().to_dict()
+        del data["escalation_chain"]
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(data, handle)
+        self.assertEqual(load_result(handle.name).escalation_chain, [])
+
+    def test_bad_chain_in_replay_file_raises(self):
+        data = self._run().to_dict()
+        data["escalation_chain"] = [{"level": 1, "outcome": "maybe"}]
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(data, handle)
+        with self.assertRaises(ValueError):
+            load_result(handle.name)
+
+    def test_chain_printed_in_human_output(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "payments-outage", "--policy", "sev1"]), 0)
+        out = buf.getvalue()
+        self.assertIn("escalation chain:", out)
+        self.assertIn("L1 ana (on-call) paged 0m, missed after 3m", out)
+        self.assertIn("L3 carla (incident-commander) paged 8m, acked 12m",
+                      out)
+
+    def test_scenarios_without_stages_have_empty_impact(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY)
+        self.assertEqual(len(result.escalation_chain), 1)
+        self.assertEqual(result.escalation_chain[0].outcome, "acked")
+        self.assertEqual(result.escalation_chain[0].impact, "")
+        self.assertNotIn("impact now:", result.timeline.render())
+
+    def test_unacked_run_records_every_level_missed(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost",
+            severity="critical", description="",
+            ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+            impact_stages=("bad", "worse", "worst"))
+        result = simulate(scenario, get_policy("sev1"))
+        self.assertEqual([step.outcome for step in result.escalation_chain],
+                         ["missed"] * 3)
+        self.assertEqual([step.impact for step in result.escalation_chain],
+                         ["bad", "worse", "worst"])
+        self.assertEqual(result.score.points, 0)
+
+    def test_impact_clamps_to_last_stage(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost",
+            severity="critical", description="",
+            ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+            impact_stages=("only-stage",))
+        result = simulate(scenario, get_policy("sev1"))
+        self.assertEqual([step.impact for step in result.escalation_chain],
+                         ["only-stage"] * 3)
+        # One stage means no growth, so no "impact now" on the events.
+        self.assertNotIn("impact now:", result.timeline.render())
+
+    def test_debrief_reports_impact_growth(self):
+        debrief = generate_debrief(self._run())
+        self.assertIn("Impact grew while the page went unanswered",
+                      " ".join(debrief.went_badly))
+        self.assertTrue(any("Escalate sooner" in item["action"]
+                            for item in debrief.action_items))
+        # A clean run reports no impact growth.
+        clean = generate_debrief(simulate(get("disk-full"),
+                                          DEFAULT_POLICY))
+        self.assertNotIn("Impact grew", " ".join(clean.went_badly))
+
+    def test_compare_diffs_chains(self):
+        a = self._run()  # sev1: 3/5/10, acked 12m
+        b = self._run(policy=DEFAULT_POLICY)  # standard: 5/5/10, acked 14m
+        comparison = compare_results(a, b)
+        self.assertFalse(comparison.chains_identical)
+        self.assertIn("escalation chain:", comparison.render())
+        self.assertIn("acked 12m", comparison.render())
+        self.assertIn("acked 14m", comparison.render())
+        data = comparison.to_dict()
+        self.assertEqual(len(data["escalation_chain"]["a"]), 3)
+        self.assertFalse(data["escalation_chain"]["identical"])
+        # The same run compared with itself has an identical chain.
+        same = compare_results(a, a)
+        self.assertTrue(same.chains_identical)
+        self.assertNotIn("escalation chain:", same.render())
+
+    def test_stats_records_final_impact_and_growth(self):
+        sev1 = self._run()
+        clean = simulate(get("disk-full"), DEFAULT_POLICY)
+        stats = aggregate_stats([sev1, clean])
+        self.assertEqual(stats.impact_growth_runs, 1)
+        self.assertEqual(
+            stats.runs[0]["impact"],
+            "Payments fully down: checkout and refunds failing, "
+            "revenue impact growing")
+        self.assertIsNone(stats.runs[1]["impact"])
+        self.assertIn("impact grew while paging: 1 run(s)",
+                      stats.render())
+        self.assertEqual(stats.to_dict()["impact_growth_runs"], 1)
+
+    def test_what_if_keeps_impact_stages(self):
+        original = self._run()
+        outcome = what_if(original, ack_timeout=5)
+        replayed = outcome.replayed
+        self.assertEqual(
+            [step.impact for step in replayed.escalation_chain],
+            [step.impact for step in original.escalation_chain])
+        self.assertEqual(
+            [step.outcome for step in replayed.escalation_chain],
+            [step.outcome for step in original.escalation_chain])
+        # The wider timeouts move the ack later (5+5+4=14m), but the
+        # impact growth is the same.
+        self.assertEqual(replayed.score.time_to_ack_min, 14)
+        self.assertEqual(
+            replayed.escalation_chain[2].impact,
+            "Payments fully down: checkout and refunds failing, "
+            "revenue impact growing")
+
+    def test_drill_records_the_chain(self):
+        decisions = io.StringIO(
+            "wait\nwait\nack 4\nmitigate 50\nresolve 30\n")
+        result = run_drill(get("payments-outage"), get_policy("sev1"),
+                           input_stream=decisions,
+                           prompt_stream=io.StringIO())
+        self.assertEqual([step.outcome for step in result.escalation_chain],
+                         ["missed", "missed", "acked"])
+        self.assertEqual(result.score.points, 40)
+        self.assertEqual(
+            [step.impact for step in result.escalation_chain],
+            list(get("payments-outage").impact_stages))
+
+    def test_drill_quit_before_decision_records_no_step(self):
+        decisions = io.StringIO("quit\n")
+        result = run_drill(get("payments-outage"), get_policy("sev1"),
+                           input_stream=decisions,
+                           prompt_stream=io.StringIO())
+        self.assertEqual(result.escalation_chain, [])
+
+    def test_template_round_trips_impact_stages(self):
+        data = scenario_to_dict(get("payments-outage"))
+        self.assertEqual(data["impact_stages"],
+                         list(get("payments-outage").impact_stages))
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"payments-outage": data}}, handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["payments-outage"].impact_stages,
+                         get("payments-outage").impact_stages)
+
+    def test_scenario_file_rejects_bad_impact_stages(self):
+        base = scenario_to_dict(get("payments-outage"))
+        for bad in ("not-a-list", ["", "ok"], [3]):
+            data = dict(base, impact_stages=bad)
+            handle = tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False, encoding="utf-8")
+            with handle:
+                json.dump({"scenarios": {"bad": data}}, handle)
+            with self.assertRaises(ValueError):
+                load_scenario_file(handle.name)
+
+    def test_named_timeout_override_by_sev1_role(self):
+        # --ack-timeouts on-call=5 names the sev1 role.
+        policy = parse_ack_timeout_overrides(["on-call=5"],
+                                             get_policy("sev1"))
+        self.assertEqual([level.ack_timeout_min for level in policy.levels],
+                         [5, 5, 10])
 
 
 if __name__ == "__main__":

@@ -28,10 +28,12 @@ def _mean(values: list):
 class RunStats:
     # One row per run: {"label", "scenario", "points", "grade",
     # "time_to_ack_min", "time_to_mitigate_min", "time_to_resolve_min",
-    # "escalations", "resolved", "hints_used", "what_if"}; a
-    # milestone a run never reached is None in its row, and "what_if"
-    # is None for a real run or {"overrides", "points_delta",
-    # "base_points"} for a what-if replay.
+    # "escalations", "resolved", "hints_used", "impact", "what_if"}; a
+    # milestone a run never reached is None in its row, "impact" is
+    # the impact the run ended at from its escalation chain (None
+    # when the run recorded no chain or the scenario has no impact
+    # stages), and "what_if" is None for a real run or {"overrides",
+    # "points_delta", "base_points"} for a what-if replay.
     runs: list
     count: int
     # Points spread across all runs.
@@ -63,6 +65,9 @@ class RunStats:
     # happened; a what-if replay is a hypothetical, so it is flagged
     # in its row and counted here instead of being silently mixed in.
     whatif_count: int
+    # How many runs saw their impact grow while the page went
+    # unanswered (the chain's impact changed between levels).
+    impact_growth_runs: int
 
     def to_dict(self) -> dict:
         """JSON-ready dict: per-run rows and the aggregates."""
@@ -85,6 +90,7 @@ class RunStats:
                 "mean": self.escalations_mean,
             },
             "hints_total": self.hints_total,
+            "impact_growth_runs": self.impact_growth_runs,
             "grades": dict(self.grade_counts),
             "what_if_runs": self.whatif_count,
             "by_scenario": {
@@ -119,6 +125,10 @@ class RunStats:
         lines.append(f"escalations: {self.escalations_total} total, "
                      f"{self.escalations_mean:.1f} per run")
         lines.append(f"hints used: {self.hints_total}")
+        if self.impact_growth_runs:
+            lines.append(
+                f"impact grew while paging: {self.impact_growth_runs} "
+                f"run(s)")
         if self.whatif_count:
             lines.append(
                 f"what-if runs: {self.whatif_count} "
@@ -141,6 +151,31 @@ def _fmt_mean(value) -> str:
     if value is None:
         return "-"
     return f"{value:.1f}m"
+
+
+def _final_impact(result) -> object:
+    """The impact in effect at the end of a run's escalation chain.
+
+    The last step's impact — the stage the incident had reached when
+    someone acked (or when the chain ran out). None when the run
+    recorded no chain or the scenario has no impact stages.
+    """
+    chain = result.escalation_chain or []
+    if not chain:
+        return None
+    impact = chain[-1].impact
+    return impact or None
+
+
+def _impact_grew(result) -> bool:
+    """True when a run's impact changed between chain levels — the
+    incident got worse while the page went unanswered."""
+    chain = result.escalation_chain or []
+    seen = []
+    for step in chain:
+        if step.impact and step.impact not in seen:
+            seen.append(step.impact)
+    return len(seen) > 1
 
 
 def aggregate_stats(results: list, labels: list = None,
@@ -180,6 +215,10 @@ def aggregate_stats(results: list, labels: list = None,
             "escalations": score.escalations,
             "resolved": score.resolved,
             "hints_used": score.hints_used,
+            # The impact the run ended at, from its escalation chain
+            # (None when the run recorded no chain or the scenario has
+            # no impact stages).
+            "impact": _final_impact(result),
             "what_if": (whatif.to_dict()
                         if whatif is not None else None),
         })
@@ -226,4 +265,6 @@ def aggregate_stats(results: list, labels: list = None,
         same_scenario=len(by_scenario) == 1,
         whatif_count=sum(1 for whatif in whatifs
                          if whatif is not None),
+        impact_growth_runs=sum(1 for result in results
+                               if _impact_grew(result)),
     )

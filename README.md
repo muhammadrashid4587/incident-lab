@@ -57,8 +57,11 @@ python3 -m incident_lab compare /tmp/run-seed-1.json /tmp/run-seed-7.json
 python3 -m incident_lab compare /tmp/run-seed-1.json /tmp/run-seed-7.json --json
 python3 -m incident_lab stats /tmp/run-seed-1.json /tmp/run-seed-7.json
 python3 -m incident_lab stats /tmp/run-seed-1.json /tmp/run-seed-7.json --json
-python3 -m incident_lab run disk-full --hints 1
-python3 -m incident_lab run disk-full --hints 2 --json
+python3 -m incident_lab run payments-outage --policy sev1
+python3 -m incident_lab run payments-outage --policy sev1 --json
+python3 -m incident_lab run payments-outage --policy sev1 --json > /tmp/payments-outage.json
+python3 -m incident_lab replay /tmp/payments-outage.json
+python3 -m incident_lab debrief /tmp/payments-outage.json
 python3 -m incident_lab template disk-full > my-disk-full.json
 python3 -m incident_lab run disk-full --scenario-file my-disk-full.json
 python3 -m incident_lab run cache-down --scenario-file examples/custom-scenario.json
@@ -87,7 +90,10 @@ python3 scripts/demo.py
 `run --json` prints the whole result as machine-readable JSON instead of
 the human replay: incident, policy (levels with responders and ack
 timeouts), the timeline in time order, the score, and any hints asked for
-(each with its text and cost). The score carries
+(each with its text and cost). It also carries the escalation chain
+(`escalation_chain`, one step per level walked — responder, ack
+timeout, acked or missed, impact in effect when paged; see Escalation
+chain). The score carries
 the acking level's lateness (`ack_late_min`, 0 for an on-time ack) and
 the partial credit it kept (`ack_credit`, 1.0 on time). The score also
 carries the effective mitigate and resolve delays
@@ -279,7 +285,11 @@ mapping, each entry with `service`, `title`, `severity` (`low`,
 of minutes per escalation level, `null` where a responder never acks),
 and `mitigate_delay_min` / `resolve_delay_min`. An entry can also carry
 an optional `hints` list of known-good next actions, asked for with
-`run --hints N` (see Hints):
+`run --hints N` (see Hints), and an optional `impact_stages` list —
+the impact in effect at each escalation count (stage 0 when the
+incident is declared, stage 1 after the first missed level, and so
+on), so a SEV-1 that nobody acks quickly gets worse while the chain
+walks (see Escalation chain):
 
 ```json
 {"scenarios": {"cache-down": {
@@ -306,6 +316,7 @@ invalid scenario fails the run with exit code 2 and an error message.
 | deploy-regression | search-api | critical | primary and secondary miss, manager acks in 6m |
 | queue-backlog | orders-queue | high | primary acks in 4m, scales consumers to drain backlog |
 | dns-outage | edge-dns | critical | primary misses the page, secondary acks in 3m, fails over |
+| payments-outage | payments-api | critical | SEV-1: on-call and senior miss, incident commander acks in 4m; impact grows while paging |
 
 ## Escalation policy
 
@@ -313,10 +324,11 @@ The default policy (`standard`) is: primary, 5 minute ack timeout;
 secondary, 5 minutes; manager, 10 minutes. Pick a different built-in
 policy with `run <scenario> --policy <name>`:
 
-| policy | primary | secondary | manager | for |
-| ------ | ------- | --------- | ------- | --- |
-| standard | 5m | 5m | 10m | the default chain |
-| fast | 2m | 2m | 5m | critical services where paging delay costs more than a hasty escalation |
+| policy | level 1 | level 2 | level 3 | for |
+| ------ | ------- | ------- | ------- | --- |
+| standard | primary 5m | secondary 5m | manager 10m | the default chain |
+| fast | primary 2m | secondary 2m | manager 5m | critical services where paging delay costs more than a hasty escalation |
+| sev1 | on-call 3m | senior 5m | incident commander 10m | SEV-1 incidents: short timeouts, and the impact grows with every missed level |
 
 Override the timeout for every level with `run <scenario> --ack-timeout <minutes>`.
 `--ack-timeout` applies on top of whichever policy you picked.
@@ -349,6 +361,35 @@ Levels are validated on load: each needs a non-empty `name` and `role`
 and a positive integer `ack_timeout_min`, and a policy needs at least
 one level. A missing file, bad JSON, or an invalid policy fails the run
 with exit code 2 and an error message.
+
+## Escalation chain
+
+Every run records the escalation chain as it was actually walked, in
+the `run --json` output as a top-level `escalation_chain` list — one
+step per level paged, with the responder, the ack timeout, whether
+they acked or missed, when they were paged and acked, and the impact
+in effect when they were paged. The human-readable output prints the
+same chain after the timeline. A scenario can carry `impact_stages`
+(see Incident templates): the impact in effect at each escalation
+count, so a SEV-1 that nobody acks quickly gets worse while the chain
+walks — each missed page moves to the next stage, and the escalation
+event in the timeline says so (`impact now: ...`). The built-in
+`payments-outage` scenario is the SEV-1 for this: run it with the
+`sev1` policy (on-call 3m, senior 5m, incident commander 10m), where
+the on-call and the senior both miss and the incident commander acks
+in 4m, while the impact grows from degraded checkout to checkout down
+to payments fully down. It scores 40/100 on the `sev1` policy:
+100 - 30 (two escalations) - 7 (12m to ack, past the 5m grace) -
+23 (62m to mitigate, past the 15m grace, halved).
+
+`replay` re-prints the chain from a saved run (runs saved before
+0.26.0 have no chain and show none), `debrief` adds a finding and an
+action item when the impact grew while paging, `compare` diffs the
+two runs' chains when they differ, and `stats` records the impact
+each run ended at and counts the runs whose impact grew. A `what-if`
+replay keeps the original run's impact stages, so the replayed chain
+shows the same growth; a drill records the chain the same way `run`
+does, one step per level the operator actually decided on.
 
 ## Policy templates
 
@@ -688,6 +729,20 @@ human-readable form.
 
 ## Version
 
+0.26.0 — SEV-1 scenario with a multi-level escalation chain:
+`payments-outage` (payments API fully down, on-call and senior miss,
+incident commander acks in 4m) with a new `sev1` policy (on-call 3m,
+senior 5m, incident commander 10m), and the escalation chain recorded
+in `run --json` (one step per level walked: responder, ack timeout,
+acked or missed, impact in effect when paged) — scenarios can carry
+`impact_stages`, so the impact grows with every missed level and the
+escalation event says so (`impact now: ...`); `replay` re-prints the
+chain, `debrief` adds a finding and an action when the impact grew,
+`compare` diffs the two runs' chains, `stats` records the impact each
+run ended at and counts the runs whose impact grew, `what-if` keeps
+the original run's impact stages, and a drill records the chain the
+same way `run` does.
+
 0.25.0 — per-operator drill history: `drill --operator NAME` records
 the drill (finished or abandoned) in a history file
 (`~/.incident-lab/history.json` by default, `--history-file PATH` to
@@ -754,3 +809,4 @@ resolved instead of claiming nobody acked.
 - [x] Interactive drill mode: `drill <scenario>` plays an incident step by step with the operator deciding when to ack, mitigate and resolve (`ack N` / `wait`, `mitigate N`, `resolve N`, `quit`), same timeouts, late-ack credit and scoring as `run`; scripted input via `--input PATH` or piped stdin, prompts on stderr so `drill --json` stays parseable, `--out PATH` writes the JSON result, and quit/EOF ends the drill cleanly with a partial run (timeline plus an `abandoned` event, scored on the milestones reached) in the same JSON shape as `run`, so `replay`, `debrief`, `compare` and `stats` all work on drill runs (0.23.0)
 - [x] Interactive `hint` during a drill: type `hint` at any drill prompt to ask for the scenario's next known-good action when stuck (costs 5 points, like `run --hints`), drawn in order and continuing after any up-front `--hints`, printed with the next milestone and what the scoring rewards at that point, and recorded in the drill's JSON exactly like an up-front hint, so `replay`, `debrief`, `compare` and `stats` all work on drill runs with mid-drill hints (0.24.0)
 - [x] Per-operator drill history: `drill --operator NAME` records the drill (finished or abandoned) in a history file (`~/.incident-lab/history.json` by default, `--history-file PATH` to point elsewhere), and `history --operator NAME` shows that operator's runs in order with scores, grades and response times plus a summary (runs, mean and best score, first vs latest, trend from the second half of runs against the first); plain `history` summarises every operator, `--json` prints either view as JSON, and a drill without `--operator` records nothing (0.25.0)
+- [x] SEV-1 scenario with a multi-level escalation chain: `payments-outage` with a `sev1` policy (on-call 3m, senior 5m, incident commander 10m), impact stages that grow with every missed level, and the escalation chain recorded in `run --json` and shown by `replay`, `debrief`, `compare` and `stats`; `what-if` keeps the original run's impact stages and drills record the chain too (0.26.0)
