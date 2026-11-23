@@ -10,6 +10,7 @@ bad JSON, and ValueError on a wrong shape or an invalid value.
 """
 
 import json
+from dataclasses import dataclass
 
 from .difficulty import parse_difficulty
 from .incident import Incident
@@ -195,6 +196,100 @@ def load_result(path: str) -> SimulationResult:
     """Load a saved `run --json` result and rebuild it for re-printing."""
     with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
+    return _result_from_dict(data)
+
+
+@dataclass
+class WhatIfInfo:
+    """Provenance of a what-if replay loaded from a saved file.
+
+    ``overrides`` are the human-readable override descriptions, in
+    the order applied; ``points_delta`` is how the replay scored
+    against its base run, and ``base_points`` is the base run's
+    score. ``base_result`` is the base run itself, for callers that
+    want to compare the replay against the run it came from.
+    """
+    overrides: list
+    points_delta: int
+    base_points: int
+    base_result: object  # SimulationResult, the run that was replayed
+
+    def to_dict(self) -> dict:
+        """JSON-ready dict: overrides, delta and base score."""
+        return {
+            "overrides": list(self.overrides),
+            "points_delta": self.points_delta,
+            "base_points": self.base_points,
+        }
+
+
+@dataclass
+class LoadedRun:
+    """A saved run file: the run to use, plus what-if provenance.
+
+    ``result`` is the run itself for a normal `run --json` file, or
+    the replayed run for a `what-if --json` file; ``what_if`` is
+    None for a normal run.
+    """
+    result: object  # SimulationResult
+    what_if: object = None  # WhatIfInfo, or None
+
+
+def load_saved(path: str) -> LoadedRun:
+    """Load a saved run or a saved what-if result.
+
+    A `what-if --json` file carries both runs under "original" and
+    "what_if" plus the overrides and the points delta; it loads as
+    the replayed run, with the base run kept as provenance. A normal
+    `run --json` file loads as itself, with no provenance. Raises
+    FileNotFoundError if the file is missing, json.JSONDecodeError
+    on bad JSON, and ValueError on a wrong shape or an invalid value
+    (including a what-if file whose delta does not match its runs).
+    """
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("replay file: expected a JSON object")
+    if "what_if" in data or "original" in data:
+        return _load_whatif(data)
+    return LoadedRun(result=_result_from_dict(data))
+
+
+def _load_whatif(data: dict) -> LoadedRun:
+    """Load a `what-if --json` file as its replayed run."""
+    original = data.get("original")
+    replayed = data.get("what_if")
+    if not isinstance(original, dict) or not isinstance(replayed, dict):
+        raise ValueError("replay file: a what-if file must carry "
+                         "'original' and 'what_if' runs")
+    overrides = data.get("overrides")
+    if (not isinstance(overrides, list)
+            or any(not isinstance(item, str) for item in overrides)):
+        raise ValueError("replay file: a what-if file's 'overrides' "
+                         "must be a list of strings")
+    points_delta = data.get("points_delta")
+    if isinstance(points_delta, bool) or not isinstance(points_delta, int):
+        raise ValueError("replay file: a what-if file's 'points_delta' "
+                         "must be an integer")
+    base = _result_from_dict(original)
+    result = _result_from_dict(replayed)
+    if base.incident.id != result.incident.id:
+        raise ValueError("replay file: a what-if file's replay must be "
+                         "of the same incident as its base run")
+    if result.score.points - base.score.points != points_delta:
+        raise ValueError("replay file: a what-if file's 'points_delta' "
+                         "does not match its runs' scores")
+    return LoadedRun(
+        result=result,
+        what_if=WhatIfInfo(
+            overrides=list(overrides),
+            points_delta=points_delta,
+            base_points=base.score.points,
+            base_result=base))
+
+
+def _result_from_dict(data: dict) -> SimulationResult:
+    """Rebuild a SimulationResult from one saved run's JSON dict."""
     if not isinstance(data, dict):
         raise ValueError("replay file: expected a JSON object")
     seed = data.get("seed")

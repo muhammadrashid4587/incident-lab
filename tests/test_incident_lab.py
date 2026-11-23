@@ -20,7 +20,7 @@ from incident_lab.policy import (
     DEFAULT_POLICY, EscalationPolicy, Level, Responder, get_policy,
     list_policies, load_policy_file, parse_ack_timeout_overrides,
 )
-from incident_lab.replay import load_result
+from incident_lab.replay import load_result, load_saved
 from incident_lab.scenarios import (
     Scenario, get, list_scenarios, load_scenario_file, scenario_to_dict,
 )
@@ -2700,6 +2700,140 @@ class TestWhatIf(unittest.TestCase):
             json.dump(batch.to_dict(), handle)
         self.assertEqual(main(["what-if", handle.name, "--ack-timeout",
                               "5"]), 2)
+
+
+class TestWhatIfInCompareAndStats(unittest.TestCase):
+    def _run(self, scenario, policy=DEFAULT_POLICY, **kwargs):
+        return simulate(get(scenario), policy, **kwargs)
+
+    def _write_json(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(data, handle)
+        return handle.name
+
+    def _whatif_path(self):
+        # disk-full on the fast policy scores 48 (grade D); replayed
+        # with 5m timeouts it scores 96 (grade A).
+        original = self._run("disk-full", get_policy("fast"))
+        outcome = what_if(original, ack_timeout=5)
+        return self._write_json(outcome.to_dict()), original, outcome
+
+    def test_load_saved_normal_run_has_no_what_if(self):
+        path = self._write_json(self._run("disk-full").to_dict())
+        loaded = load_saved(path)
+        self.assertEqual(loaded.result.score.points, 96)
+        self.assertIsNone(loaded.what_if)
+
+    def test_load_saved_what_if_returns_replay_and_provenance(self):
+        path, _, outcome = self._whatif_path()
+        loaded = load_saved(path)
+        self.assertEqual(loaded.result.score.points, 96)
+        self.assertEqual(loaded.what_if.points_delta, 48)
+        self.assertEqual(loaded.what_if.base_points, 48)
+        self.assertEqual(loaded.what_if.overrides,
+                         ["ack timeout: every level 5m"])
+        self.assertEqual(loaded.what_if.base_result.score.points, 48)
+
+    def test_load_saved_what_if_with_wrong_delta_fails(self):
+        _, _, outcome = self._whatif_path()
+        data = outcome.to_dict()
+        data["points_delta"] = 1
+        with self.assertRaises(ValueError):
+            load_saved(self._write_json(data))
+
+    def test_load_saved_what_if_missing_replay_fails(self):
+        _, _, outcome = self._whatif_path()
+        data = outcome.to_dict()
+        del data["what_if"]
+        with self.assertRaises(ValueError):
+            load_saved(self._write_json(data))
+
+    def test_compare_base_run_against_its_what_if(self):
+        original = self._run("disk-full", get_policy("fast"))
+        loaded = load_saved(self._write_json(
+            what_if(original, ack_timeout=5).to_dict()))
+        comparison = compare_results(original, loaded.result,
+                                     whatif_b=loaded.what_if)
+        rows = {row["metric"]: row for row in comparison.score_rows}
+        self.assertEqual(rows["points"]["delta"], 48)
+        self.assertIn("what-if replay", comparison.render())
+        self.assertIn("+48 points vs base", comparison.render())
+        data = comparison.to_dict()
+        self.assertIsNone(data["run_a"]["what_if"])
+        self.assertEqual(data["run_b"]["what_if"]["points_delta"], 48)
+        self.assertEqual(data["run_b"]["what_if"]["base_points"], 48)
+
+    def test_compare_two_what_if_replays(self):
+        original = self._run("disk-full", get_policy("fast"))
+        first = load_saved(self._write_json(
+            what_if(original, ack_timeout=5).to_dict()))
+        second = load_saved(self._write_json(
+            what_if(original, policy=get_policy("standard")).to_dict()))
+        comparison = compare_results(first.result, second.result,
+                                     whatif_a=first.what_if,
+                                     whatif_b=second.what_if)
+        # Both replays score 96 on the same incident, so the score
+        # deltas are all zero — but both sides are flagged as replays.
+        rows = {row["metric"]: row for row in comparison.score_rows}
+        self.assertEqual(rows["points"]["delta"], 0)
+        self.assertIn("A is a what-if replay", comparison.render())
+        self.assertIn("B is a what-if replay", comparison.render())
+
+    def test_cli_compare_run_against_what_if(self):
+        original = self._run("disk-full", get_policy("fast"))
+        base_path = self._write_json(original.to_dict())
+        whatif_path = self._write_json(
+            what_if(original, ack_timeout=5).to_dict())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["compare", base_path, whatif_path]), 0)
+        output = buf.getvalue()
+        self.assertIn("what-if replay", output)
+        self.assertIn("+48 points vs base", output)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["compare", base_path, whatif_path, "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["run_b"]["what_if"]["points_delta"], 48)
+
+    def test_stats_flags_what_if_rows(self):
+        base = self._run("disk-full")
+        original = self._run("disk-full", get_policy("fast"))
+        loaded = load_saved(self._write_json(
+            what_if(original, ack_timeout=5).to_dict()))
+        stats = aggregate_stats([base, loaded.result],
+                                whatifs=[None, loaded.what_if])
+        self.assertEqual(stats.count, 2)
+        self.assertEqual(stats.whatif_count, 1)
+        self.assertIsNone(stats.runs[0]["what_if"])
+        self.assertEqual(stats.runs[1]["what_if"]["points_delta"], 48)
+        self.assertEqual(stats.to_dict()["what_if_runs"], 1)
+        self.assertIn("what-if runs: 1", stats.render())
+
+    def test_stats_whatif_list_length_must_match(self):
+        with self.assertRaises(ValueError):
+            aggregate_stats([self._run("disk-full")], whatifs=[])
+
+    def test_cli_stats_mixes_runs_and_what_if(self):
+        run_path = self._write_json(self._run("disk-full").to_dict())
+        original = self._run("disk-full", get_policy("fast"))
+        whatif_path = self._write_json(
+            what_if(original, ack_timeout=5).to_dict())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["stats", run_path, whatif_path]), 0)
+        self.assertIn("what-if runs: 1", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["stats", run_path, whatif_path, "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["what_if_runs"], 1)
+        self.assertEqual(data["runs"][1]["what_if"]["points_delta"], 48)
+        self.assertIsNone(data["runs"][0]["what_if"])
 
 
 if __name__ == "__main__":

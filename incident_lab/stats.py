@@ -28,8 +28,10 @@ def _mean(values: list):
 class RunStats:
     # One row per run: {"label", "scenario", "points", "grade",
     # "time_to_ack_min", "time_to_mitigate_min", "time_to_resolve_min",
-    # "escalations", "resolved", "hints_used"}; a milestone a run
-    # never reached is None in its row.
+    # "escalations", "resolved", "hints_used", "what_if"}; a
+    # milestone a run never reached is None in its row, and "what_if"
+    # is None for a real run or {"overrides", "points_delta",
+    # "base_points"} for a what-if replay.
     runs: list
     count: int
     # Points spread across all runs.
@@ -57,6 +59,10 @@ class RunStats:
     by_scenario: dict
     # True when every run played the same scenario.
     same_scenario: bool
+    # How many of the runs are what-if replays rather than runs that
+    # happened; a what-if replay is a hypothetical, so it is flagged
+    # in its row and counted here instead of being silently mixed in.
+    whatif_count: int
 
     def to_dict(self) -> dict:
         """JSON-ready dict: per-run rows and the aggregates."""
@@ -80,6 +86,7 @@ class RunStats:
             },
             "hints_total": self.hints_total,
             "grades": dict(self.grade_counts),
+            "what_if_runs": self.whatif_count,
             "by_scenario": {
                 name: dict(entry)
                 for name, entry in self.by_scenario.items()
@@ -112,6 +119,10 @@ class RunStats:
         lines.append(f"escalations: {self.escalations_total} total, "
                      f"{self.escalations_mean:.1f} per run")
         lines.append(f"hints used: {self.hints_total}")
+        if self.whatif_count:
+            lines.append(
+                f"what-if runs: {self.whatif_count} "
+                f"(hypothetical replays, flagged per run in --json)")
         lines.append("")
         lines.append("grades:")
         for letter in ("A", "B", "C", "D"):
@@ -132,12 +143,17 @@ def _fmt_mean(value) -> str:
     return f"{value:.1f}m"
 
 
-def aggregate_stats(results: list, labels: list = None) -> RunStats:
+def aggregate_stats(results: list, labels: list = None,
+                    whatifs: list = None) -> RunStats:
     """Summarise a list of saved runs.
 
     ``labels`` names each run in the per-run rows (defaults to
-    "run 1", "run 2", ...). Raises ValueError on an empty list or a
-    labels list of the wrong length.
+    "run 1", "run 2", ...). ``whatifs`` is an optional list aligned
+    with ``results`` of WhatIfInfo objects (from replay.load_saved,
+    or None) for runs that came from a `what-if --json` file; those
+    rows are flagged as what-if replays with their overrides and
+    points delta recorded. Raises ValueError on an empty list or a
+    labels / whatifs list of the wrong length.
     """
     results = list(results)
     if not results:
@@ -146,8 +162,12 @@ def aggregate_stats(results: list, labels: list = None) -> RunStats:
         labels = [f"run {index + 1}" for index in range(len(results))]
     if len(labels) != len(results):
         raise ValueError("stats needs one label per run")
+    if whatifs is None:
+        whatifs = [None] * len(results)
+    if len(whatifs) != len(results):
+        raise ValueError("stats needs one what-if entry per run")
     rows = []
-    for result, label in zip(results, labels):
+    for result, label, whatif in zip(results, labels, whatifs):
         score = result.score
         rows.append({
             "label": label,
@@ -160,6 +180,8 @@ def aggregate_stats(results: list, labels: list = None) -> RunStats:
             "escalations": score.escalations,
             "resolved": score.resolved,
             "hints_used": score.hints_used,
+            "what_if": (whatif.to_dict()
+                        if whatif is not None else None),
         })
     points = [row["points"] for row in rows]
     grade_counts = {letter: 0 for letter in ("A", "B", "C", "D")}
@@ -202,4 +224,6 @@ def aggregate_stats(results: list, labels: list = None) -> RunStats:
         grade_counts=grade_counts,
         by_scenario=by_scenario,
         same_scenario=len(by_scenario) == 1,
+        whatif_count=sum(1 for whatif in whatifs
+                         if whatif is not None),
     )

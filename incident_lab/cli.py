@@ -13,7 +13,7 @@ from .difficulty import (
 from .policy import (
     POLICIES, list_policies, load_policy_file, parse_ack_timeout_overrides,
 )
-from .replay import load_result
+from .replay import load_result, load_saved
 from .scenarios import (
     SCENARIOS, get, list_scenarios, load_scenario_file, scenario_to_dict,
 )
@@ -249,11 +249,14 @@ def main(argv=None) -> int:
     compare = sub.add_parser(
         "compare",
         help="diff two saved --json runs side by side: score deltas "
-             "and timeline differences")
+             "and timeline differences; each side may be a run or a "
+             "what-if --json file (the replay is compared and flagged)")
     compare.add_argument("path_a", metavar="RUN-A",
-                         help="path to a JSON file saved from run --json")
+                         help="path to a JSON file saved from run --json "
+                              "or what-if --json")
     compare.add_argument("path_b", metavar="RUN-B",
-                         help="path to a JSON file saved from run --json")
+                         help="path to a JSON file saved from run --json "
+                              "or what-if --json")
     compare.add_argument("--json", action="store_true",
                          help="print the comparison as JSON instead of "
                               "the human-readable diff")
@@ -261,9 +264,12 @@ def main(argv=None) -> int:
     stats = sub.add_parser(
         "stats",
         help="aggregate saved --json runs: score spread, mean response "
-             "times, grade counts, per-scenario means")
+             "times, grade counts, per-scenario means; what-if --json "
+             "files are aggregated as their replayed runs and flagged "
+             "as what-if")
     stats.add_argument("paths", nargs="+", metavar="RUN",
-                       help="paths to JSON files saved from run --json")
+                       help="paths to JSON files saved from run --json "
+                            "or what-if --json")
     stats.add_argument("--json", action="store_true",
                        help="print the summary as JSON instead of the "
                             "human-readable form")
@@ -362,10 +368,10 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "compare":
-        results = []
+        loaded = []
         for path in (args.path_a, args.path_b):
             try:
-                results.append(load_result(path))
+                loaded.append(load_saved(path))
             except OSError as exc:
                 print(f"cannot read compare file: {exc}", file=sys.stderr)
                 return 2
@@ -375,9 +381,11 @@ def main(argv=None) -> int:
             except ValueError as exc:
                 print(f"invalid compare file: {exc}", file=sys.stderr)
                 return 2
-        comparison = compare_results(results[0], results[1],
+        comparison = compare_results(loaded[0].result, loaded[1].result,
                                      label_a=args.path_a,
-                                     label_b=args.path_b)
+                                     label_b=args.path_b,
+                                     whatif_a=loaded[0].what_if,
+                                     whatif_b=loaded[1].what_if)
         if args.json:
             print(json.dumps(comparison.to_dict(), indent=2))
         else:
@@ -385,10 +393,10 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "stats":
-        results = []
+        loaded = []
         for path in args.paths:
             try:
-                results.append(load_result(path))
+                loaded.append(load_saved(path))
             except OSError as exc:
                 print(f"cannot read stats file: {exc}", file=sys.stderr)
                 return 2
@@ -398,7 +406,10 @@ def main(argv=None) -> int:
             except ValueError as exc:
                 print(f"invalid stats file: {exc}", file=sys.stderr)
                 return 2
-        summary = aggregate_stats(results, labels=list(args.paths))
+        summary = aggregate_stats([entry.result for entry in loaded],
+                                  labels=list(args.paths),
+                                  whatifs=[entry.what_if
+                                           for entry in loaded])
         if args.json:
             print(json.dumps(summary.to_dict(), indent=2))
         else:

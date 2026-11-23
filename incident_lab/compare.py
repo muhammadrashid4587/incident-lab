@@ -51,6 +51,11 @@ class Comparison:
     # Events only one run has, as {"t_min", "kind", "actor", "detail"}.
     timeline_only_a: list
     timeline_only_b: list
+    # What-if provenance for each side, or None: a WhatIfInfo from
+    # replay.load_saved, when that side came from a `what-if --json`
+    # file instead of a `run --json` file.
+    whatif_a: object = None
+    whatif_b: object = None
 
     @property
     def timelines_identical(self) -> bool:
@@ -62,8 +67,18 @@ class Comparison:
     def to_dict(self) -> dict:
         """JSON-ready dict: runs, score rows, timeline diff."""
         return {
-            "run_a": {"label": self.label_a, "scenario": self.incident_a},
-            "run_b": {"label": self.label_b, "scenario": self.incident_b},
+            "run_a": {
+                "label": self.label_a,
+                "scenario": self.incident_a,
+                "what_if": (self.whatif_a.to_dict()
+                            if self.whatif_a is not None else None),
+            },
+            "run_b": {
+                "label": self.label_b,
+                "scenario": self.incident_b,
+                "what_if": (self.whatif_b.to_dict()
+                            if self.whatif_b is not None else None),
+            },
             "same_scenario": self.same_scenario,
             "same_policy": self.same_policy,
             "score": [
@@ -89,6 +104,15 @@ class Comparison:
             f"A: {self.label_a} ({self.incident_a})",
             f"B: {self.label_b} ({self.incident_b})",
         ]
+        for label, whatif in (("A", self.whatif_a),
+                              ("B", self.whatif_b)):
+            if whatif is not None:
+                delta = whatif.points_delta
+                lines.append(
+                    f"note: {label} is a what-if replay of its base run "
+                    f"({whatif.base_points} points) with overrides: "
+                    f"{'; '.join(whatif.overrides)}; "
+                    f"{'+' if delta >= 0 else ''}{delta} points vs base")
         if not self.same_scenario:
             lines.append("note: different scenarios — scores are not "
                          "directly comparable")
@@ -225,8 +249,14 @@ def _same_policy(a: SimulationResult, b: SimulationResult) -> bool:
 
 
 def compare_results(a: SimulationResult, b: SimulationResult,
-                    label_a: str = "A", label_b: str = "B") -> Comparison:
-    """Diff two runs: score rows with deltas and a timeline diff."""
+                    label_a: str = "A", label_b: str = "B",
+                    whatif_a=None, whatif_b=None) -> Comparison:
+    """Diff two runs: score rows with deltas and a timeline diff.
+
+    ``whatif_a`` / ``whatif_b`` are WhatIfInfo objects (from
+    replay.load_saved) when that side came from a `what-if --json`
+    file; the comparison then uses the replayed run and flags it.
+    """
     matched, only_a, only_b = _timeline_diff(a, b)
     return Comparison(
         label_a=label_a,
@@ -239,4 +269,6 @@ def compare_results(a: SimulationResult, b: SimulationResult,
         timeline_matched=matched,
         timeline_only_a=only_a,
         timeline_only_b=only_b,
+        whatif_a=whatif_a,
+        whatif_b=whatif_b,
     )

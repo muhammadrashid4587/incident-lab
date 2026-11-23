@@ -65,6 +65,9 @@ python3 -m incident_lab what-if /tmp/disk-full.json --difficulty hard
 python3 -m incident_lab what-if /tmp/disk-full.json --ack-timeouts primary=2 --json
 python3 -m incident_lab what-if /tmp/disk-full.json --policy standard
 python3 -m incident_lab what-if /tmp/disk-full.json --policy fast --difficulty hard --json
+python3 -m incident_lab what-if /tmp/disk-full.json --ack-timeout 5 --json > /tmp/disk-full-whatif.json
+python3 -m incident_lab compare /tmp/disk-full.json /tmp/disk-full-whatif.json
+python3 -m incident_lab stats /tmp/run-seed-1.json /tmp/disk-full-whatif.json
 python3 scripts/demo.py
 ```
 
@@ -141,6 +144,15 @@ different scenarios still works, but the report says plainly that the
 scores are not directly comparable, and a different policy is flagged
 the same way. A milestone one run never reached (nobody acked, never
 mitigated) shows as `-` with no delta.
+
+Either side may also be a saved `what-if --json` file: the comparison
+then uses the what-if replay and says so plainly, with the overrides
+that produced it and how many points the replay gained or lost
+against its base run — so comparing a base run against its own
+what-if shows exactly what the override was worth, and comparing two
+what-if replays shows which override helped more. With `--json` each
+side carries a `what_if` entry (`null` for a real run, or the
+overrides, points delta and base score for a replay).
 
 ```sh
 python3 -m incident_lab run disk-full --seed 1 --json > run-seed-1.json
@@ -219,6 +231,13 @@ prints as JSON instead, including one row per run. Runs spanning
 several scenarios are still aggregated, but the report says plainly
 that the averages mix different incidents, and it breaks the runs down
 by scenario with a per-scenario mean score.
+
+A saved `what-if --json` file may be passed too: it is aggregated as
+its replayed run, and it is flagged as a what-if — the report counts
+how many of the runs are hypothetical replays rather than runs that
+happened, and each what-if row in `--json` carries its overrides, its
+points delta against its base run, and the base run's score — so a
+what-if never slips silently into an average of real runs.
 
 ```sh
 python3 -m incident_lab run disk-full --seed 1 --json > run-seed-1.json
@@ -405,7 +424,9 @@ incident_lab/
   scenarios.py   built-in incident scenarios + scenario files/templates
   simulator.py   deterministic simulation + scoring
   difficulty.py  difficulty ladder: easy / normal / hard scaling
-  replay.py      rebuild a saved --json run for re-printing
+  replay.py      rebuild a saved --json run for re-printing; also loads
+                 a saved what-if file as its replayed run, with the
+                 base run and overrides kept as provenance
   debrief.py     structured postmortem from a saved run
   compare.py     side-by-side diff of two saved runs: score deltas,
                  shared-event time shifts, events only one run has
@@ -476,13 +497,12 @@ human-readable form.
 
 ## Version
 
-0.20.0 — what-if replay against a different named policy:
-`what-if <saved-run.json> --policy <name>` (built-in, or from
-`--policy-file`) re-simulates the saved run under that policy and
-shows how the score and grade would have changed; the new policy's
-timeouts are scaled to the original run's difficulty unless
-`--difficulty` is also given, an unknown policy name fails with exit
-code 2, and the original run file is never modified.
+0.21.0 — compare and stats accept what-if replay outputs: `compare`
+and `stats` take saved `what-if --json` files alongside normal runs,
+compare what-if replays against each other and against their base
+runs, and aggregate what-if runs in stats, flagging them as what-if
+with their overrides and points delta recorded; a what-if file whose
+points delta does not match its runs' scores is rejected.
 
 ## Roadmap
 
@@ -506,3 +526,4 @@ code 2, and the original run file is never modified.
 - [x] Stats: `stats <run.json>...` aggregates saved runs (score spread, mean response times, acked/resolved counts, escalations, hints used, grade counts, per-scenario means), human form or `--json`, flags mixed scenarios (0.18.0)
 - [x] What-if replay: `what-if <saved-run.json> --ack-timeout N | --ack-timeouts ... | --difficulty X` re-simulates a saved run with overridden parameters and shows how the score and grade would have changed (human form or `--json`); the incident's behaviour is rebuilt from the saved run's own recorded delays, a seeded run's jitter is not drawn again, hints are kept, and the original run file is never modified (0.19.0)
 - [x] What-if replay against a different named policy: `what-if <saved-run.json> --policy <name>` (built-in, or from `--policy-file`) re-simulates the saved run under that policy and shows how the score and grade would have changed; the new policy's timeouts are scaled to the original run's difficulty unless `--difficulty` is also given, an unknown policy name fails with exit code 2, and the original run file is never modified (0.20.0)
+- [x] Compare and stats accept what-if replay outputs: `compare` and `stats` take saved `what-if --json` files alongside normal runs, compare what-if replays against each other and against their base runs, and aggregate what-if runs in stats, flagging them as what-if with their overrides and points delta recorded; a what-if file whose points delta does not match its runs' scores is rejected (0.21.0)
