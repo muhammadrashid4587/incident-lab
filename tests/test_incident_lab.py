@@ -25,6 +25,7 @@ from incident_lab.scenarios import (
     Scenario, get, list_scenarios, load_scenario_file, scenario_to_dict,
 )
 from incident_lab.simulator import simulate, simulate_batch
+from incident_lab.stats import aggregate_stats
 from incident_lab.timeline import Timeline
 
 
@@ -2128,6 +2129,161 @@ class TestHints(unittest.TestCase):
             json.dump(bad, out)
         with self.assertRaises(ValueError):
             load_scenario_file(handle.name)
+
+
+class TestStats(unittest.TestCase):
+    def _runs(self):
+        # disk-full 96 (A), cert-expiry 100 (A), latency-spike 67 (C).
+        return [
+            simulate(get("disk-full"), DEFAULT_POLICY),
+            simulate(get("cert-expiry"), DEFAULT_POLICY),
+            simulate(get("latency-spike"), DEFAULT_POLICY),
+        ]
+
+    def _write_runs(self, results):
+        paths = []
+        for result in results:
+            handle = tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False, encoding="utf-8")
+            with handle:
+                json.dump(result.to_dict(), handle)
+            paths.append(handle.name)
+        return paths
+
+    def test_points_distribution(self):
+        stats = aggregate_stats(self._runs())
+        self.assertEqual(stats.count, 3)
+        self.assertAlmostEqual(stats.points_mean, (96 + 100 + 67) / 3)
+        self.assertEqual(stats.points_min, 67)
+        self.assertEqual(stats.points_max, 100)
+        self.assertEqual(stats.points_median, 96)
+
+    def test_mean_response_times(self):
+        stats = aggregate_stats(self._runs())
+        self.assertAlmostEqual(stats.mean_time_to_ack_min, (3 + 2 + 9) / 3)
+        self.assertAlmostEqual(stats.mean_time_to_mitigate_min,
+                               (23 + 10 + 44) / 3)
+        self.assertAlmostEqual(stats.mean_time_to_resolve_min,
+                               (35 + 15 + 64) / 3)
+        self.assertEqual(stats.acked, 3)
+        self.assertEqual(stats.resolved, 3)
+
+    def test_grade_counts(self):
+        stats = aggregate_stats(self._runs())
+        self.assertEqual(stats.grade_counts, {"A": 2, "B": 0, "C": 1, "D": 0})
+
+    def test_unacked_run_excluded_from_means(self):
+        ghost = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        results = self._runs() + [simulate(ghost, DEFAULT_POLICY)]
+        stats = aggregate_stats(results)
+        self.assertEqual(stats.count, 4)
+        self.assertEqual(stats.points_min, 0)
+        self.assertEqual(stats.acked, 3)
+        self.assertEqual(stats.resolved, 3)
+        # Means only cover the runs that reached each milestone.
+        self.assertAlmostEqual(stats.mean_time_to_ack_min, (3 + 2 + 9) / 3)
+        self.assertAlmostEqual(stats.mean_time_to_resolve_min,
+                               (35 + 15 + 64) / 3)
+        self.assertEqual(stats.grade_counts["D"], 1)
+
+    def test_no_run_acked_means_no_mean_ack(self):
+        ghost = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        stats = aggregate_stats([simulate(ghost, DEFAULT_POLICY)])
+        self.assertEqual(stats.acked, 0)
+        self.assertIsNone(stats.mean_time_to_ack_min)
+        self.assertIsNone(stats.mean_time_to_mitigate_min)
+        self.assertIsNone(stats.mean_time_to_resolve_min)
+
+    def test_same_scenario_flag_and_by_scenario(self):
+        same = aggregate_stats([
+            simulate(get("disk-full"), DEFAULT_POLICY),
+            simulate(get("disk-full"), DEFAULT_POLICY, seed=3),
+        ])
+        self.assertTrue(same.same_scenario)
+        self.assertEqual(same.by_scenario,
+                         {"disk-full": {"runs": 2, "points_mean": 96.0}})
+        mixed = aggregate_stats(self._runs())
+        self.assertFalse(mixed.same_scenario)
+        self.assertEqual(mixed.by_scenario["disk-full"]["runs"], 1)
+        self.assertEqual(mixed.by_scenario["latency-spike"]["runs"], 1)
+
+    def test_escalations_and_hints_totals(self):
+        results = self._runs()
+        hinted = simulate(get("disk-full"), DEFAULT_POLICY, hints=2)
+        stats = aggregate_stats(results + [hinted])
+        self.assertEqual(stats.escalations_total, 1)
+        self.assertAlmostEqual(stats.escalations_mean, 0.25)
+        self.assertEqual(stats.hints_total, 2)
+
+    def test_empty_list_raises(self):
+        with self.assertRaises(ValueError):
+            aggregate_stats([])
+
+    def test_label_count_must_match_runs(self):
+        with self.assertRaises(ValueError):
+            aggregate_stats(self._runs(), labels=["only-one"])
+
+    def test_default_labels_number_runs(self):
+        stats = aggregate_stats(self._runs())
+        self.assertEqual([row["label"] for row in stats.runs],
+                         ["run 1", "run 2", "run 3"])
+
+    def test_cli_stats_human_and_json(self):
+        paths = self._write_runs(self._runs())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["stats"] + paths), 0)
+        out = buf.getvalue()
+        self.assertIn("runs: 3", out)
+        self.assertIn("mean:   87.7/100", out)
+        self.assertIn("A: 2", out)
+        self.assertIn("C: 1", out)
+        self.assertIn("multiple scenarios", out)
+        self.assertIn("by scenario:", out)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["stats"] + paths + ["--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["count"], 3)
+        self.assertFalse(data["same_scenario"])
+        self.assertEqual(data["points"]["min"], 67)
+        self.assertEqual(data["points"]["max"], 100)
+        self.assertEqual(data["grades"], {"A": 2, "B": 0, "C": 1, "D": 0})
+        self.assertEqual(len(data["runs"]), 3)
+        self.assertEqual(data["runs"][0]["label"], paths[0])
+        self.assertEqual(data["runs"][0]["scenario"], "disk-full")
+
+    def test_cli_stats_single_run(self):
+        paths = self._write_runs([simulate(get("disk-full"),
+                                           DEFAULT_POLICY)])
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["stats"] + paths), 0)
+        out = buf.getvalue()
+        self.assertIn("runs: 1", out)
+        self.assertIn("mean:   96.0/100", out)
+        self.assertNotIn("multiple scenarios", out)
+
+    def test_cli_stats_bad_files_fail(self):
+        missing = os.path.join(tempfile.gettempdir(), "no-such-run.json")
+        self.assertEqual(main(["stats", missing]), 2)
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            handle.write("{not json")
+        self.assertEqual(main(["stats", handle.name]), 2)
+        # No run files at all is an argparse error (exit 2).
+        with self.assertRaises(SystemExit) as caught:
+            main(["stats"])
+        self.assertEqual(caught.exception.code, 2)
 
 
 if __name__ == "__main__":

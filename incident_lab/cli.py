@@ -18,6 +18,7 @@ from .scenarios import (
     SCENARIOS, get, list_scenarios, load_scenario_file, scenario_to_dict,
 )
 from .simulator import simulate, simulate_batch
+from .stats import aggregate_stats
 
 
 def parse_seed_spec(spec: str) -> list:
@@ -256,6 +257,16 @@ def main(argv=None) -> int:
                          help="print the comparison as JSON instead of "
                               "the human-readable diff")
 
+    stats = sub.add_parser(
+        "stats",
+        help="aggregate saved --json runs: score spread, mean response "
+             "times, grade counts, per-scenario means")
+    stats.add_argument("paths", nargs="+", metavar="RUN",
+                       help="paths to JSON files saved from run --json")
+    stats.add_argument("--json", action="store_true",
+                       help="print the summary as JSON instead of the "
+                            "human-readable form")
+
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -333,6 +344,27 @@ def main(argv=None) -> int:
             print(json.dumps(comparison.to_dict(), indent=2))
         else:
             print(comparison.render())
+        return 0
+
+    if args.command == "stats":
+        results = []
+        for path in args.paths:
+            try:
+                results.append(load_result(path))
+            except OSError as exc:
+                print(f"cannot read stats file: {exc}", file=sys.stderr)
+                return 2
+            except json.JSONDecodeError as exc:
+                print(f"invalid stats file: {exc}", file=sys.stderr)
+                return 2
+            except ValueError as exc:
+                print(f"invalid stats file: {exc}", file=sys.stderr)
+                return 2
+        summary = aggregate_stats(results, labels=list(args.paths))
+        if args.json:
+            print(json.dumps(summary.to_dict(), indent=2))
+        else:
+            print(summary.render())
         return 0
 
     if args.command == "run":

@@ -52,6 +52,8 @@ python3 -m incident_lab run disk-full --seed 1 --json > /tmp/run-seed-1.json
 python3 -m incident_lab run disk-full --seed 7 --json > /tmp/run-seed-7.json
 python3 -m incident_lab compare /tmp/run-seed-1.json /tmp/run-seed-7.json
 python3 -m incident_lab compare /tmp/run-seed-1.json /tmp/run-seed-7.json --json
+python3 -m incident_lab stats /tmp/run-seed-1.json /tmp/run-seed-7.json
+python3 -m incident_lab stats /tmp/run-seed-1.json /tmp/run-seed-7.json --json
 python3 -m incident_lab run disk-full --hints 1
 python3 -m incident_lab run disk-full --hints 2 --json
 python3 -m incident_lab template disk-full > my-disk-full.json
@@ -142,6 +144,30 @@ python3 -m incident_lab compare run-seed-1.json run-seed-7.json
 
 A missing file, bad JSON, or a file that is not a saved run fails with
 exit code 2 and an error message.
+
+## Stats
+
+`stats <run.json>...` aggregates any number of saved `run --json` runs
+into a summary: the score spread (mean, median, min, max), the mean
+time-to-ack, time-to-mitigate and time-to-resolve over the runs that
+reached each milestone, how many runs were acked and resolved, total
+and per-run escalations, total hints used, and the grade counts
+(A at 90, B at 75, C at 50, else D). With `--json` the same summary
+prints as JSON instead, including one row per run. Runs spanning
+several scenarios are still aggregated, but the report says plainly
+that the averages mix different incidents, and it breaks the runs down
+by scenario with a per-scenario mean score.
+
+```sh
+python3 -m incident_lab run disk-full --seed 1 --json > run-seed-1.json
+python3 -m incident_lab run disk-full --seed 7 --json > run-seed-7.json
+python3 -m incident_lab stats run-seed-1.json run-seed-7.json
+```
+
+A missing file, bad JSON, or a file that is not a saved run fails with
+exit code 2 and an error message. A batch file from `run --seeds --json`
+is not a single run, so it is rejected the same way; pass the runs
+one by one instead.
 
 ## Incident templates
 
@@ -321,7 +347,9 @@ incident_lab/
   debrief.py     structured postmortem from a saved run
   compare.py     side-by-side diff of two saved runs: score deltas,
                  shared-event time shifts, events only one run has
-  cli.py         list / run / replay / debrief / compare
+  stats.py       aggregate saved runs: score spread, mean response
+                 times, grade counts, per-scenario means
+  cli.py         list / run / replay / debrief / compare / stats
 tests/
   test_incident_lab.py
 scripts/
@@ -382,11 +410,11 @@ human-readable form.
 
 ## Version
 
-0.17.0 — hints: `run --hints N` asks for N hints during a run, drawn in
-order from the scenario's known-good next actions (each scenario carries
-its own, and scenario files can add theirs); each hint costs 5 points
-off the final score and is recorded in `run --json` and shown again by
-`replay`.
+0.18.0 — stats: `stats <run.json>...` aggregates saved runs (score
+spread, mean response times, acked/resolved counts, escalations,
+hints used, grade counts, per-scenario means), human form or `--json`;
+runs spanning several scenarios are flagged and broken down by
+scenario.
 
 ## Roadmap
 
@@ -407,3 +435,4 @@ off the final score and is recorded in `run --json` and shown again by
 - [x] Difficulty ladder: `run --difficulty easy|normal|hard` (or 1/2/3) scales ack timeouts (×1.5 / ×1.0 / ×0.6), scoring targets (ack grace 8/5/3m, mitigate grace 20/15/10m) and the default seeded jitter (0-0 / 0-1 / 0-3), records the difficulty in `run --json`, and `replay`/`debrief` show it (0.15.0)
 - [x] Run comparison: `compare <run-a.json> <run-b.json>` diffs two saved runs side by side (score deltas per metric, timeline diff of shared-event time shifts plus events only one run has), human form or `--json`, flags different scenarios/policies, unreached milestones show as `-` (0.16.0)
 - [x] Hints: `run --hints N` asks for N hints during a run, drawn in order from the scenario's known-good next actions (each built-in scenario carries 2-3, scenario files can add their own, `template` prints them); each hint costs 5 points off the final score and is recorded in `run --json` and shown again by `replay` (0.17.0)
+- [x] Stats: `stats <run.json>...` aggregates saved runs (score spread, mean response times, acked/resolved counts, escalations, hints used, grade counts, per-scenario means), human form or `--json`, flags mixed scenarios (0.18.0)
