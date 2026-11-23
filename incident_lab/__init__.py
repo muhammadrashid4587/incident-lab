@@ -1,3 +1,3 @@
 """incident-lab: an SRE incident simulator with escalation and replay."""
 
-__version__ = "0.10.0"
+__version__ = "0.11.0"

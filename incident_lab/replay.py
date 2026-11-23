@@ -143,6 +143,12 @@ def _score_from_dict(raw) -> Score:
         points=points,
         ack_late_min=ack_late_min,
         ack_credit=_require_number_or_none(data, "ack_credit", "score"),
+        # Saved runs from before 0.11.0 have no delay fields; they
+        # round-trip as null.
+        mitigate_delay_min=_require_int_or_none(
+            data, "mitigate_delay_min", "score"),
+        resolve_delay_min=_require_int_or_none(
+            data, "resolve_delay_min", "score"),
     )
 
 

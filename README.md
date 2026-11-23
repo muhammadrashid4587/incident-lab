@@ -48,7 +48,10 @@ python3 scripts/demo.py
 the human replay: incident, policy (levels with responders and ack
 timeouts), the timeline in time order, and the score. The score carries
 the acking level's lateness (`ack_late_min`, 0 for an on-time ack) and
-the partial credit it kept (`ack_credit`, 1.0 on time). Unreached milestones
+the partial credit it kept (`ack_credit`, 1.0 on time). The score also
+carries the effective mitigate and resolve delays
+(`mitigate_delay_min`, `resolve_delay_min`, `null` when the incident
+was never mitigated or resolved), which vary with `--seed`. Unreached milestones
 serialize as `null` (for example, an incident nobody acks has
 `"time_to_ack_min": null` and `"points": 0`). The top-level `seed` records
 the `--seed` value used for the run, or `null` for an unseeded run, and the
@@ -176,26 +179,36 @@ way, drawn from a random generator seeded with `N`, so the same seed
 replays the same run exactly (same timeline, same score, byte-identical
 `--json` output) while different seeds vary the response times. A miss
 stays a miss, so the seed never changes who acks or how many escalations
-happen — only how quickly the acking responder answers. The seed is
-recorded in the `run --json` output (top-level `seed`) and shown in the
-human-readable output, and `replay` re-prints it from a saved run.
+happen — only how quickly the acking responder answers. The same seeded
+jitter also applies to the mitigate and resolve delays once someone
+acks, drawn from the same generator after the ack draws, so the whole
+incident varies with the seed while staying reproducible; the effective
+delays are recorded in the `run --json` output as
+`score.mitigate_delay_min` and `score.resolve_delay_min` (or `null` for
+an incident nobody acks). The seed is recorded in the `run --json`
+output (top-level `seed`) and shown in the human-readable output, and
+`replay` re-prints it from a saved run.
 
 `run <scenario> --seed N --jitter LO-HI` widens or narrows that jitter:
-each ack delay shifts by a magnitude drawn from `LO` to `HI` minutes,
-with a random sign, from the same seeded generator, so reproducibility
-holds for any range. `--jitter 0-0` means no jitter at all. The default
-is `0-1`, the same as `--seed` alone. `--jitter` requires `--seed`, and
-a bad range (negative bounds, or `LO` greater than `HI`) fails the run
-with exit code 2 and an error message. The range is recorded in the
-`run --json` output (top-level `jitter`, `[lo, hi]`) and shown in the
-human-readable output, and `replay` re-prints it from a saved run.
+each ack, mitigate and resolve delay shifts by a magnitude drawn from
+`LO` to `HI` minutes, with a random sign, from the same seeded
+generator, so reproducibility holds for any range. `--jitter 0-0` means
+no jitter at all. The default is `0-1`, the same as `--seed` alone.
+`--jitter` requires `--seed`, and a bad range (negative bounds, or `LO`
+greater than `HI`) fails the run with exit code 2 and an error
+message. The range is recorded in the `run --json` output (top-level
+`jitter`, `[lo, hi]`) and shown in the human-readable output, and
+`replay` re-prints it from a saved run.
 
 ## Version
 
-0.10.0 — `--jitter LO-HI` for a configurable seeded ack-delay jitter
-range: each ack delay shifts by a magnitude in that range with a random
-sign, keeping `--seed` reproducibility; recorded in `run --json` output
-and re-printed by `replay`.
+0.11.0 — seeded jitter now also applies to the mitigate and resolve
+delays: each step shifts by a magnitude in the `--jitter` range with a
+random sign, drawn from the same seeded generator after the ack draws,
+so the whole incident varies with the seed and stays reproducible; the
+effective delays are recorded in `run --json` as
+`score.mitigate_delay_min` / `score.resolve_delay_min` and round-trip
+through `replay`.
 
 ## Roadmap
 
@@ -209,3 +222,4 @@ and re-printed by `replay`.
 - [x] Late-ack partial credit: linear decay to zero at 2x the timeout (0.8.0)
 - [x] `--seed N` for randomized ack delays: reproducible runs (0.9.0)
 - [x] `--jitter LO-HI` for a configurable seeded ack-delay jitter range (0.10.0)
+- [x] Seeded jitter for mitigate and resolve delays, recorded in JSON, replay round-trips (0.11.0)

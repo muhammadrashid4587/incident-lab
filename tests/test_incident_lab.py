@@ -487,6 +487,7 @@ class TestJsonOutput(unittest.TestCase):
 
     def test_score_to_dict_known_values(self):
         # disk-full: ack 3m, mitigate 23m, resolve 35m, no escalations, 96.
+        # The mitigate delay is 20m (23-3) and the resolve delay 12m.
         score = simulate(get("disk-full"), DEFAULT_POLICY).score.to_dict()
         self.assertEqual(score, {
             "time_to_ack_min": 3,
@@ -497,6 +498,8 @@ class TestJsonOutput(unittest.TestCase):
             "points": 96,
             "ack_late_min": 0,
             "ack_credit": 1.0,
+            "mitigate_delay_min": 20,
+            "resolve_delay_min": 12,
         })
 
     def test_result_to_dict_unacked_serializes_nulls(self):
@@ -1086,6 +1089,164 @@ class TestJitterRange(unittest.TestCase):
         self.addCleanup(os.unlink, path.name)
         with self.assertRaises(ValueError):
             load_result(path.name)
+
+
+class TestSeededMitigateResolveDelays(unittest.TestCase):
+    def _scenario(self, mitigate, resolve):
+        return Scenario(
+            name="delays", service="svc", title="delays", severity="high",
+            description="", ack_delay_min=(3, None, None),
+            mitigate_delay_min=mitigate, resolve_delay_min=resolve,
+        )
+
+    def test_same_seed_reproduces_identical_delays(self):
+        first = simulate(get("disk-full"), DEFAULT_POLICY, seed=7,
+                         jitter=(0, 3))
+        second = simulate(get("disk-full"), DEFAULT_POLICY, seed=7,
+                          jitter=(0, 3))
+        self.assertEqual(first.to_dict(), second.to_dict())
+        self.assertEqual(first.score.mitigate_delay_min,
+                         second.score.mitigate_delay_min)
+        self.assertEqual(first.score.resolve_delay_min,
+                         second.score.resolve_delay_min)
+
+    def test_different_seeds_vary_mitigate_and_resolve_delays(self):
+        # disk-full fixes mitigate at 20m and resolve at 12m; across
+        # many seeds the seeded jitter must move both.
+        mitigates = {
+            simulate(get("disk-full"), DEFAULT_POLICY, seed=seed)
+            .score.mitigate_delay_min
+            for seed in range(30)
+        }
+        resolves = {
+            simulate(get("disk-full"), DEFAULT_POLICY, seed=seed)
+            .score.resolve_delay_min
+            for seed in range(30)
+        }
+        self.assertGreater(len(mitigates), 1)
+        self.assertGreater(len(resolves), 1)
+
+    def test_seeded_delays_stay_within_jitter_of_fixed_delays(self):
+        # Default jitter 0-1: mitigate 20 -> 19..21, resolve 12 -> 11..13.
+        for seed in range(30):
+            result = simulate(get("disk-full"), DEFAULT_POLICY, seed=seed)
+            self.assertIn(result.score.mitigate_delay_min, (19, 20, 21))
+            self.assertIn(result.score.resolve_delay_min, (11, 12, 13))
+
+    def test_wider_jitter_moves_delays_further(self):
+        # Fixed mitigate 20, resolve 12, jitter 2-3: mitigate lands at
+        # 17, 18, 22 or 23 and resolve at 9, 10, 14 or 15.
+        mitigates = {
+            simulate(get("disk-full"), DEFAULT_POLICY, seed=seed,
+                     jitter=(2, 3)).score.mitigate_delay_min
+            for seed in range(30)
+        }
+        resolves = {
+            simulate(get("disk-full"), DEFAULT_POLICY, seed=seed,
+                     jitter=(2, 3)).score.resolve_delay_min
+            for seed in range(30)
+        }
+        self.assertTrue(mitigates <= {17, 18, 22, 23},
+                        f"unexpected mitigate delays: {mitigates}")
+        self.assertTrue(resolves <= {9, 10, 14, 15},
+                        f"unexpected resolve delays: {resolves}")
+        self.assertGreater(len(mitigates), 1)
+        self.assertGreater(len(resolves), 1)
+
+    def test_jitter_zero_zero_keeps_fixed_delays(self):
+        for seed in range(10):
+            result = simulate(get("disk-full"), DEFAULT_POLICY, seed=seed,
+                              jitter=(0, 0))
+            self.assertEqual(result.score.mitigate_delay_min, 20)
+            self.assertEqual(result.score.resolve_delay_min, 12)
+
+    def test_unseeded_run_uses_fixed_delays(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY)
+        self.assertEqual(result.score.mitigate_delay_min, 20)
+        self.assertEqual(result.score.resolve_delay_min, 12)
+        self.assertIsNone(result.seed)
+
+    def test_seeded_delays_never_below_one_minute(self):
+        # Mitigate 2m and resolve 1m with a wide jitter: the clamp keeps
+        # both steps at least 1 minute long.
+        for seed in range(30):
+            result = simulate(self._scenario(2, 1), DEFAULT_POLICY,
+                              seed=seed, jitter=(0, 5))
+            self.assertGreaterEqual(result.score.mitigate_delay_min, 1)
+            self.assertGreaterEqual(result.score.resolve_delay_min, 1)
+
+    def test_delays_recorded_in_json_output(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--seed", "7", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        score = data["score"]
+        self.assertIsInstance(score["mitigate_delay_min"], int)
+        self.assertIsInstance(score["resolve_delay_min"], int)
+        # The recorded delays agree with the timeline: mitigate lands
+        # ack + mitigate delay after t=0, resolve after that.
+        self.assertEqual(
+            score["mitigate_delay_min"],
+            score["time_to_mitigate_min"] - score["time_to_ack_min"])
+        self.assertEqual(
+            score["resolve_delay_min"],
+            score["time_to_resolve_min"] - score["time_to_mitigate_min"])
+
+    def test_unseeded_json_records_fixed_delays(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "disk-full", "--json"]), 0)
+        score = json.loads(buf.getvalue())["score"]
+        self.assertEqual(score["mitigate_delay_min"], 20)
+        self.assertEqual(score["resolve_delay_min"], 12)
+
+    def test_seeded_unacked_run_records_null_delays(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        result = simulate(scenario, DEFAULT_POLICY, seed=3)
+        self.assertIsNone(result.score.mitigate_delay_min)
+        self.assertIsNone(result.score.resolve_delay_min)
+
+    def test_seeded_delays_replay_round_trip(self):
+        original = simulate(get("disk-full"), DEFAULT_POLICY, seed=7,
+                            jitter=(0, 3))
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(original.to_dict(), path)
+        self.addCleanup(os.unlink, path.name)
+        loaded = load_result(path.name)
+        self.assertEqual(loaded.score.mitigate_delay_min,
+                         original.score.mitigate_delay_min)
+        self.assertEqual(loaded.score.resolve_delay_min,
+                         original.score.resolve_delay_min)
+        self.assertEqual(loaded.to_dict(), original.to_dict())
+        replay_buf = io.StringIO()
+        with redirect_stdout(replay_buf):
+            self.assertEqual(main(["replay", path.name]), 0)
+        run_buf = io.StringIO()
+        with redirect_stdout(run_buf):
+            self.assertEqual(main(["run", "disk-full", "--seed", "7",
+                                   "--jitter", "0-3"]), 0)
+        self.assertEqual(replay_buf.getvalue(), run_buf.getvalue())
+
+    def test_replay_file_without_delay_fields_loads_as_null(self):
+        # Saved runs from before 0.11.0 have no delay fields.
+        data = simulate(get("disk-full"), DEFAULT_POLICY).to_dict()
+        del data["score"]["mitigate_delay_min"]
+        del data["score"]["resolve_delay_min"]
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(data, path)
+        self.addCleanup(os.unlink, path.name)
+        loaded = load_result(path.name)
+        self.assertIsNone(loaded.score.mitigate_delay_min)
+        self.assertIsNone(loaded.score.resolve_delay_min)
 
 
 if __name__ == "__main__":

@@ -35,7 +35,20 @@ LATE_ACK_CREDIT_WINDOW = 2
 # seed replays the same run while different seeds vary the response
 # times. The jitter is small enough that a scenario's structure (who
 # acks, who misses) never changes. --jitter LO-HI overrides the range.
+# The same jitter, from the same RNG, also applies to the mitigate and
+# resolve delays once someone acks, so the whole incident varies with
+# the seed while staying reproducible.
 DEFAULT_JITTER_RANGE = (0, 1)
+
+
+def _jitter_delay(rng, delay_min: int, jitter_range: tuple) -> int:
+    """Shift a delay by a magnitude in ``jitter_range`` with a random sign.
+
+    Drawn from the seeded ``rng``; never below 1 minute, so a step can
+    shrink but never vanish or run backwards.
+    """
+    magnitude = rng.randint(jitter_range[0], jitter_range[1])
+    return max(1, delay_min + rng.choice((-1, 1)) * magnitude)
 
 
 def late_ack_credit(ack_delay_min: int, ack_timeout_min: int) -> float:
@@ -65,6 +78,11 @@ class Score:
     # Fraction of the score a late ack keeps: 1.0 on time, decaying
     # linearly to 0.0 at twice the timeout; None if nobody acked.
     ack_credit: object = None
+    # Minutes from ack to mitigated, and from mitigated to resolved
+    # (the effective delays, after any seeded jitter); None if the
+    # incident was never mitigated / resolved.
+    mitigate_delay_min: object = None
+    resolve_delay_min: object = None
 
     def to_dict(self) -> dict:
         """JSON-ready dict; unreached milestones serialize as null."""
@@ -77,6 +95,8 @@ class Score:
             "points": self.points,
             "ack_late_min": self.ack_late_min,
             "ack_credit": self.ack_credit,
+            "mitigate_delay_min": self.mitigate_delay_min,
+            "resolve_delay_min": self.resolve_delay_min,
         }
 
 
@@ -139,8 +159,12 @@ def simulate(
     ``random.Random`` seeded with ``seed`` — so the same seed replays
     the same run exactly while different seeds vary the response times.
     A miss (``None`` delay) stays a miss, so the scenario's escalation
-    structure is unchanged. Without a seed the scenario's fixed delays
-    are used and ``jitter`` is ignored.
+    structure is unchanged. The same seeded jitter also applies to the
+    mitigate and resolve delays once someone acks, drawn from the same
+    RNG after the ack draws, so the whole incident varies with the seed
+    and stays reproducible; the effective delays are recorded in the
+    score (``mitigate_delay_min`` / ``resolve_delay_min``). Without a
+    seed the scenario's fixed delays are used and ``jitter`` is ignored.
     """
     if seed is not None:
         if jitter is None:
@@ -179,8 +203,7 @@ def simulate(
         if delay is not None and rng is not None:
             # Jitter the ack delay by a magnitude in the jitter range
             # with a random sign, never below 1 minute.
-            magnitude = rng.randint(jitter_range[0], jitter_range[1])
-            delay = max(1, delay + rng.choice((-1, 1)) * magnitude)
+            delay = _jitter_delay(rng, delay, jitter_range)
         if delay is not None:
             # The responder acks, on time or late. A late ack still counts:
             # the incident proceeds, but the score is scaled by partial
@@ -219,8 +242,19 @@ def simulate(
                 seed=seed, jitter=jitter_range,
             )
 
-    mitigated_at = acked_at + scenario.mitigate_delay_min
-    resolved_at = mitigated_at + scenario.resolve_delay_min
+    if rng is not None:
+        # Jitter the mitigate and resolve delays from the same seeded
+        # RNG (after the ack draws), so the whole incident varies with
+        # the seed and stays reproducible for it.
+        mitigate_delay = _jitter_delay(rng, scenario.mitigate_delay_min,
+                                       jitter_range)
+        resolve_delay = _jitter_delay(rng, scenario.resolve_delay_min,
+                                      jitter_range)
+    else:
+        mitigate_delay = scenario.mitigate_delay_min
+        resolve_delay = scenario.resolve_delay_min
+    mitigated_at = acked_at + mitigate_delay
+    resolved_at = mitigated_at + resolve_delay
     timeline.record(mitigated_at, "mitigated", acked_by)
     timeline.record(resolved_at, "resolved", acked_by)
 
@@ -240,6 +274,8 @@ def simulate(
         points=points,
         ack_late_min=ack_late_min,
         ack_credit=ack_credit,
+        mitigate_delay_min=mitigate_delay,
+        resolve_delay_min=resolve_delay,
     )
     return SimulationResult(incident, policy, timeline, score, seed=seed,
                             jitter=jitter_range)
