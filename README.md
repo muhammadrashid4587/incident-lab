@@ -76,6 +76,9 @@ printf 'ack 3\nmitigate 20\nresolve 12\n' | python3 -m incident_lab drill disk-f
 python3 -m incident_lab drill latency-spike --difficulty hard
 python3 -m incident_lab replay /tmp/drill.json
 python3 -m incident_lab debrief /tmp/drill.json
+printf 'ack 3\nmitigate 20\nresolve 12\n' | python3 -m incident_lab drill disk-full --operator ana
+python3 -m incident_lab history --operator ana
+python3 -m incident_lab history
 python3 scripts/demo.py
 ```
 
@@ -490,7 +493,9 @@ The timeouts, the late-ack credit and the scoring are the same as
 same. `disk-full` drilled as `ack 3`, `mitigate 20`, `resolve 12`
 scores 96, the same as `run disk-full`. The scenario's fixed
 ack/mitigate/resolve delays are the behaviour `run` plays, not the
-drill's — the drill's delays are your decisions. `drill` takes the
+drill's — the drill's delays are your decisions. `drill --operator
+NAME` records the drill in the operator's history — see Drill
+history below. `drill` takes the
 same `--policy`, `--policy-file`, `--scenario-file`,
 `--ack-timeout(s)`, `--difficulty` and `--hints N` as `run` (hints
 are asked for up front, in order, 5 points each — or mid-drill with
@@ -526,6 +531,43 @@ python3 -m incident_lab replay drill.json
 python3 -m incident_lab debrief drill.json
 python3 -m incident_lab compare drill.json run.json
 ```
+
+## Drill history
+
+`drill --operator NAME` records the finished drill — or a drill
+ended early with `quit` or EOF, flagged as abandoned — in a history
+file, so an operator can see whether their practice is paying off.
+`history --operator NAME` lists that operator's runs in order with
+their scores, grades and response times, plus a summary: runs, mean
+and best score, first score vs latest score, and a trend — improving,
+declining or steady, from the mean of the second half of their runs
+against the mean of the first half (with fewer than two runs there is
+nothing to compare yet). Plain `history` summarises every operator
+the file knows about, one line each. With `--json` either view prints
+as JSON instead.
+
+The history file is `~/.incident-lab/history.json` by default; point
+at a different file with `--history-file PATH` on both `drill` and
+`history` (for example, one file per team or per training cohort).
+A drill without `--operator` records nothing, and `--history-file`
+without `--operator` fails with exit code 2 — history is only kept
+for a named operator. A missing history file just means no drills
+recorded yet; a corrupt one fails with exit code 2 and an error
+message. Only drills are recorded: `run` plays a scenario's fixed
+behaviour, not an operator's decisions, so there is nothing to learn
+from attributing it.
+
+```sh
+printf 'ack 3\nmitigate 20\nresolve 12\n' | python3 -m incident_lab drill disk-full --operator ana
+python3 -m incident_lab history --operator ana
+python3 -m incident_lab history
+python3 -m incident_lab history --operator ana --json
+```
+
+Example: ana drills `disk-full` three times, scoring 50, then 70,
+then 90 — `history --operator ana` shows all three runs and
+summarises them as mean 70/100, best 90/100, first → latest 50 → 90
+(+40 pts), trend improving.
 
 ## Difficulty ladder
 
@@ -579,8 +621,13 @@ incident_lab/
                  timeouts, late-ack credit and scoring as run, with
                  scripted input (--input / piped stdin) and a clean
                  quit/EOF path that records a partial run
+  history.py     per-operator drill history: record a drill run under
+                 an operator name (`drill --operator NAME`), read it
+                 back with `history` — one operator's runs and
+                 improvement over time, or an overview of all
+                 operators — as human text or --json
   cli.py         list / template / policy-template / run / drill /
-                 replay / debrief / compare / stats / what-if
+                 history / replay / debrief / compare / stats / what-if
 tests/
   test_incident_lab.py
 scripts/
@@ -641,6 +688,19 @@ human-readable form.
 
 ## Version
 
+0.25.0 — per-operator drill history: `drill --operator NAME` records
+the drill (finished or abandoned) in a history file
+(`~/.incident-lab/history.json` by default, `--history-file PATH` to
+point elsewhere), and `history --operator NAME` shows that operator's
+runs in order with their scores, grades and response times, plus a
+summary — runs, mean and best score, first score vs latest, and a
+trend (improving / declining / steady, from the second half of their
+runs against the first); plain `history` summarises every operator,
+one line each, and `--json` prints either view as JSON. A drill
+without `--operator` records nothing; only drills are recorded, never
+`run`, because `run` plays fixed behaviour, not an operator's
+decisions.
+
 0.24.0 — interactive `hint` during a drill: type `hint` at any drill
 prompt to ask for the scenario's next known-good action when stuck,
 drawn in order and continuing after any hints asked for up front
@@ -693,3 +753,4 @@ resolved instead of claiming nobody acked.
 - [x] Policy template command: `policy-template [name]` prints a built-in policy as a starter JSON policy file (or writes it with `--out PATH`), ready to edit and pass back with `--policy-file`; the template is validated through the policy loader so it always loads cleanly (0.22.0)
 - [x] Interactive drill mode: `drill <scenario>` plays an incident step by step with the operator deciding when to ack, mitigate and resolve (`ack N` / `wait`, `mitigate N`, `resolve N`, `quit`), same timeouts, late-ack credit and scoring as `run`; scripted input via `--input PATH` or piped stdin, prompts on stderr so `drill --json` stays parseable, `--out PATH` writes the JSON result, and quit/EOF ends the drill cleanly with a partial run (timeline plus an `abandoned` event, scored on the milestones reached) in the same JSON shape as `run`, so `replay`, `debrief`, `compare` and `stats` all work on drill runs (0.23.0)
 - [x] Interactive `hint` during a drill: type `hint` at any drill prompt to ask for the scenario's next known-good action when stuck (costs 5 points, like `run --hints`), drawn in order and continuing after any up-front `--hints`, printed with the next milestone and what the scoring rewards at that point, and recorded in the drill's JSON exactly like an up-front hint, so `replay`, `debrief`, `compare` and `stats` all work on drill runs with mid-drill hints (0.24.0)
+- [x] Per-operator drill history: `drill --operator NAME` records the drill (finished or abandoned) in a history file (`~/.incident-lab/history.json` by default, `--history-file PATH` to point elsewhere), and `history --operator NAME` shows that operator's runs in order with scores, grades and response times plus a summary (runs, mean and best score, first vs latest, trend from the second half of runs against the first); plain `history` summarises every operator, `--json` prints either view as JSON, and a drill without `--operator` records nothing (0.25.0)

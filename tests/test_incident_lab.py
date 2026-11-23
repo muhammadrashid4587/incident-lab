@@ -18,6 +18,10 @@ from incident_lab.difficulty import (
     parse_difficulty,
 )
 from incident_lab.drill import run_drill
+from incident_lab.history import (
+    entry_from_result, load_history, record_run, render_all_operators,
+    summarize_all, summarize_operator,
+)
 from incident_lab.policy import (
     DEFAULT_POLICY, EscalationPolicy, Level, Responder, get_policy,
     list_policies, load_policy_file, parse_ack_timeout_overrides,
@@ -3342,6 +3346,289 @@ class TestDrill(unittest.TestCase):
         self.assertEqual(len(data["hints"]), 1)
         self.assertIn("Check WAL archiving", data["hints"][0]["text"])
         self.assertIn("Check WAL archiving", err.getvalue())
+
+
+class TestHistory(unittest.TestCase):
+    def _write_decisions(self, decisions):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".txt", delete=False, encoding="utf-8")
+        with handle:
+            handle.write(decisions)
+        return handle.name
+
+    def _drill_result(self, decisions, scenario="disk-full", **kwargs):
+        stream = io.StringIO(decisions)
+        return run_drill(get(scenario), DEFAULT_POLICY,
+                         input_stream=stream,
+                         prompt_stream=io.StringIO(), **kwargs)
+
+    def _write_history(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        handle.write(json.dumps(data))
+        handle.close()
+        return handle.name
+
+    def test_entry_from_finished_drill(self):
+        result = self._drill_result("ack 3\nmitigate 20\nresolve 12\n")
+        entry = entry_from_result(result, "ana",
+                                  recorded_at="2026-11-23T12:00:00+00:00")
+        self.assertEqual(entry.operator, "ana")
+        self.assertEqual(entry.scenario, "disk-full")
+        self.assertEqual(entry.difficulty, "normal")
+        self.assertEqual(entry.policy, "standard")
+        self.assertEqual(entry.points, 96)
+        self.assertEqual(entry.grade, "A")
+        self.assertEqual(entry.time_to_ack_min, 3)
+        self.assertEqual(entry.time_to_mitigate_min, 23)
+        self.assertEqual(entry.time_to_resolve_min, 35)
+        self.assertEqual(entry.escalations, 0)
+        self.assertTrue(entry.resolved)
+        self.assertFalse(entry.abandoned)
+        self.assertEqual(entry.hints_used, 0)
+
+    def test_entry_from_abandoned_drill_is_flagged(self):
+        result = self._drill_result("ack 3\nquit\n")
+        entry = entry_from_result(result, "ana")
+        self.assertTrue(entry.abandoned)
+        self.assertFalse(entry.resolved)
+        self.assertEqual(entry.time_to_ack_min, 3)
+        self.assertIsNone(entry.time_to_mitigate_min)
+
+    def test_entry_from_unacked_drill_scores_zero(self):
+        result = self._drill_result("wait\nwait\nwait\n")
+        entry = entry_from_result(result, "ana")
+        self.assertEqual(entry.points, 0)
+        self.assertEqual(entry.grade, "D")
+        self.assertIsNone(entry.time_to_ack_min)
+        self.assertFalse(entry.abandoned)
+
+    def test_record_and_load_round_trips(self):
+        path = os.path.join(tempfile.mkdtemp(), "history.json")
+        entry = entry_from_result(
+            self._drill_result("ack 3\nmitigate 20\nresolve 12\n"), "ana",
+            recorded_at="2026-11-23T12:00:00+00:00")
+        record_run(path, entry)
+        record_run(path, entry_from_result(
+            self._drill_result("wait\nack 4\nmitigate 35\nresolve 20\n",
+                               scenario="latency-spike"), "ben",
+            recorded_at="2026-11-23T13:00:00+00:00"))
+        entries = load_history(path)
+        self.assertEqual(len(entries), 2)
+        self.assertEqual(entries[0], entry)
+        self.assertEqual(entries[1].operator, "ben")
+        self.assertEqual(entries[1].scenario, "latency-spike")
+
+    def test_load_missing_history_is_empty(self):
+        self.assertEqual(
+            load_history(os.path.join(tempfile.mkdtemp(), "nope.json")),
+            [])
+
+    def test_load_bad_json_fails(self):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        handle.write("{not json")
+        handle.close()
+        with self.assertRaises(json.JSONDecodeError):
+            load_history(handle.name)
+
+    def test_load_wrong_version_fails(self):
+        path = self._write_history({"version": 99, "runs": []})
+        with self.assertRaises(ValueError):
+            load_history(path)
+
+    def test_load_invalid_entry_fails(self):
+        entry = entry_from_result(
+            self._drill_result("ack 3\nmitigate 20\nresolve 12\n"), "ana")
+        data = {"version": 1, "runs": [entry.to_dict()]}
+        data["runs"][0]["points"] = "ninety-six"
+        with self.assertRaises(ValueError):
+            load_history(self._write_history(data))
+
+    def test_summarize_operator_tracks_improvement(self):
+        # Scores 50, 70, 90: first half mean 50, second half mean 80.
+        entries = []
+        for index, points in enumerate((50, 70, 90)):
+            base = entry_from_result(
+                self._drill_result("ack 3\nmitigate 20\nresolve 12\n"),
+                "ana", recorded_at=f"2026-11-2{index}T12:00:00+00:00")
+            entries.append(replace(base, points=points,
+                                   grade=grade(points)))
+        summary = summarize_operator(entries, "ana")
+        self.assertEqual(summary.runs, 3)
+        self.assertEqual(summary.points_mean, 70)
+        self.assertEqual(summary.points_best, 90)
+        self.assertEqual(summary.points_first, 50)
+        self.assertEqual(summary.points_latest, 90)
+        self.assertEqual(summary.points_delta, 40)
+        self.assertEqual(summary.trend, "improving")
+        self.assertEqual(summary.mean_time_to_ack_min, 3)
+        self.assertEqual(summary.resolved, 3)
+        self.assertEqual(summary.abandoned, 0)
+        rendered = summary.render(entries)
+        self.assertIn("ana (3 drill(s))", rendered)
+        self.assertIn("first -> latest: 50 -> 90 (+40 pts)", rendered)
+        self.assertIn("trend: improving", rendered)
+
+    def test_summarize_operator_declining_and_steady(self):
+        def _entries(points_list):
+            entries = []
+            for index, points in enumerate(points_list):
+                base = entry_from_result(
+                    self._drill_result("ack 3\nmitigate 20\nresolve 12\n"),
+                    "ana")
+                entries.append(replace(base, points=points,
+                                       grade=grade(points)))
+            return entries
+        self.assertEqual(
+            summarize_operator(_entries((90, 70, 50)), "ana").trend,
+            "declining")
+        self.assertEqual(
+            summarize_operator(_entries((80, 80, 80)), "ana").trend,
+            "steady")
+
+    def test_summarize_single_run_has_no_trend(self):
+        entry = entry_from_result(
+            self._drill_result("ack 3\nmitigate 20\nresolve 12\n"), "ana")
+        summary = summarize_operator([entry], "ana")
+        self.assertEqual(summary.trend, "not enough runs yet")
+        self.assertEqual(summary.points_delta, 0)
+
+    def test_summarize_unknown_operator_fails(self):
+        entry = entry_from_result(
+            self._drill_result("ack 3\nmitigate 20\nresolve 12\n"), "ana")
+        with self.assertRaises(ValueError):
+            summarize_operator([entry], "ben")
+
+    def test_summarize_all_lists_operators_in_first_run_order(self):
+        entries = [
+            entry_from_result(
+                self._drill_result("ack 3\nmitigate 20\nresolve 12\n"),
+                "ana"),
+            entry_from_result(
+                self._drill_result("ack 3\nmitigate 20\nresolve 12\n"),
+                "ben"),
+            entry_from_result(
+                self._drill_result("ack 3\nmitigate 20\nresolve 12\n"),
+                "ana"),
+        ]
+        summaries = summarize_all(entries)
+        self.assertEqual([s.operator for s in summaries], ["ana", "ben"])
+        self.assertEqual(summaries[0].runs, 2)
+        self.assertEqual(summaries[1].runs, 1)
+        overview = render_all_operators(summaries)
+        self.assertIn("ana", overview)
+        self.assertIn("2 drill(s)", overview)
+        self.assertIn("ben", overview)
+
+    def test_cli_drill_with_operator_records_history(self):
+        decisions = self._write_decisions(
+            "ack 3\nmitigate 20\nresolve 12\n")
+        history_path = os.path.join(tempfile.mkdtemp(), "history.json")
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(
+                main(["drill", "disk-full", "--input", decisions,
+                      "--operator", "ana", "--history-file", history_path,
+                      "--json"]), 0)
+        # Stdout stays clean JSON; the recording note goes to stderr.
+        self.assertEqual(json.loads(out.getvalue())["score"]["points"], 96)
+        self.assertIn("recorded drill for operator 'ana'", err.getvalue())
+        entries = load_history(history_path)
+        self.assertEqual(len(entries), 1)
+        self.assertEqual(entries[0].operator, "ana")
+        self.assertEqual(entries[0].points, 96)
+
+    def test_cli_drill_without_operator_records_nothing(self):
+        from unittest import mock
+        decisions = self._write_decisions(
+            "ack 3\nmitigate 20\nresolve 12\n")
+        history_path = os.path.join(tempfile.mkdtemp(), "history.json")
+        with mock.patch("incident_lab.cli.DEFAULT_HISTORY_PATH",
+                        history_path), \
+                redirect_stdout(io.StringIO()), \
+                redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["drill", "disk-full", "--input", decisions]), 0)
+        self.assertFalse(os.path.exists(history_path))
+
+    def test_cli_drill_history_file_without_operator_fails(self):
+        decisions = self._write_decisions(
+            "ack 3\nmitigate 20\nresolve 12\n")
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["drill", "disk-full", "--input", decisions,
+                      "--history-file", "/tmp/history.json"]), 2)
+
+    def test_cli_history_operator_view(self):
+        decisions = self._write_decisions(
+            "ack 3\nmitigate 20\nresolve 12\n")
+        history_path = os.path.join(tempfile.mkdtemp(), "history.json")
+        for _ in range(2):
+            with redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    main(["drill", "disk-full", "--input", decisions,
+                          "--operator", "ana",
+                          "--history-file", history_path]), 0)
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["history", "--operator", "ana",
+                      "--history-file", history_path]), 0)
+        self.assertIn("ana (2 drill(s))", out.getvalue())
+        self.assertIn("96/100", out.getvalue())
+        self.assertIn("trend: steady", out.getvalue())
+
+    def test_cli_history_overview_and_json(self):
+        decisions = self._write_decisions(
+            "ack 3\nmitigate 20\nresolve 12\n")
+        history_path = os.path.join(tempfile.mkdtemp(), "history.json")
+        for operator in ("ana", "ben"):
+            with redirect_stdout(io.StringIO()), \
+                    redirect_stderr(io.StringIO()):
+                self.assertEqual(
+                    main(["drill", "disk-full", "--input", decisions,
+                          "--operator", operator,
+                          "--history-file", history_path]), 0)
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["history", "--history-file", history_path]), 0)
+        self.assertIn("ana", out.getvalue())
+        self.assertIn("ben", out.getvalue())
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["history", "--operator", "ana",
+                      "--history-file", history_path, "--json"]), 0)
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["summary"]["operator"], "ana")
+        self.assertEqual(len(data["runs"]), 1)
+
+    def test_cli_history_empty_file_reports_no_drills(self):
+        out = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["history", "--history-file",
+                      os.path.join(tempfile.mkdtemp(), "history.json")]),
+                0)
+        self.assertIn("no drills recorded yet", out.getvalue())
+
+    def test_cli_history_unknown_operator_fails(self):
+        decisions = self._write_decisions(
+            "ack 3\nmitigate 20\nresolve 12\n")
+        history_path = os.path.join(tempfile.mkdtemp(), "history.json")
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["drill", "disk-full", "--input", decisions,
+                      "--operator", "ana",
+                      "--history-file", history_path]), 0)
+        with redirect_stderr(io.StringIO()):
+            self.assertEqual(
+                main(["history", "--operator", "ben",
+                      "--history-file", history_path]), 2)
 
 
 if __name__ == "__main__":

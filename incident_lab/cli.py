@@ -11,6 +11,10 @@ from .difficulty import (
     apply_difficulty, list_difficulties, parse_difficulty,
 )
 from .drill import run_drill
+from .history import (
+    DEFAULT_HISTORY_PATH, entry_from_result, load_history, record_run,
+    render_all_operators, summarize_all, summarize_operator,
+)
 from .policy import (
     POLICIES, list_policies, load_policy_file, parse_ack_timeout_overrides,
     policy_template,
@@ -399,6 +403,32 @@ def main(argv=None) -> int:
     drill.add_argument("--out", default=None, metavar="PATH",
                        help="write the result as JSON to this file as "
                             "well as printing it")
+    drill.add_argument("--operator", default=None, metavar="NAME",
+                       help="record this drill in the operator history "
+                            "under NAME, so `history --operator NAME` "
+                            "can show the operator's runs and "
+                            "improvement over time; without it the "
+                            "drill is not recorded")
+    drill.add_argument("--history-file", default=None, metavar="PATH",
+                       help="history file to record this drill in "
+                            "(default ~/.incident-lab/history.json); "
+                            "needs --operator")
+
+    history = sub.add_parser(
+        "history",
+        help="show recorded drill history: every operator's runs and "
+             "improvement over time, or one operator's runs with "
+             "`history --operator NAME` (drills are recorded with "
+             "`drill --operator NAME`)")
+    history.add_argument("--operator", default=None, metavar="NAME",
+                         help="show one operator's runs and summary "
+                              "instead of the overview of all operators")
+    history.add_argument("--history-file", default=None, metavar="PATH",
+                         help="history file to read "
+                              "(default ~/.incident-lab/history.json)")
+    history.add_argument("--json", action="store_true",
+                         help="print the history as JSON instead of the "
+                              "human-readable form")
 
     replay = sub.add_parser(
         "replay",
@@ -523,6 +553,54 @@ def main(argv=None) -> int:
                   f"to {args.out}")
             return 0
         print(text)
+        return 0
+
+    if args.command == "history":
+        history_path = args.history_file or DEFAULT_HISTORY_PATH
+        try:
+            entries = load_history(history_path)
+        except OSError as exc:
+            print(f"cannot read history file: {exc}", file=sys.stderr)
+            return 2
+        except json.JSONDecodeError as exc:
+            print(f"invalid history file: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"invalid history file: {exc}", file=sys.stderr)
+            return 2
+        if not entries:
+            print("no drills recorded yet — record one with "
+                  "`drill --operator NAME`")
+            return 0
+        if args.operator is not None:
+            operator = args.operator.strip()
+            if not operator:
+                print("--operator must name an operator", file=sys.stderr)
+                return 2
+            try:
+                summary = summarize_operator(entries, operator)
+            except ValueError as exc:
+                print(exc, file=sys.stderr)
+                return 2
+            operator_entries = [entry for entry in entries
+                                if entry.operator == operator]
+            if args.json:
+                print(json.dumps({
+                    "summary": summary.to_dict(),
+                    "runs": [entry.to_dict()
+                             for entry in operator_entries],
+                }, indent=2))
+            else:
+                print(summary.render(operator_entries))
+            return 0
+        summaries = summarize_all(entries)
+        if args.json:
+            print(json.dumps({
+                "operators": [summary.to_dict()
+                              for summary in summaries],
+            }, indent=2))
+        else:
+            print(render_all_operators(summaries))
         return 0
 
     if args.command == "replay":
@@ -720,6 +798,13 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "drill":
+        if args.operator is not None and not args.operator.strip():
+            print("--operator must name an operator", file=sys.stderr)
+            return 2
+        if args.history_file is not None and args.operator is None:
+            print("--history-file needs --operator: history is only "
+                  "recorded for a named operator", file=sys.stderr)
+            return 2
         resolved = _resolve_scenario_policy(args)
         if resolved is None:
             return 2
@@ -744,6 +829,20 @@ def main(argv=None) -> int:
         finally:
             if input_file is not None:
                 input_file.close()
+        if args.operator is not None:
+            history_path = args.history_file or DEFAULT_HISTORY_PATH
+            try:
+                record_run(history_path,
+                           entry_from_result(result, args.operator.strip()))
+            except (OSError, ValueError) as exc:
+                # The drill itself ran fine; a history write failure
+                # is a warning, not a failed drill.
+                print(f"warning: could not record drill history: {exc}",
+                      file=sys.stderr)
+            else:
+                print(f"recorded drill for operator "
+                      f"{args.operator.strip()!r} in {history_path}",
+                      file=sys.stderr)
         if args.out is not None:
             try:
                 with open(args.out, "w", encoding="utf-8") as handle:
