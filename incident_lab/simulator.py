@@ -30,11 +30,12 @@ ESCALATION_PENALTY = 15
 # A late ack earns partial credit that decays linearly to zero when the
 # ack delay reaches this many times the level's ack timeout.
 LATE_ACK_CREDIT_WINDOW = 2
-# With --seed, each ack delay is jittered by this many minutes either way
-# (drawn from a seeded RNG), so the same seed replays the same run while
-# different seeds vary the response times. The jitter is small enough
-# that a scenario's structure (who acks, who misses) never changes.
-SEED_JITTER_MIN = 1
+# With --seed, each ack delay is jittered by a magnitude drawn from this
+# range (minutes) with a random sign, from a seeded RNG, so the same
+# seed replays the same run while different seeds vary the response
+# times. The jitter is small enough that a scenario's structure (who
+# acks, who misses) never changes. --jitter LO-HI overrides the range.
+DEFAULT_JITTER_RANGE = (0, 1)
 
 
 def late_ack_credit(ack_delay_min: int, ack_timeout_min: int) -> float:
@@ -88,11 +89,16 @@ class SimulationResult:
     # RNG seed used to jitter ack delays, or None for the fixed scenario
     # delays. Recorded so a seeded run can be reproduced exactly.
     seed: object = None
+    # Jitter range (lo, hi) in minutes applied to ack delays, or None
+    # for an unseeded run. Recorded alongside the seed for replay.
+    jitter: object = None
 
     def to_dict(self) -> dict:
         """JSON-ready dict of the whole result: incident, policy, timeline, score."""
         return {
             "seed": self.seed,
+            "jitter": (list(self.jitter) if self.jitter is not None
+                       else None),
             "incident": {
                 "id": self.incident.id,
                 "service": self.incident.service,
@@ -123,16 +129,34 @@ def simulate(
     policy: EscalationPolicy,
     max_duration_min: int = 240,
     seed: object = None,
+    jitter: object = None,
 ) -> SimulationResult:
     """Run one scenario against one policy and return the full result.
 
-    With ``seed`` given, each ack delay is jittered by up to
-    ``SEED_JITTER_MIN`` minutes either way, drawn from a ``random.Random``
-    seeded with ``seed`` — so the same seed replays the same run exactly
-    while different seeds vary the response times. A miss (``None``
-    delay) stays a miss, so the scenario's escalation structure is
-    unchanged. Without a seed the scenario's fixed delays are used.
+    With ``seed`` given, each ack delay is jittered by a magnitude drawn
+    from ``jitter`` (a ``(lo, hi)`` pair of minutes, default
+    ``DEFAULT_JITTER_RANGE``) with a random sign, drawn from a
+    ``random.Random`` seeded with ``seed`` — so the same seed replays
+    the same run exactly while different seeds vary the response times.
+    A miss (``None`` delay) stays a miss, so the scenario's escalation
+    structure is unchanged. Without a seed the scenario's fixed delays
+    are used and ``jitter`` is ignored.
     """
+    if seed is not None:
+        if jitter is None:
+            jitter_range = DEFAULT_JITTER_RANGE
+        else:
+            jitter_range = tuple(jitter)
+            if (len(jitter_range) != 2
+                    or any(isinstance(v, bool) or not isinstance(v, int)
+                           for v in jitter_range)
+                    or jitter_range[0] < 0 or jitter_range[1] < 0
+                    or jitter_range[0] > jitter_range[1]):
+                raise ValueError(
+                    "jitter must be a (lo, hi) pair of non-negative "
+                    "integers with lo <= hi")
+    else:
+        jitter_range = None
     incident = Incident(
         id=scenario.name,
         service=scenario.service,
@@ -153,9 +177,10 @@ def simulate(
         timeline.record(t, "paged", level.responder.name, level.responder.role)
         delay = scenario.ack_delay_min[i] if i < len(scenario.ack_delay_min) else None
         if delay is not None and rng is not None:
-            # Jitter the ack delay, never below 1 minute.
-            delay = max(1, delay + rng.randint(-SEED_JITTER_MIN,
-                                               SEED_JITTER_MIN))
+            # Jitter the ack delay by a magnitude in the jitter range
+            # with a random sign, never below 1 minute.
+            magnitude = rng.randint(jitter_range[0], jitter_range[1])
+            delay = max(1, delay + rng.choice((-1, 1)) * magnitude)
         if delay is not None:
             # The responder acks, on time or late. A late ack still counts:
             # the incident proceeds, but the score is scaled by partial
@@ -184,14 +209,14 @@ def simulate(
             return SimulationResult(
                 incident, policy, timeline,
                 Score(None, None, None, escalations, False, 0),
-                seed=seed,
+                seed=seed, jitter=jitter_range,
             )
         if t > max_duration_min:
             timeline.record(t, "unacked", "monitor", "max duration reached")
             return SimulationResult(
                 incident, policy, timeline,
                 Score(None, None, None, escalations, False, 0),
-                seed=seed,
+                seed=seed, jitter=jitter_range,
             )
 
     mitigated_at = acked_at + scenario.mitigate_delay_min
@@ -216,4 +241,5 @@ def simulate(
         ack_late_min=ack_late_min,
         ack_credit=ack_credit,
     )
-    return SimulationResult(incident, policy, timeline, score, seed=seed)
+    return SimulationResult(incident, policy, timeline, score, seed=seed,
+                            jitter=jitter_range)

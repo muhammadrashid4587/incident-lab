@@ -37,6 +37,7 @@ python3 -m incident_lab run latency-spike --ack-timeouts primary=120 L2=300
 python3 -m incident_lab run disk-full --policy-file examples/custom-policy.json
 python3 -m incident_lab run dns-outage --json > /tmp/dns-outage.json
 python3 -m incident_lab run disk-full --seed 7 --json
+python3 -m incident_lab run disk-full --seed 7 --jitter 0-3 --json
 python3 -m incident_lab replay /tmp/dns-outage.json
 python3 scripts/demo.py
 ```
@@ -50,7 +51,9 @@ the acking level's lateness (`ack_late_min`, 0 for an on-time ack) and
 the partial credit it kept (`ack_credit`, 1.0 on time). Unreached milestones
 serialize as `null` (for example, an incident nobody acks has
 `"time_to_ack_min": null` and `"points": 0`). The top-level `seed` records
-the `--seed` value used for the run, or `null` for an unseeded run.
+the `--seed` value used for the run, or `null` for an unseeded run, and the
+top-level `jitter` records the `--jitter` range as `[lo, hi]`, or `null`
+for an unseeded run.
 
 ## Replay
 
@@ -177,11 +180,22 @@ happen — only how quickly the acking responder answers. The seed is
 recorded in the `run --json` output (top-level `seed`) and shown in the
 human-readable output, and `replay` re-prints it from a saved run.
 
+`run <scenario> --seed N --jitter LO-HI` widens or narrows that jitter:
+each ack delay shifts by a magnitude drawn from `LO` to `HI` minutes,
+with a random sign, from the same seeded generator, so reproducibility
+holds for any range. `--jitter 0-0` means no jitter at all. The default
+is `0-1`, the same as `--seed` alone. `--jitter` requires `--seed`, and
+a bad range (negative bounds, or `LO` greater than `HI`) fails the run
+with exit code 2 and an error message. The range is recorded in the
+`run --json` output (top-level `jitter`, `[lo, hi]`) and shown in the
+human-readable output, and `replay` re-prints it from a saved run.
+
 ## Version
 
-0.9.0 — `--seed N` for randomized ack delays: each ack delay is jittered
-by up to 1 minute from a seeded RNG, so a run is reproducible (same seed,
-same output) and the seed is recorded in the `run --json` output.
+0.10.0 — `--jitter LO-HI` for a configurable seeded ack-delay jitter
+range: each ack delay shifts by a magnitude in that range with a random
+sign, keeping `--seed` reproducibility; recorded in `run --json` output
+and re-printed by `replay`.
 
 ## Roadmap
 
@@ -194,3 +208,4 @@ same output) and the seed is recorded in the `run --json` output.
 - [x] Per-level ack timeouts on the command line (0.7.0)
 - [x] Late-ack partial credit: linear decay to zero at 2x the timeout (0.8.0)
 - [x] `--seed N` for randomized ack delays: reproducible runs (0.9.0)
+- [x] `--jitter LO-HI` for a configurable seeded ack-delay jitter range (0.10.0)

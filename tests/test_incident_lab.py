@@ -8,7 +8,7 @@ import unittest
 from contextlib import redirect_stdout
 from dataclasses import replace
 
-from incident_lab.cli import main
+from incident_lab.cli import main, parse_jitter_range
 from incident_lab.policy import (
     DEFAULT_POLICY, get_policy, list_policies, load_policy_file,
     parse_ack_timeout_overrides,
@@ -914,6 +914,171 @@ class TestSeededAckDelays(unittest.TestCase):
     def test_bad_seed_in_replay_file_raises(self):
         data = simulate(get("cert-expiry"), DEFAULT_POLICY).to_dict()
         data["seed"] = "seven"
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(data, path)
+        self.addCleanup(os.unlink, path.name)
+        with self.assertRaises(ValueError):
+            load_result(path.name)
+
+
+class TestJitterRange(unittest.TestCase):
+    def _scenario(self, delay):
+        return Scenario(
+            name="jitter", service="svc", title="jitter", severity="high",
+            description="", ack_delay_min=(delay, None, None),
+            mitigate_delay_min=8, resolve_delay_min=5,
+        )
+
+    def test_jitter_range_parses(self):
+        self.assertEqual(parse_jitter_range("0-3"), (0, 3))
+        self.assertEqual(parse_jitter_range("2-2"), (2, 2))
+        self.assertEqual(parse_jitter_range("0-0"), (0, 0))
+
+    def test_jitter_range_rejects_bad_specs(self):
+        for bad in ("3-1", "abc", "1", "1-2-3", "-1-2", "0--1", "1.5-3",
+                    "1-x"):
+            with self.assertRaises(ValueError, msg=bad):
+                parse_jitter_range(bad)
+
+    def test_same_seed_and_jitter_reproduce_identical_result(self):
+        first = simulate(get("disk-full"), DEFAULT_POLICY, seed=7,
+                         jitter=(0, 3))
+        second = simulate(get("disk-full"), DEFAULT_POLICY, seed=7,
+                          jitter=(0, 3))
+        self.assertEqual(first.to_dict(), second.to_dict())
+
+    def test_jitter_zero_zero_means_no_jitter(self):
+        # Magnitude is always 0, so every seed gives the fixed delay.
+        for seed in range(10):
+            result = simulate(get("disk-full"), DEFAULT_POLICY, seed=seed,
+                              jitter=(0, 0))
+            self.assertEqual(result.score.time_to_ack_min, 3)
+
+    def test_jitter_bounds_respected(self):
+        # Fixed delay 10, jitter 2-3: the ack lands at 7, 8, 12 or 13,
+        # never closer to 10 and never further away.
+        ack_times = {
+            simulate(self._scenario(10), DEFAULT_POLICY, seed=seed,
+                     jitter=(2, 3)).score.time_to_ack_min
+            for seed in range(30)
+        }
+        self.assertTrue(ack_times <= {7, 8, 12, 13},
+                        f"unexpected ack times: {ack_times}")
+        self.assertGreater(len(ack_times), 1)
+
+    def test_wider_jitter_varies_more_than_default(self):
+        # Across 30 seeds, the 0-3 range reaches ack times the default
+        # 0-1 range cannot.
+        wide = {
+            simulate(get("disk-full"), DEFAULT_POLICY, seed=seed,
+                     jitter=(0, 3)).score.time_to_ack_min
+            for seed in range(30)
+        }
+        self.assertTrue(wide - {2, 3, 4}, f"wide range stayed narrow: {wide}")
+
+    def test_simulate_rejects_bad_jitter(self):
+        for bad in ((3, 1), (-1, 2), (0, -1), (1,), (1, 2, 3), (1.5, 3)):
+            with self.assertRaises(ValueError, msg=str(bad)):
+                simulate(get("disk-full"), DEFAULT_POLICY, seed=1,
+                         jitter=bad)
+
+    def test_jitter_without_seed_is_ignored_by_simulate(self):
+        # No RNG without a seed, so a jitter argument changes nothing.
+        result = simulate(get("disk-full"), DEFAULT_POLICY, jitter=(0, 3))
+        self.assertIsNone(result.seed)
+        self.assertIsNone(result.jitter)
+        self.assertEqual(result.score.time_to_ack_min, 3)
+
+    def test_jitter_recorded_in_json_output(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "disk-full", "--seed", "7",
+                                   "--jitter", "0-3", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["seed"], 7)
+        self.assertEqual(data["jitter"], [0, 3])
+
+    def test_jitter_defaults_to_zero_to_one_with_seed(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--seed", "7", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["jitter"], [0, 1])
+
+    def test_unseeded_run_records_null_jitter(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "disk-full", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertIsNone(data["jitter"])
+
+    def test_jitter_shown_in_human_output(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "disk-full", "--seed", "7",
+                                   "--jitter", "0-3"]), 0)
+        self.assertIn("jitter:   0-3m", buf.getvalue())
+
+    def test_jitter_without_seed_fails(self):
+        self.assertEqual(
+            main(["run", "disk-full", "--jitter", "0-3"]), 2)
+
+    def test_cli_bad_jitter_fails(self):
+        for bad in ("3-1", "abc", "1", "1-2-3", "-1-2"):
+            with self.subTest(bad=bad):
+                # --jitter=<spec> so a leading "-" reaches the validator
+                # instead of being read as an option flag by argparse.
+                self.assertEqual(
+                    main(["run", "disk-full", "--seed", "7",
+                          f"--jitter={bad}"]), 2)
+
+    def test_jitter_does_not_change_who_acks(self):
+        # latency-spike: primary misses, secondary acks 4m after the
+        # timeout. Even with a wide jitter the escalation count stays 1
+        # and the ack stays within 5 + 4 +/- 3.
+        for seed in range(20):
+            result = simulate(get("latency-spike"), DEFAULT_POLICY,
+                              seed=seed, jitter=(0, 3))
+            self.assertEqual(result.score.escalations, 1)
+            self.assertIn(result.score.time_to_ack_min, range(6, 13))
+
+    def test_jitter_replay_round_trip(self):
+        original = simulate(get("disk-full"), DEFAULT_POLICY, seed=7,
+                            jitter=(0, 3))
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(original.to_dict(), path)
+        self.addCleanup(os.unlink, path.name)
+        loaded = load_result(path.name)
+        self.assertEqual(loaded.jitter, (0, 3))
+        self.assertEqual(loaded.to_dict(), original.to_dict())
+        replay_buf = io.StringIO()
+        with redirect_stdout(replay_buf):
+            self.assertEqual(main(["replay", path.name]), 0)
+        run_buf = io.StringIO()
+        with redirect_stdout(run_buf):
+            self.assertEqual(main(["run", "disk-full", "--seed", "7",
+                                   "--jitter", "0-3"]), 0)
+        self.assertEqual(replay_buf.getvalue(), run_buf.getvalue())
+
+    def test_bad_jitter_in_replay_file_raises(self):
+        data = simulate(get("cert-expiry"), DEFAULT_POLICY).to_dict()
+        data["jitter"] = "wide"
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(data, path)
+        self.addCleanup(os.unlink, path.name)
+        with self.assertRaises(ValueError):
+            load_result(path.name)
+
+    def test_jitter_range_reversed_in_replay_file_raises(self):
+        data = simulate(get("cert-expiry"), DEFAULT_POLICY).to_dict()
+        data["jitter"] = [3, 0]
         path = tempfile.NamedTemporaryFile(
             mode="w", suffix=".json", delete=False)
         with path:

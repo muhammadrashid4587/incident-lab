@@ -13,6 +13,28 @@ from .scenarios import get, list_scenarios
 from .simulator import simulate
 
 
+def parse_jitter_range(spec: str) -> tuple:
+    """Parse a --jitter LO-HI spec into a (lo, hi) pair of minutes.
+
+    Both bounds must be non-negative integers with lo <= hi. Raises
+    ValueError on a bad spec.
+    """
+    parts = spec.split("-")
+    if len(parts) != 2:
+        raise ValueError(
+            f"jitter range must look like LO-HI (got {spec!r})")
+    try:
+        lo, hi = int(parts[0]), int(parts[1])
+    except ValueError:
+        raise ValueError(
+            f"jitter range bounds must be integers (got {spec!r})")
+    if lo < 0 or hi < 0 or lo > hi:
+        raise ValueError(
+            f"jitter range must be non-negative minutes with LO <= HI "
+            f"(got {spec!r})")
+    return (lo, hi)
+
+
 def _print_result(result) -> None:
     incident = result.incident
     score = result.score
@@ -21,6 +43,8 @@ def _print_result(result) -> None:
     print(f"policy:   {result.policy.name}")
     if result.seed is not None:
         print(f"seed:     {result.seed}")
+    if result.jitter is not None:
+        print(f"jitter:   {result.jitter[0]}-{result.jitter[1]}m")
     print("timeouts: " + ", ".join(
         f"{level.responder.name} ({level.responder.role}) "
         f"{level.ack_timeout_min}m" for level in result.policy.levels))
@@ -75,6 +99,11 @@ def main(argv=None) -> int:
                      help="seed the RNG that jitters ack delays by up to "
                           "1 minute, so the same seed replays the same run "
                           "exactly; recorded in --json output")
+    run.add_argument("--jitter", default=None, metavar="LO-HI",
+                     help="jitter range in minutes for seeded ack delays, "
+                          "e.g. 0-3: each ack delay shifts by a magnitude "
+                          "in that range, random sign; requires --seed, "
+                          "default 0-1; recorded in --json output")
     run.add_argument("--json", action="store_true",
                      help="print the result as JSON instead of the replay")
 
@@ -164,7 +193,17 @@ def main(argv=None) -> int:
             except ValueError as exc:
                 print(f"invalid --ack-timeouts: {exc}", file=sys.stderr)
                 return 2
-        result = simulate(scenario, policy, seed=args.seed)
+        jitter = None
+        if args.jitter is not None:
+            if args.seed is None:
+                print("--jitter requires --seed", file=sys.stderr)
+                return 2
+            try:
+                jitter = parse_jitter_range(args.jitter)
+            except ValueError as exc:
+                print(f"invalid --jitter: {exc}", file=sys.stderr)
+                return 2
+        result = simulate(scenario, policy, seed=args.seed, jitter=jitter)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:

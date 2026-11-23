@@ -156,10 +156,21 @@ def load_result(path: str) -> SimulationResult:
     if seed is not None and (isinstance(seed, bool)
                              or not isinstance(seed, int)):
         raise ValueError("replay file: 'seed' must be an integer or null")
+    raw_jitter = data.get("jitter")
+    jitter = None
+    if raw_jitter is not None:
+        if (not isinstance(raw_jitter, list) or len(raw_jitter) != 2
+                or any(isinstance(v, bool) or not isinstance(v, int)
+                       for v in raw_jitter)
+                or raw_jitter[0] < 0 or raw_jitter[1] < raw_jitter[0]):
+            raise ValueError(
+                "replay file: 'jitter' must be [lo, hi] minutes or null")
+        jitter = tuple(raw_jitter)
     return SimulationResult(
         incident=_incident_from_dict(data.get("incident")),
         policy=_policy_from_dict(data.get("policy")),
         timeline=_timeline_from_dict(data.get("timeline")),
         score=_score_from_dict(data.get("score")),
         seed=seed,
+        jitter=jitter,
     )
