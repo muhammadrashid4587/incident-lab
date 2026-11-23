@@ -3012,6 +3012,111 @@ class TestDrill(unittest.TestCase):
         self.assertEqual(drill.score.points, 91)
         self.assertEqual(drill.score.hints_used, 1)
 
+    def test_drill_hint_mid_drill_costs_points_like_run(self):
+        # A hint asked for at the ack prompt costs the same 5 points
+        # as an up-front hint, and the drill matches a run that asked
+        # for the same hint: 96 - 5 = 91.
+        prompts = io.StringIO()
+        drill = run_drill(
+            get("disk-full"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "hint\nack 3\nmitigate 20\nresolve 12\n"),
+            prompt_stream=prompts)
+        run = simulate(get("disk-full"), DEFAULT_POLICY, hints=1)
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 91)
+        self.assertEqual(drill.score.hints_used, 1)
+        self.assertEqual(drill.score.hint_cost_points, 5)
+        self.assertEqual(drill.hints[0].text,
+                         get("disk-full").hints[0])
+        self.assertIn("Check WAL archiving", prompts.getvalue())
+        self.assertIn("next milestone: ack", prompts.getvalue())
+
+    def test_drill_hint_at_each_stage_draws_in_order(self):
+        # One hint per prompt, drawn in order: 96 - 3 x 5 = 81.
+        prompts = io.StringIO()
+        drill = run_drill(
+            get("disk-full"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "hint\nack 3\nhint\nmitigate 20\nhint\nresolve 12\n"),
+            prompt_stream=prompts)
+        self.assertEqual(drill.score.points, 81)
+        self.assertEqual(drill.score.hints_used, 3)
+        self.assertEqual(drill.score.hint_cost_points, 15)
+        self.assertEqual(
+            [hint.text for hint in drill.hints],
+            list(get("disk-full").hints))
+        self.assertIn("next milestone: ack", prompts.getvalue())
+        self.assertIn("next milestone: mitigate", prompts.getvalue())
+        self.assertIn("next milestone: resolve", prompts.getvalue())
+
+    def test_drill_hint_continues_after_up_front_hints(self):
+        # One hint up front, one mid-drill: the mid-drill hint is the
+        # second scenario hint, not the first again.
+        drill = self._drill(get("disk-full"), hints=1, decisions=(
+            "hint\nack 3\nmitigate 20\nresolve 12\n"))
+        self.assertEqual(drill.score.points, 86)
+        self.assertEqual(drill.score.hints_used, 2)
+        self.assertEqual(
+            [hint.text for hint in drill.hints],
+            list(get("disk-full").hints[:2]))
+
+    def test_drill_hint_when_none_left_costs_nothing_more(self):
+        # disk-full has 3 hints; the fourth `hint` says so, costs
+        # nothing, and re-prompts instead of answering the decision.
+        prompts = io.StringIO()
+        drill = run_drill(
+            get("disk-full"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "hint\nhint\nhint\nhint\n"
+                "ack 3\nmitigate 20\nresolve 12\n"),
+            prompt_stream=prompts)
+        self.assertEqual(drill.score.points, 81)
+        self.assertEqual(drill.score.hints_used, 3)
+        self.assertEqual(drill.score.hint_cost_points, 15)
+        self.assertIn("no hints left", prompts.getvalue())
+
+    def test_drill_hint_in_partial_run_is_recorded(self):
+        # A hint asked for before quitting is still recorded, and
+        # still costs its 5 points: acked at 3m, inside the grace,
+        # so the partial run keeps 100 - 5 = 95.
+        drill = self._drill(get("disk-full"),
+                            decisions="hint\nack 3\nquit\n")
+        self.assertFalse(drill.score.resolved)
+        self.assertEqual(drill.score.hints_used, 1)
+        self.assertEqual(drill.score.hint_cost_points, 5)
+        self.assertEqual(drill.score.points, 95)
+        self.assertIn("abandoned", drill.timeline.kinds())
+
+    def test_drill_hint_without_hints_is_unknown_answer(self):
+        # A scenario with no hints offers no `hint` command: typing
+        # it is an unknown answer and re-prompts, like any other.
+        scenario = Scenario(
+            name="plain", service="svc", title="plain", severity="low",
+            description="", ack_delay_min=(3, None, None),
+            mitigate_delay_min=20, resolve_delay_min=12,
+        )
+        prompts = io.StringIO()
+        drill = run_drill(
+            scenario, DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "hint\nack 3\nmitigate 20\nresolve 12\n"),
+            prompt_stream=prompts)
+        self.assertTrue(drill.score.resolved)
+        self.assertEqual(drill.score.hints_used, 0)
+        self.assertEqual(drill.score.points, 96)
+        self.assertIn("unknown answer 'hint'", prompts.getvalue())
+
+    def test_drill_hint_round_trips_through_replay(self):
+        # A mid-drill hint is recorded in the run JSON like an
+        # up-front hint, so replay/compare/stats see it.
+        drill = self._drill(get("disk-full"), decisions=(
+            "hint\nack 3\nmitigate 20\nresolve 12\n"))
+        loaded = load_result(self._write_json(drill.to_dict()))
+        self.assertEqual(loaded.to_dict(), drill.to_dict())
+        self.assertEqual(loaded.score.hints_used, 1)
+        self.assertEqual(loaded.score.points, 91)
+
     def test_drill_too_many_hints_fails(self):
         with self.assertRaises(ValueError):
             self._drill(get("disk-full"), hints=99, decisions="")
@@ -3217,6 +3322,26 @@ class TestDrill(unittest.TestCase):
         data = json.loads(out.getvalue())
         self.assertEqual(data["difficulty"], "hard")
         self.assertEqual(data["score"]["points"], 94)
+
+    def test_cli_drill_hint_records_hint_in_json(self):
+        # A mid-drill hint is recorded in the drill --json output
+        # like an up-front hint, and the prompt text (with the hint
+        # itself) stays on stderr, so stdout is clean JSON.
+        path = self._write_decisions(
+            "hint\nack 3\nmitigate 20\nresolve 12\n")
+        out = io.StringIO()
+        err = io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            self.assertEqual(
+                main(["drill", "disk-full", "--input", path, "--json"]),
+                0)
+        data = json.loads(out.getvalue())
+        self.assertEqual(data["score"]["points"], 91)
+        self.assertEqual(data["score"]["hints_used"], 1)
+        self.assertEqual(data["score"]["hint_cost_points"], 5)
+        self.assertEqual(len(data["hints"]), 1)
+        self.assertIn("Check WAL archiving", data["hints"][0]["text"])
+        self.assertIn("Check WAL archiving", err.getvalue())
 
 
 if __name__ == "__main__":

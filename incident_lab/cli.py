@@ -355,7 +355,8 @@ def main(argv=None) -> int:
     drill = sub.add_parser(
         "drill",
         help="play one scenario interactively, step by step: you "
-             "decide when to ack, mitigate and resolve, one decision "
+             "decide when to ack, mitigate and resolve, and can ask "
+             "for a hint when stuck, one decision "
              "per line (see README: Interactive drills)")
     drill.add_argument("scenario",
                        help="scenario name (see: incident-lab list)")

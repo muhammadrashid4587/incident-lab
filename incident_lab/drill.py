@@ -20,12 +20,19 @@ and needs no TTY:
 defaults to 0); a delay past the level's timeout is a late ack, with
 the same partial credit ``run`` gives. ``wait`` lets the timeout
 lapse and escalates to the next level. ``mitigate N`` / ``resolve N``
-are minutes after the ack / mitigation. ``quit`` ends the drill
-cleanly at any prompt; running out of input (EOF) does the same. A
-drill ended early records a partial run — the timeline so far, plus
+are minutes after the ack / mitigation. ``hint`` asks for the
+scenario's next known-good action when stuck — the same hints
+``run --hints`` draws, in the same order, each costing
+``HINT_COST_POINTS`` off the final score — and says which milestone
+is next and what the scoring rewards at this point. ``quit`` ends the
+drill cleanly at any prompt; running out of input (EOF) does the same.
+A drill ended early records a partial run — the timeline so far, plus
 an ``abandoned`` event — scored on the milestones it reached, in the
 same JSON shape as ``run`` so ``replay``, ``debrief``, ``compare``
-and ``stats`` all work on drill runs.
+and ``stats`` all work on drill runs. Hints asked for mid-drill are
+recorded in the run JSON exactly like up-front hints, so a drill
+that asks for a hint scores the same as a ``run`` that asked for
+the same hint.
 
 Prompts go to the prompt stream (stderr by default), never to stdout,
 so ``drill --json`` output stays parseable JSON.
@@ -65,7 +72,7 @@ def _parse_minutes(text: str, command: str):
 
 
 def _read_decision(prompt_stream, input_stream, prompt: str,
-                   choices: dict) -> tuple:
+                   choices: dict, on_hint=None) -> tuple:
     """Read one drill decision from the input stream.
 
     ``choices`` maps a command word to its (argument name, help) — the
@@ -74,10 +81,18 @@ def _read_decision(prompt_stream, input_stream, prompt: str,
     ``("quit", reason)`` when the operator quits or the input ends.
     An unrecognised line prints an error and re-prompts; EOF ends the
     drill the same way ``quit`` does.
+
+    ``on_hint`` is a no-argument callback run when the operator types
+    ``hint``: it gives the next hint and the prompt is shown again,
+    so a hint never answers the decision itself. When ``on_hint`` is
+    None the scenario has no hints to give and ``hint`` is an
+    unrecognised answer like any other.
     """
     help_text = ", ".join(
         f"{word} {arg}" if arg else word
         for word, (arg, _hint) in choices.items())
+    if on_hint is not None:
+        help_text += ", hint"
     prompt_stream.write(f"{prompt}\n  [{help_text}] > ")
     prompt_stream.flush()
     while True:
@@ -96,13 +111,23 @@ def _read_decision(prompt_stream, input_stream, prompt: str,
         if word in ("help", "?"):
             for name, (_arg, hint) in choices.items():
                 prompt_stream.write(f"  {name}: {hint}\n")
+            if on_hint is not None:
+                prompt_stream.write(
+                    "  hint: ask for the next known-good action "
+                    f"({HINT_COST_POINTS} points, like run --hints)\n")
             prompt_stream.write("  > ")
             prompt_stream.flush()
             continue
+        if word == "hint" and on_hint is not None:
+            on_hint()
+            continue
         if word not in choices:
+            expected = sorted(choices)
+            if on_hint is not None:
+                expected.append("hint")
             prompt_stream.write(
                 f"  unknown answer {stripped!r}: expected one of "
-                f"{', '.join(sorted(choices))} (or 'quit')\n  > ")
+                f"{', '.join(expected)} (or 'quit')\n  > ")
             prompt_stream.flush()
             continue
         arg_name, _hint = choices[word]
@@ -179,8 +204,11 @@ def run_drill(
     policy, as the CLI does. ``hints`` asks for that many hints up
     front, drawn in order from the scenario's known-good next actions,
     each costing ``HINT_COST_POINTS`` off the final score, exactly as
-    in ``run``. Raises ValueError if ``hints`` is negative or more
-    than the scenario has.
+    in ``run``. The operator can also type ``hint`` at any prompt to
+    ask for the next hint mid-drill, at the same cost, continuing
+    after the up-front ones; hints asked for that way are recorded
+    in the result exactly like up-front hints. Raises ValueError if
+    ``hints`` is negative or more than the scenario has.
     """
     if difficulty is None:
         difficulty = NORMAL
@@ -191,11 +219,49 @@ def run_drill(
             f"scenario {scenario.name!r} has only "
             f"{len(scenario.hints)} hint(s), asked for {hints}")
     used_hints = [Hint(text) for text in scenario.hints[:hints]]
-    hint_cost = len(used_hints) * HINT_COST_POINTS
     if input_stream is None:
         input_stream = sys.stdin
     if prompt_stream is None:
         prompt_stream = sys.stderr
+
+    def _hint_cost() -> int:
+        """What the hints used so far cost — derived live from
+        ``used_hints``, so a hint taken mid-drill counts in every
+        result the drill builds, partial or finished."""
+        return len(used_hints) * HINT_COST_POINTS
+
+    def _take_hint(stage: str) -> None:
+        """Give the scenario's next unused hint, at its usual cost.
+
+        Draws in order from the scenario's known-good next actions,
+        continuing after any hints asked for up front with ``hints``;
+        each one costs ``HINT_COST_POINTS`` off the final score,
+        exactly as in ``run``. The hint goes to the prompt stream,
+        never stdout, with the stage context — which milestone is
+        next, and what the scoring rewards at this point — so the
+        operator knows what the hint is for. When no hints are left
+        it says so and costs nothing; the decision is re-prompted
+        either way, so a hint never answers it.
+        """
+        if len(used_hints) >= len(scenario.hints):
+            prompt_stream.write("  no hints left for this scenario\n  > ")
+            prompt_stream.flush()
+            return
+        text = scenario.hints[len(used_hints)]
+        used_hints.append(Hint(text))
+        prompt_stream.write(
+            f"  hint ({HINT_COST_POINTS} pts): {text}\n"
+            f"  {stage}\n  > ")
+        prompt_stream.flush()
+
+    def _hint_offer(stage: str):
+        """The mid-drill hint callback for one prompt, or None when
+        the scenario has no hints to give — then ``hint`` is an
+        unrecognised answer like any other."""
+        if not scenario.hints:
+            return None
+        return lambda: _take_hint(stage)
+
     incident = Incident(
         id=scenario.name,
         service=scenario.service,
@@ -239,7 +305,11 @@ def run_drill(
                              "(or 'ack' alone to ack now); "
                              "past the timeout is a late ack"),
                 "wait": (None, "let the timeout lapse and escalate"),
-            })
+            },
+            on_hint=_hint_offer(
+                "next milestone: ack — full credit up to the "
+                f"{level.ack_timeout_min}m timeout, decaying to none "
+                "at twice it"))
         if command == "quit":
             timeline.record(t, "abandoned", "operator",
                             f"drill {arg}")
@@ -248,7 +318,7 @@ def run_drill(
                 acked_at=None, acked_by=None, ack_late_min=None,
                 ack_credit=None, mitigated_at=None,
                 mitigate_delay_min=None, difficulty=difficulty,
-                used_hints=used_hints, hint_cost=hint_cost)
+                used_hints=used_hints, hint_cost=_hint_cost())
         if command == "wait":
             # Missed ack: wait out the timeout, then escalate (or give
             # up, exactly as `run` does when nobody acks).
@@ -269,7 +339,7 @@ def run_drill(
                 acked_at=None, acked_by=None, ack_late_min=None,
                 ack_credit=None, mitigated_at=None,
                 mitigate_delay_min=None, difficulty=difficulty,
-                used_hints=used_hints, hint_cost=hint_cost)
+                used_hints=used_hints, hint_cost=_hint_cost())
         # The operator acks, on time or late: the same late-ack credit
         # `run` gives for an ack past its level's timeout.
         delay = arg
@@ -289,7 +359,11 @@ def run_drill(
         f"  {acked_by} acked at {acked_at}m. mitigate in how many "
         "minutes?",
         {"mitigate": ("N", "mitigate N minutes after the ack "
-                           "(or 'mitigate' alone to mitigate now)")})
+                           "(or 'mitigate' alone to mitigate now)")},
+        on_hint=_hint_offer(
+            "next milestone: mitigate — the score loses 1 point per "
+            "2 minutes past the "
+            f"{difficulty.mitigate_grace_min}m mitigate grace"))
     if command == "quit":
         timeline.record(acked_at, "abandoned", "operator",
                         f"drill {arg}")
@@ -299,7 +373,7 @@ def run_drill(
             ack_late_min=ack_late_min, ack_credit=ack_credit,
             mitigated_at=None, mitigate_delay_min=None,
             difficulty=difficulty, used_hints=used_hints,
-            hint_cost=hint_cost)
+            hint_cost=_hint_cost())
     mitigate_delay = arg
     mitigated_at = acked_at + mitigate_delay
     timeline.record(mitigated_at, "mitigated", acked_by)
@@ -308,7 +382,10 @@ def run_drill(
         prompt_stream, input_stream,
         f"  mitigated at {mitigated_at}m. resolve in how many minutes?",
         {"resolve": ("N", "resolve N minutes after the mitigation "
-                         "(or 'resolve' alone to resolve now)")})
+                         "(or 'resolve' alone to resolve now)")},
+        on_hint=_hint_offer(
+            "next milestone: resolve — the score is already set by "
+            "the ack and mitigation, so resolve promptly"))
     if command == "quit":
         timeline.record(mitigated_at, "abandoned", "operator",
                         f"drill {arg}")
@@ -318,7 +395,7 @@ def run_drill(
             ack_late_min=ack_late_min, ack_credit=ack_credit,
             mitigated_at=mitigated_at,
             mitigate_delay_min=mitigate_delay, difficulty=difficulty,
-            used_hints=used_hints, hint_cost=hint_cost)
+            used_hints=used_hints, hint_cost=_hint_cost())
     resolve_delay = arg
     resolved_at = mitigated_at + resolve_delay
     timeline.record(resolved_at, "resolved", acked_by)
@@ -326,7 +403,7 @@ def run_drill(
     points = compute_points(
         escalations=escalations, acked_at=acked_at, ack_credit=ack_credit,
         mitigated_at=mitigated_at, difficulty=difficulty,
-        hint_cost=hint_cost)
+        hint_cost=_hint_cost())
     return SimulationResult(
         incident, policy, timeline,
         Score(
@@ -341,7 +418,7 @@ def run_drill(
             mitigate_delay_min=mitigate_delay,
             resolve_delay_min=resolve_delay,
             hints_used=len(used_hints),
-            hint_cost_points=hint_cost,
+            hint_cost_points=_hint_cost(),
         ),
         difficulty=difficulty,
         hints=used_hints,
