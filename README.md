@@ -84,6 +84,8 @@ python3 -m incident_lab debrief /tmp/drill.json
 printf 'ack 3\nmitigate 20\nresolve 12\n' | python3 -m incident_lab drill disk-full --operator ana
 python3 -m incident_lab history --operator ana
 python3 -m incident_lab history
+python3 -m incident_lab bundle /tmp/latency-spike.json
+python3 -m incident_lab bundle --check latency-spike-bundle.zip
 python3 scripts/demo.py
 ```
 
@@ -178,6 +180,34 @@ python3 -m incident_lab run latency-spike --json > latency-spike.json
 python3 -m incident_lab postmortem latency-spike.json --out postmortem.html
 python3 -m incident_lab what-if latency-spike.json --ack-timeout 5 --json > latency-spike-whatif.json
 python3 -m incident_lab postmortem latency-spike-whatif.json
+```
+
+## Postmortem bundle
+
+`bundle <run.json>` packages a saved run into one shareable zip so
+the run can be sent to someone else and re-imported: `run.json` (the
+saved run, verbatim), `postmortem.html` (the HTML postmortem), and
+`manifest.json` (incident-lab version, incident and score, seed and
+difficulty, what-if overrides and points delta when the source is a
+what-if replay, plus a SHA-256 hash and size for every other member).
+A what-if file bundles its replay as `run.json` and its base run as
+`base-run.json`, so the comparison stays replayable. The bundle is
+validated as it is created — the written zip is re-opened, every hash
+is re-checked, and `run.json` is loaded back through `replay` to
+prove it re-imports — and a bundle that fails validation is deleted,
+never left behind. `bundle --check <bundle.zip>` runs the same
+validation on a bundle someone shared. After unzipping, the run is a
+plain saved run, so `replay`, `debrief` and `postmortem` all work on
+it. With `--out PATH` the zip is written there instead of
+`<run>-bundle.zip`; a missing file, bad JSON, or a file that is not a
+saved run fails with exit code 2 and an error message.
+
+```sh
+python3 -m incident_lab run latency-spike --json > latency-spike.json
+python3 -m incident_lab bundle latency-spike.json
+python3 -m incident_lab bundle --check latency-spike-bundle.zip
+unzip latency-spike-bundle.zip -d shared-run
+python3 -m incident_lab replay shared-run/run.json
 ```
 
 ## Compare
@@ -710,6 +740,10 @@ incident_lab/
                  score and grade, timeline, per-responder timings
                  from the escalation chain, hints used, findings and
                  action items; what-if files render with provenance
+  bundle.py      shareable postmortem bundle: one zip holding the run
+                 JSON, the HTML postmortem and a manifest with
+                 provenance and SHA-256 hashes, validated on creation
+                 and on `--check`
   compare.py     side-by-side diff of two saved runs: score deltas,
                  shared-event time shifts, events only one run has
   stats.py       aggregate saved runs: score spread, mean response
@@ -728,8 +762,8 @@ incident_lab/
                  improvement over time, or an overview of all
                  operators — as human text or --json
   cli.py         list / template / policy-template / run / drill /
-                 history / replay / debrief / postmortem / compare /
-                 stats / what-if
+                 history / replay / debrief / postmortem / bundle /
+                 compare / stats / what-if
 tests/
   test_incident_lab.py
 scripts/
@@ -789,6 +823,21 @@ exit code 2 and an error message. With `--json` the batch prints
 human-readable form.
 
 ## Version
+
+0.29.0 — Shareable postmortem bundle: `bundle <saved-run.json>`
+packages a saved run into one zip — `run.json` (the saved run,
+verbatim), `postmortem.html` (the HTML postmortem) and `manifest.json`
+(incident-lab version, incident and score, seed and difficulty, and
+the what-if overrides and points delta when the source is a what-if
+replay, plus a SHA-256 hash and size for every other member). A
+what-if file bundles its replay as `run.json` and its base run as
+`base-run.json`, so the comparison stays replayable. The bundle is
+validated as it is created (the written zip is re-opened, every hash
+is re-checked, `run.json` is loaded back through `replay` to prove it
+re-imports) and a failing bundle is deleted, never left behind;
+`bundle --check <bundle.zip>` runs the same validation on a bundle
+someone shared. After unzipping, the run is a plain saved run, so
+`replay`, `debrief` and `postmortem` all work on it.
 
 0.28.0 — HTML postmortem export: `postmortem <saved-run.json>` renders
 the debrief as a self-contained HTML page (inline CSS, no JavaScript,
@@ -898,4 +947,5 @@ resolved instead of claiming nobody acked.
 - [x] SEV-1 scenario with a multi-level escalation chain: `payments-outage` with a `sev1` policy (on-call 3m, senior 5m, incident commander 10m), impact stages that grow with every missed level, and the escalation chain recorded in `run --json` and shown by `replay`, `debrief`, `compare` and `stats`; `what-if` keeps the original run's impact stages and drills record the chain too (0.26.0)
 - [x] Error-budget burn: every scenario carries an SLO target (`slo_percent`), and the run reports the downtime (declaration to mitigated) as a percentage of the monthly error budget that SLO allows in a 30-day month — over 100% means one incident spent the whole month's budget; shown in `run` output and `run --json`, flagged by `debrief` when over 100%, diffed by `compare`, averaged by `stats`, recomputed by `what-if`, recorded by drills, and settable per scenario in scenario files (0.27.0)
 - [x] HTML postmortem export: `postmortem <saved-run.json>` renders the debrief as a self-contained HTML page (inline CSS, no JavaScript, no external resources) with the score and grade, the timeline, a per-responder timings table from the escalation chain, the hints used with what each one cost, findings and action items with owners; a saved `what-if --json` file renders its replay with a provenance box (the overrides, the points delta and the base run's score), `--out PATH` writes the page to a file, and every string from the run is escaped (0.28.0)
-- [ ] PDF postmortem export, or a shareable postmortem bundle (HTML + run JSON)
+- [x] Shareable postmortem bundle: `bundle <saved-run.json>` packages the run JSON (verbatim), the HTML postmortem and a manifest with provenance (incident-lab version, incident and score, seed and difficulty, what-if overrides and points delta when the source is a what-if replay) and a SHA-256 hash of every other member into one zip, validated as it is created (hashes re-checked, `run.json` loaded back through `replay` to prove it re-imports, a failing bundle deleted); a what-if file bundles its replay as `run.json` and its base run as `base-run.json`; `bundle --check <bundle.zip>` validates a shared bundle, and the unzipped run works with `replay`, `debrief` and `postmortem` (0.29.0)
+- [ ] PDF postmortem export

@@ -7,9 +7,15 @@ import statistics
 import sys
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stderr, redirect_stdout
 from dataclasses import replace
 
+from incident_lab.bundle import (
+    create_bundle,
+    default_bundle_path,
+    validate_bundle,
+)
 from incident_lab.cli import main, parse_jitter_range, parse_seed_spec
 from incident_lab.compare import compare_results
 from incident_lab.debrief import generate_debrief, grade
@@ -4238,6 +4244,223 @@ class TestHtmlPostmortem(unittest.TestCase):
         self.addCleanup(os.unlink, bad.name)
         with redirect_stderr(err):
             self.assertEqual(main(["postmortem", bad.name]), 2)
+
+
+class TestBundle(unittest.TestCase):
+    def _save_run(self, result):
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(result.to_dict(), path)
+        self.addCleanup(os.unlink, path.name)
+        return path.name
+
+    def _save_whatif(self, run_path):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["what-if", run_path, "--ack-timeout", "5",
+                      "--json"]), 0)
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            path.write(buf.getvalue())
+        self.addCleanup(os.unlink, path.name)
+        return path.name
+
+    def _bundle_path(self):
+        path = tempfile.NamedTemporaryFile(
+            suffix=".zip", delete=False)
+        path.close()
+        os.unlink(path.name)
+        self.addCleanup(
+            lambda: os.path.exists(path.name) and os.unlink(path.name))
+        return path.name
+
+    def _tamper(self, bundle_path, member, new_data):
+        """Rewrite a bundle with one member's bytes replaced."""
+        with zipfile.ZipFile(bundle_path) as bundle:
+            members = {name: bundle.read(name)
+                       for name in bundle.namelist()}
+        members[member] = new_data
+        tampered = tempfile.NamedTemporaryFile(
+            suffix=".zip", delete=False)
+        tampered.close()
+        self.addCleanup(os.unlink, tampered.name)
+        with zipfile.ZipFile(tampered.name, "w",
+                             compression=zipfile.ZIP_DEFLATED) as bundle:
+            for name, data in members.items():
+                bundle.writestr(name, data)
+        return tampered.name
+
+    def test_bundle_contains_run_html_and_manifest(self):
+        run_path = self._save_run(
+            simulate(get("disk-full"), DEFAULT_POLICY))
+        out = self._bundle_path()
+        manifest = create_bundle(run_path, out)
+        self.assertEqual(manifest["format"], "incident-lab-bundle")
+        self.assertEqual(manifest["format_version"], 1)
+        self.assertEqual(manifest["generator"],
+                         "incident-lab 0.29.0")
+        self.assertEqual(manifest["incident"]["id"], "disk-full")
+        self.assertEqual(manifest["score"]["points"], 96)
+        self.assertEqual(manifest["score"]["grade"], "A")
+        self.assertIsNone(manifest["what_if"])
+        with zipfile.ZipFile(out) as bundle:
+            self.assertEqual(sorted(bundle.namelist()),
+                             ["manifest.json", "postmortem.html",
+                              "run.json"])
+            # The stored run is the saved file verbatim.
+            with open(run_path, "rb") as handle:
+                self.assertEqual(bundle.read("run.json"),
+                                 handle.read())
+            html_text = bundle.read("postmortem.html").decode("utf-8")
+            self.assertIn("<!DOCTYPE html>", html_text)
+            self.assertIn("Disk 97% full on payments-db", html_text)
+            self.assertIn("96/100 (grade A)", html_text)
+            stored_manifest = json.loads(
+                bundle.read("manifest.json").decode("utf-8"))
+            self.assertEqual(stored_manifest, manifest)
+
+    def test_bundled_run_reimports(self):
+        run_path = self._save_run(
+            simulate(get("disk-full"), DEFAULT_POLICY))
+        out = self._bundle_path()
+        create_bundle(run_path, out)
+        with zipfile.ZipFile(out) as bundle:
+            data = bundle.read("run.json")
+        extracted = tempfile.NamedTemporaryFile(
+            mode="wb", suffix=".json", delete=False)
+        with extracted:
+            extracted.write(data)
+        self.addCleanup(os.unlink, extracted.name)
+        self.assertEqual(load_result(extracted.name).score.points, 96)
+
+    def test_bundle_what_if_carries_base_run_and_provenance(self):
+        run_path = self._save_run(
+            simulate(get("disk-full"), get_policy("fast")))
+        whatif_path = self._save_whatif(run_path)
+        out = self._bundle_path()
+        manifest = create_bundle(whatif_path, out)
+        self.assertIsNotNone(manifest["what_if"])
+        self.assertEqual(manifest["what_if"]["points_delta"], 48)
+        self.assertEqual(manifest["what_if"]["base_points"], 48)
+        self.assertIn("ack timeout: every level 5m",
+                      manifest["what_if"]["overrides"])
+        with zipfile.ZipFile(out) as bundle:
+            self.assertEqual(sorted(bundle.namelist()),
+                             ["base-run.json", "manifest.json",
+                              "postmortem.html", "run.json"])
+            replayed = json.loads(
+                bundle.read("run.json").decode("utf-8"))
+            base = json.loads(
+                bundle.read("base-run.json").decode("utf-8"))
+            self.assertEqual(replayed["score"]["points"], 96)
+            self.assertEqual(base["score"]["points"], 48)
+            html_text = bundle.read("postmortem.html").decode("utf-8")
+            self.assertIn("What-if replay", html_text)
+
+    def test_validation_catches_tampered_run(self):
+        run_path = self._save_run(
+            simulate(get("disk-full"), DEFAULT_POLICY))
+        out = self._bundle_path()
+        create_bundle(run_path, out)
+        with zipfile.ZipFile(out) as bundle:
+            run_data = json.loads(bundle.read("run.json").decode("utf-8"))
+        run_data["score"]["points"] = 100
+        tampered = self._tamper(
+            out, "run.json",
+            (json.dumps(run_data, indent=2) + "\n").encode("utf-8"))
+        with self.assertRaises(ValueError):
+            validate_bundle(tampered)
+
+    def test_validation_catches_missing_member(self):
+        run_path = self._save_run(
+            simulate(get("disk-full"), DEFAULT_POLICY))
+        out = self._bundle_path()
+        create_bundle(run_path, out)
+        with zipfile.ZipFile(out) as bundle:
+            members = {name: bundle.read(name)
+                       for name in bundle.namelist()
+                       if name != "postmortem.html"}
+        trimmed = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        trimmed.close()
+        self.addCleanup(os.unlink, trimmed.name)
+        with zipfile.ZipFile(trimmed.name, "w",
+                             compression=zipfile.ZIP_DEFLATED) as bundle:
+            for name, data in members.items():
+                bundle.writestr(name, data)
+        with self.assertRaises(ValueError):
+            validate_bundle(trimmed)
+
+    def test_validation_rejects_non_bundle_zip(self):
+        path = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+        path.close()
+        self.addCleanup(os.unlink, path.name)
+        with zipfile.ZipFile(path.name, "w") as bundle:
+            bundle.writestr("hello.txt", "hello")
+        with self.assertRaises(ValueError):
+            validate_bundle(path.name)
+
+    def test_create_bundle_rejects_invalid_run_and_leaves_no_file(self):
+        bad = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with bad:
+            bad.write('{"not": "a run"}')
+        self.addCleanup(os.unlink, bad.name)
+        out = self._bundle_path()
+        with self.assertRaises(ValueError):
+            create_bundle(bad.name, out)
+        self.assertFalse(os.path.exists(out))
+
+    def test_default_bundle_path(self):
+        self.assertEqual(default_bundle_path("/tmp/latency-spike.json"),
+                         "latency-spike-bundle.zip")
+        self.assertEqual(default_bundle_path("disk-full.json"),
+                         "disk-full-bundle.zip")
+
+    def test_cli_bundle_and_check(self):
+        run_path = self._save_run(
+            simulate(get("disk-full"), DEFAULT_POLICY))
+        out = self._bundle_path()
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["bundle", run_path, "--out", out]), 0)
+        self.assertIn("wrote bundle", buf.getvalue())
+        self.assertIn("Disk 97% full on payments-db", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["bundle", "--check", out]), 0)
+        self.assertIn("bundle OK", buf.getvalue())
+        self.assertIn("96/100 (grade A)", buf.getvalue())
+
+    def test_cli_bundle_missing_or_bad_file_fails(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(main(["bundle", "/no/such/run.json"]), 2)
+        bad = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with bad:
+            bad.write("{not json")
+        self.addCleanup(os.unlink, bad.name)
+        with redirect_stderr(err):
+            self.assertEqual(main(["bundle", bad.name]), 2)
+
+    def test_cli_check_tampered_bundle_fails(self):
+        run_path = self._save_run(
+            simulate(get("disk-full"), DEFAULT_POLICY))
+        out = self._bundle_path()
+        create_bundle(run_path, out)
+        with zipfile.ZipFile(out) as bundle:
+            run_data = json.loads(bundle.read("run.json").decode("utf-8"))
+        run_data["score"]["points"] = 100
+        tampered = self._tamper(
+            out, "run.json",
+            (json.dumps(run_data, indent=2) + "\n").encode("utf-8"))
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(main(["bundle", "--check", tampered]), 2)
+        self.assertIn("invalid bundle", err.getvalue())
 
 
 if __name__ == "__main__":

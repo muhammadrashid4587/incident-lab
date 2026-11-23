@@ -5,6 +5,12 @@ import json
 import sys
 
 from . import __version__
+from .bundle import (
+    create_bundle,
+    default_bundle_path,
+    summarize_bundle,
+    validate_bundle,
+)
 from .compare import compare_results
 from .debrief import generate_debrief
 from .difficulty import (
@@ -486,6 +492,23 @@ def main(argv=None) -> int:
                             help="write the HTML to PATH instead of "
                                  "printing it")
 
+    bundle = sub.add_parser(
+        "bundle",
+        help="package a saved --json run as a shareable zip: the run "
+             "JSON, the HTML postmortem and a manifest with provenance "
+             "and SHA-256 hashes, validated as it is created; "
+             "--check validates a bundle someone shared")
+    bundle.add_argument("path", metavar="PATH", nargs="?",
+                        help="path to a JSON file saved from run --json "
+                             "(or a saved what-if --json file), or to a "
+                             "bundle zip with --check")
+    bundle.add_argument("--out", default=None, metavar="PATH",
+                        help="write the bundle zip to PATH instead of "
+                             "<run>-bundle.zip")
+    bundle.add_argument("--check", action="store_true",
+                        help="validate the bundle at PATH instead of "
+                             "creating one")
+
     compare = sub.add_parser(
         "compare",
         help="diff two saved --json runs side by side: score deltas "
@@ -704,6 +727,41 @@ def main(argv=None) -> int:
                   f"{loaded.result.incident.title!r} to {args.out}")
             return 0
         print(text)
+        return 0
+
+    if args.command == "bundle":
+        if args.check:
+            if args.path is None:
+                print("bundle --check needs a bundle zip path",
+                      file=sys.stderr)
+                return 2
+            try:
+                manifest = validate_bundle(args.path)
+            except ValueError as exc:
+                print(f"invalid bundle: {exc}", file=sys.stderr)
+                return 2
+            print(summarize_bundle(manifest))
+            print(f"bundle OK: {args.path}")
+            return 0
+        if args.path is None:
+            print("bundle needs a saved run path", file=sys.stderr)
+            return 2
+        out_path = args.out or default_bundle_path(args.path)
+        try:
+            manifest = create_bundle(args.path, out_path)
+        except OSError as exc:
+            print(f"cannot read bundle file: {exc}", file=sys.stderr)
+            return 2
+        except json.JSONDecodeError as exc:
+            print(f"invalid bundle file: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"invalid bundle file: {exc}", file=sys.stderr)
+            return 2
+        names = ", ".join(entry["name"] for entry in manifest["files"])
+        print(f"wrote bundle for "
+              f"{manifest['incident']['title']!r} to {out_path} "
+              f"({names})")
         return 0
 
     if args.command == "compare":
