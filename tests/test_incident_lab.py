@@ -18,6 +18,7 @@ from incident_lab.difficulty import (
     parse_difficulty,
 )
 from incident_lab.drill import run_drill
+from incident_lab.export_html import render_postmortem_html
 from incident_lab.history import (
     entry_from_result, load_history, record_run, render_all_operators,
     summarize_all, summarize_operator,
@@ -4104,6 +4105,139 @@ class TestErrorBudgetBurn(unittest.TestCase):
         for run in batch.runs:
             self.assertEqual(run.score.slo_percent, 99.9)
             self.assertIsNotNone(run.score.error_budget_burn_pct)
+
+
+class TestHtmlPostmortem(unittest.TestCase):
+    def _save_run(self, result):
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(result.to_dict(), path)
+        self.addCleanup(os.unlink, path.name)
+        return path.name
+
+    def _postmortem_html(self, path, *extra_args):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["postmortem", path, *extra_args]), 0)
+        return buf.getvalue()
+
+    def test_html_contains_key_facts(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY)
+        html_text = render_postmortem_html(result)
+        self.assertIn("<!DOCTYPE html>", html_text)
+        self.assertIn("Disk 97% full on payments-db", html_text)
+        self.assertIn("payments-db", html_text)
+        self.assertIn("96/100 (grade A)", html_text)
+        self.assertIn("ana", html_text)
+        self.assertIn("acked", html_text)
+        self.assertIn("Time-to-ack", html_text)
+        self.assertIn("3m", html_text)
+        self.assertIn("Error budget", html_text)
+        self.assertIn("53.2%", html_text)
+        # Self-contained: inline CSS, no scripts, no external resources.
+        self.assertIn("<style>", html_text)
+        self.assertNotIn("<script", html_text)
+        self.assertNotIn("http://", html_text)
+        self.assertNotIn("https://", html_text)
+
+    def test_html_lists_hints_used_with_cost(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY, hints=1)
+        html_text = render_postmortem_html(result)
+        self.assertIn("Check WAL archiving", html_text)
+        self.assertIn("Total hint cost: 5 points", html_text)
+
+    def test_html_without_hints_says_none_used(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY)
+        self.assertIn("No hints used.",
+                      render_postmortem_html(result))
+
+    def test_html_shows_responder_timings_from_chain(self):
+        result = simulate(get("payments-outage"), get_policy("sev1"))
+        html_text = render_postmortem_html(result)
+        self.assertIn("Responder timings", html_text)
+        self.assertIn("on-call", html_text)
+        self.assertIn("incident commander", html_text)
+        self.assertIn("missed", html_text)
+        self.assertIn("Checkout down: all payments failing", html_text)
+        self.assertIn("no ack within 3m", html_text)
+
+    def test_html_marks_unacked_run(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        html_text = render_postmortem_html(simulate(scenario,
+                                                    DEFAULT_POLICY))
+        self.assertIn("nobody acked", html_text)
+        self.assertIn("0/100 (grade D)", html_text)
+
+    def test_html_escapes_scenario_markup(self):
+        scenario = Scenario(
+            name="xss", service="svc",
+            title="Title with <b>bold</b> markup", severity="low",
+            description="Detail with <script>alert(1)</script> inside.",
+            ack_delay_min=(2, None, None),
+            mitigate_delay_min=1, resolve_delay_min=1,
+            hints=("Hint with <img src=x onerror=alert(1)> in it.",),
+        )
+        html_text = render_postmortem_html(
+            simulate(scenario, DEFAULT_POLICY, hints=1))
+        self.assertIn("&lt;b&gt;bold&lt;/b&gt;", html_text)
+        self.assertIn("&lt;script&gt;alert(1)&lt;/script&gt;", html_text)
+        self.assertIn("&lt;img src=x onerror=alert(1)&gt;", html_text)
+        self.assertNotIn("<b>bold</b>", html_text)
+        self.assertNotIn("<script>alert(1)</script>", html_text)
+        self.assertNotIn("<img src=x", html_text)
+
+    def test_cli_prints_html_and_out_writes_file(self):
+        path = self._save_run(simulate(get("disk-full"), DEFAULT_POLICY))
+        html_text = self._postmortem_html(path)
+        self.assertIn("Disk 97% full on payments-db", html_text)
+        out_path = tempfile.NamedTemporaryFile(
+            suffix=".html", delete=False)
+        out_path.close()
+        self.addCleanup(os.unlink, out_path.name)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["postmortem", path, "--out", out_path.name]), 0)
+        self.assertIn("wrote postmortem", buf.getvalue())
+        with open(out_path.name, encoding="utf-8") as handle:
+            # print() adds one trailing newline to the stdout version.
+            self.assertEqual(handle.read(), html_text.rstrip("\n") + "\n")
+
+    def test_cli_what_if_file_carries_provenance(self):
+        run_path = self._save_run(
+            simulate(get("disk-full"), get_policy("fast")))
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["what-if", run_path, "--ack-timeout", "5",
+                      "--json"]), 0)
+        whatif_path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with whatif_path:
+            whatif_path.write(buf.getvalue())
+        self.addCleanup(os.unlink, whatif_path.name)
+        html_text = self._postmortem_html(whatif_path.name)
+        self.assertIn("What-if replay", html_text)
+        self.assertIn("ack timeout: every level 5m", html_text)
+        self.assertIn("+48 points", html_text)
+        self.assertIn("base run scored 48/100", html_text)
+
+    def test_cli_missing_or_bad_file_fails(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(main(["postmortem", "/no/such/run.json"]), 2)
+        bad = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with bad:
+            bad.write("{not json")
+        self.addCleanup(os.unlink, bad.name)
+        with redirect_stderr(err):
+            self.assertEqual(main(["postmortem", bad.name]), 2)
 
 
 if __name__ == "__main__":

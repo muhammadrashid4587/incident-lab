@@ -51,6 +51,8 @@ python3 -m incident_lab replay /tmp/dns-outage.json
 python3 -m incident_lab run latency-spike --json > /tmp/latency-spike.json
 python3 -m incident_lab debrief /tmp/latency-spike.json
 python3 -m incident_lab debrief /tmp/latency-spike.json --json
+python3 -m incident_lab postmortem /tmp/latency-spike.json
+python3 -m incident_lab postmortem /tmp/latency-spike.json --out postmortem.html
 python3 -m incident_lab run disk-full --seed 1 --json > /tmp/run-seed-1.json
 python3 -m incident_lab run disk-full --seed 7 --json > /tmp/run-seed-7.json
 python3 -m incident_lab compare /tmp/run-seed-1.json /tmp/run-seed-7.json
@@ -150,6 +152,32 @@ as JSON instead of Markdown.
 ```sh
 python3 -m incident_lab run latency-spike --json > latency-spike.json
 python3 -m incident_lab debrief latency-spike.json
+```
+
+## HTML postmortem
+
+`postmortem <path>` renders the same debrief as a self-contained HTML
+page — inline CSS, no JavaScript, no external resources — so it can be
+opened anywhere, attached to a ticket, or pasted into a wiki. It
+carries the score and grade, the timeline, what went well and badly,
+and action items with owners, plus two things the Markdown debrief does
+not show: a per-responder timings table built from the escalation chain
+(when each level was paged, when they acked or missed, how late they
+were, and the impact in effect when they were paged), and the hints the
+run used, with what each one cost. A saved `what-if --json` file renders
+its replay with a provenance box naming the overrides, the points delta
+against the base run, and the base run's score, so a hypothetical replay
+never passes as a run that happened. With `--out PATH` the HTML is
+written to a file instead of printed; without it, it prints to stdout.
+Every string from the run is escaped, so scenario text can never break
+out of the page. A missing file, bad JSON, or a file that is not a saved
+run fails with exit code 2 and an error message.
+
+```sh
+python3 -m incident_lab run latency-spike --json > latency-spike.json
+python3 -m incident_lab postmortem latency-spike.json --out postmortem.html
+python3 -m incident_lab what-if latency-spike.json --ack-timeout 5 --json > latency-spike-whatif.json
+python3 -m incident_lab postmortem latency-spike-whatif.json
 ```
 
 ## Compare
@@ -678,6 +706,10 @@ incident_lab/
                  a saved what-if file as its replayed run, with the
                  base run and overrides kept as provenance
   debrief.py     structured postmortem from a saved run
+  export_html.py self-contained HTML postmortem from a saved run:
+                 score and grade, timeline, per-responder timings
+                 from the escalation chain, hints used, findings and
+                 action items; what-if files render with provenance
   compare.py     side-by-side diff of two saved runs: score deltas,
                  shared-event time shifts, events only one run has
   stats.py       aggregate saved runs: score spread, mean response
@@ -696,7 +728,8 @@ incident_lab/
                  improvement over time, or an overview of all
                  operators — as human text or --json
   cli.py         list / template / policy-template / run / drill /
-                 history / replay / debrief / compare / stats / what-if
+                 history / replay / debrief / postmortem / compare /
+                 stats / what-if
 tests/
   test_incident_lab.py
 scripts/
@@ -756,6 +789,16 @@ exit code 2 and an error message. With `--json` the batch prints
 human-readable form.
 
 ## Version
+
+0.28.0 — HTML postmortem export: `postmortem <saved-run.json>` renders
+the debrief as a self-contained HTML page (inline CSS, no JavaScript,
+no external resources) with the score and grade, the timeline, a
+per-responder timings table from the escalation chain, the hints used
+with what each one cost, findings and action items with owners; a saved
+`what-if --json` file renders its replay with a provenance box (the
+overrides, the points delta and the base run's score), `--out PATH`
+writes the page to a file instead of printing it, and every string from
+the run is escaped.
 
 0.27.0 — error-budget burn: every scenario carries an SLO target
 (`slo_percent`, for example 99.9% for `payments-db`), and the run
@@ -854,3 +897,5 @@ resolved instead of claiming nobody acked.
 - [x] Per-operator drill history: `drill --operator NAME` records the drill (finished or abandoned) in a history file (`~/.incident-lab/history.json` by default, `--history-file PATH` to point elsewhere), and `history --operator NAME` shows that operator's runs in order with scores, grades and response times plus a summary (runs, mean and best score, first vs latest, trend from the second half of runs against the first); plain `history` summarises every operator, `--json` prints either view as JSON, and a drill without `--operator` records nothing (0.25.0)
 - [x] SEV-1 scenario with a multi-level escalation chain: `payments-outage` with a `sev1` policy (on-call 3m, senior 5m, incident commander 10m), impact stages that grow with every missed level, and the escalation chain recorded in `run --json` and shown by `replay`, `debrief`, `compare` and `stats`; `what-if` keeps the original run's impact stages and drills record the chain too (0.26.0)
 - [x] Error-budget burn: every scenario carries an SLO target (`slo_percent`), and the run reports the downtime (declaration to mitigated) as a percentage of the monthly error budget that SLO allows in a 30-day month — over 100% means one incident spent the whole month's budget; shown in `run` output and `run --json`, flagged by `debrief` when over 100%, diffed by `compare`, averaged by `stats`, recomputed by `what-if`, recorded by drills, and settable per scenario in scenario files (0.27.0)
+- [x] HTML postmortem export: `postmortem <saved-run.json>` renders the debrief as a self-contained HTML page (inline CSS, no JavaScript, no external resources) with the score and grade, the timeline, a per-responder timings table from the escalation chain, the hints used with what each one cost, findings and action items with owners; a saved `what-if --json` file renders its replay with a provenance box (the overrides, the points delta and the base run's score), `--out PATH` writes the page to a file, and every string from the run is escaped (0.28.0)
+- [ ] PDF postmortem export, or a shareable postmortem bundle (HTML + run JSON)

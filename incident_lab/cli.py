@@ -11,6 +11,7 @@ from .difficulty import (
     apply_difficulty, list_difficulties, parse_difficulty,
 )
 from .drill import run_drill
+from .export_html import render_postmortem_html
 from .history import (
     DEFAULT_HISTORY_PATH, entry_from_result, load_history, record_run,
     render_all_operators, summarize_all, summarize_operator,
@@ -471,6 +472,20 @@ def main(argv=None) -> int:
                          help="print the postmortem as JSON instead of "
                               "Markdown")
 
+    postmortem = sub.add_parser(
+        "postmortem",
+        help="render a saved --json run as a self-contained HTML "
+             "postmortem: score and grade, timeline, per-responder "
+             "timings, hints used, findings and action items")
+    postmortem.add_argument("path", metavar="PATH",
+                            help="path to a JSON file saved from run "
+                                 "--json (or a saved what-if --json file, "
+                                 "whose replay is rendered with its "
+                                 "provenance)")
+    postmortem.add_argument("--out", default=None, metavar="PATH",
+                            help="write the HTML to PATH instead of "
+                                 "printing it")
+
     compare = sub.add_parser(
         "compare",
         help="diff two saved --json runs side by side: score deltas "
@@ -661,6 +676,34 @@ def main(argv=None) -> int:
             print(json.dumps(debrief.to_dict(), indent=2))
         else:
             print(debrief.render())
+        return 0
+
+    if args.command == "postmortem":
+        try:
+            loaded = load_saved(args.path)
+        except OSError as exc:
+            print(f"cannot read postmortem file: {exc}", file=sys.stderr)
+            return 2
+        except json.JSONDecodeError as exc:
+            print(f"invalid postmortem file: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"invalid postmortem file: {exc}", file=sys.stderr)
+            return 2
+        text = render_postmortem_html(loaded.result,
+                                      what_if=loaded.what_if)
+        if args.out is not None:
+            try:
+                with open(args.out, "w", encoding="utf-8") as handle:
+                    handle.write(text)
+            except OSError as exc:
+                print(f"cannot write postmortem file: {exc}",
+                      file=sys.stderr)
+                return 2
+            print(f"wrote postmortem for "
+                  f"{loaded.result.incident.title!r} to {args.out}")
+            return 0
+        print(text)
         return 0
 
     if args.command == "compare":
