@@ -5,6 +5,7 @@ import json
 import sys
 
 from . import __version__
+from .debrief import generate_debrief
 from .policy import (
     POLICIES, list_policies, load_policy_file, parse_ack_timeout_overrides,
 )
@@ -193,6 +194,15 @@ def main(argv=None) -> int:
     replay.add_argument("path", metavar="PATH",
                         help="path to a JSON file saved from run --json")
 
+    debrief = sub.add_parser(
+        "debrief",
+        help="write a postmortem from a saved --json run")
+    debrief.add_argument("path", metavar="PATH",
+                         help="path to a JSON file saved from run --json")
+    debrief.add_argument("--json", action="store_true",
+                         help="print the postmortem as JSON instead of "
+                              "Markdown")
+
     args = parser.parse_args(argv)
 
     if args.command == "list":
@@ -215,6 +225,25 @@ def main(argv=None) -> int:
             print(f"invalid replay file: {exc}", file=sys.stderr)
             return 2
         _print_result(result)
+        return 0
+
+    if args.command == "debrief":
+        try:
+            result = load_result(args.path)
+        except OSError as exc:
+            print(f"cannot read debrief file: {exc}", file=sys.stderr)
+            return 2
+        except json.JSONDecodeError as exc:
+            print(f"invalid debrief file: {exc}", file=sys.stderr)
+            return 2
+        except ValueError as exc:
+            print(f"invalid debrief file: {exc}", file=sys.stderr)
+            return 2
+        debrief = generate_debrief(result)
+        if args.json:
+            print(json.dumps(debrief.to_dict(), indent=2))
+        else:
+            print(debrief.render())
         return 0
 
     if args.command == "run":

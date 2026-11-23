@@ -10,6 +10,7 @@ from contextlib import redirect_stdout
 from dataclasses import replace
 
 from incident_lab.cli import main, parse_jitter_range, parse_seed_spec
+from incident_lab.debrief import generate_debrief, grade
 from incident_lab.policy import (
     DEFAULT_POLICY, get_policy, list_policies, load_policy_file,
     parse_ack_timeout_overrides,
@@ -1376,6 +1377,141 @@ class TestSeedBatch(unittest.TestCase):
     def test_jitter_without_seed_or_seeds_fails(self):
         self.assertEqual(
             main(["run", "disk-full", "--jitter", "0-3"]), 2)
+
+
+class TestDebrief(unittest.TestCase):
+    def _save_run(self, result):
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(result.to_dict(), path)
+        self.addCleanup(os.unlink, path.name)
+        return path.name
+
+    def test_clean_run_has_no_bad_findings_or_actions(self):
+        # cert-expiry: primary acks in 2m, mitigates in 10m, resolves
+        # in 15m, no escalations, 100 points.
+        result = simulate(get("cert-expiry"), DEFAULT_POLICY)
+        debrief = generate_debrief(result)
+        self.assertEqual(debrief.points, 100)
+        self.assertEqual(debrief.grade, "A")
+        self.assertEqual(debrief.escalations, 0)
+        self.assertEqual(debrief.went_badly, [])
+        self.assertEqual(debrief.action_items, [])
+        self.assertIn("Ack arrived on time (ana acked 2m after being "
+                      "paged, within the 5m timeout)",
+                      debrief.went_well)
+        self.assertIn("Mitigated within the 15m target (10m)",
+                      debrief.went_well)
+        self.assertIn("Incident resolved in 15m", debrief.went_well)
+
+    def test_missed_ack_becomes_bad_finding_and_action(self):
+        # latency-spike: primary misses, secondary acks; mitigation
+        # takes 44m, past the 15m target.
+        result = simulate(get("latency-spike"), DEFAULT_POLICY)
+        debrief = generate_debrief(result)
+        self.assertIn("ana (primary) missed the page — no ack within 5m",
+                      debrief.went_badly)
+        self.assertIn("Mitigation took 44m, 29m past the 15m target",
+                      debrief.went_badly)
+        owners = {item["owner"] for item in debrief.action_items}
+        self.assertEqual(owners, {"ana", "on-call lead"})
+        ana_item = next(item for item in debrief.action_items
+                        if item["owner"] == "ana")
+        self.assertIn("paging delivery", ana_item["action"])
+
+    def test_late_ack_keeps_partial_credit_finding(self):
+        # disk-full on the fast policy: primary acks 1m late, 50%
+        # credit, 48 points.
+        from incident_lab.policy import get_policy
+        result = simulate(get("disk-full"), get_policy("fast"))
+        debrief = generate_debrief(result)
+        self.assertEqual(debrief.points, 48)
+        self.assertEqual(debrief.grade, "D")
+        self.assertIn("Ack was 1m late, keeping only 50% of the score",
+                      debrief.went_badly)
+        self.assertEqual(debrief.action_items[0]["owner"], "ana")
+
+    def test_nobody_acks_blames_every_level_and_adds_fallback(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=1, resolve_delay_min=1,
+        )
+        result = simulate(scenario, DEFAULT_POLICY)
+        debrief = generate_debrief(result)
+        self.assertEqual(debrief.points, 0)
+        self.assertEqual(debrief.grade, "D")
+        self.assertFalse(debrief.resolved)
+        self.assertEqual(debrief.went_well, [])
+        self.assertIn("Nobody acked the page; the incident was never "
+                      "mitigated or resolved", debrief.went_badly)
+        self.assertEqual(len(debrief.went_badly), 4)  # 3 misses + nobody
+        fallback = next(item for item in debrief.action_items
+                        if item["owner"] == "on-call lead")
+        self.assertIn("fallback page", fallback["action"])
+
+    def test_grade_boundaries(self):
+        self.assertEqual(grade(100), "A")
+        self.assertEqual(grade(90), "A")
+        self.assertEqual(grade(89), "B")
+        self.assertEqual(grade(75), "B")
+        self.assertEqual(grade(74), "C")
+        self.assertEqual(grade(50), "C")
+        self.assertEqual(grade(49), "D")
+        self.assertEqual(grade(0), "D")
+
+    def test_debrief_dict_has_summary_findings_and_timeline(self):
+        result = simulate(get("cert-expiry"), DEFAULT_POLICY)
+        data = generate_debrief(result).to_dict()
+        self.assertEqual(data["incident"]["id"], "cert-expiry")
+        self.assertEqual(data["summary"]["points"], 100)
+        self.assertEqual(data["summary"]["grade"], "A")
+        self.assertEqual(data["went_badly"], [])
+        self.assertEqual(data["action_items"], [])
+        self.assertIn("acked", data["timeline"])
+
+    def test_render_is_markdown_with_sections(self):
+        result = simulate(get("latency-spike"), DEFAULT_POLICY)
+        text = generate_debrief(result).render()
+        self.assertIn("# Postmortem: p99 latency over 2s on checkout-api",
+                      text)
+        self.assertIn("## Timeline", text)
+        self.assertIn("## What went well", text)
+        self.assertIn("## What went badly", text)
+        self.assertIn("## Action items", text)
+        self.assertIn("- [ ] Check ana's paging delivery", text)
+        self.assertIn("(owner: ana)", text)
+
+    def test_render_with_no_findings_says_none(self):
+        result = simulate(get("cert-expiry"), DEFAULT_POLICY)
+        text = generate_debrief(result).render()
+        self.assertIn("## What went badly\n\n- none", text)
+        self.assertIn("## Action items\n\n- none", text)
+
+    def test_cli_debrief_from_saved_run(self):
+        result = simulate(get("cert-expiry"), DEFAULT_POLICY)
+        path = self._save_run(result)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["debrief", path]), 0)
+        self.assertIn("# Postmortem: TLS certificate expires in 6 hours",
+                      buf.getvalue())
+        self.assertIn("Score: 100/100 (grade A)", buf.getvalue())
+
+    def test_cli_debrief_json(self):
+        result = simulate(get("latency-spike"), DEFAULT_POLICY)
+        path = self._save_run(result)
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["debrief", path, "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["summary"]["escalations"], 1)
+        self.assertEqual(len(data["action_items"]), 2)
+        self.assertEqual(data["action_items"][0]["owner"], "ana")
+
+    def test_cli_debrief_missing_file_fails(self):
+        self.assertEqual(main(["debrief", "/tmp/no-such-run.json"]), 2)
 
 
 if __name__ == "__main__":

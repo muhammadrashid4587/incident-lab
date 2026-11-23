@@ -1,6 +1,7 @@
 # incident-lab
 
-An SRE incident simulator with escalation policies and timeline replay.
+An SRE incident simulator with escalation policies, timeline replay,
+and postmortem debriefs.
 Pure Python 3, standard library only, no dependencies.
 
 ## What it is
@@ -41,6 +42,9 @@ python3 -m incident_lab run disk-full --seed 7 --jitter 0-3 --json
 python3 -m incident_lab run disk-full --seeds 1,2,3
 python3 -m incident_lab run disk-full --seeds 1-5 --json
 python3 -m incident_lab replay /tmp/dns-outage.json
+python3 -m incident_lab run latency-spike --json > /tmp/latency-spike.json
+python3 -m incident_lab debrief /tmp/latency-spike.json
+python3 -m incident_lab debrief /tmp/latency-spike.json --json
 python3 scripts/demo.py
 ```
 
@@ -79,6 +83,27 @@ python3 -m incident_lab replay dns-outage.json
 
 A missing file, bad JSON, or a file that is not a saved run fails with
 exit code 2 and an error message.
+
+## Debrief
+
+`debrief <path>` reads a JSON file saved from `run --json` and writes
+the postmortem for the incident as Markdown: a summary (score and
+grade — A at 90, B at 75, C at 50, else D — plus time-to-ack,
+time-to-mitigate and time-to-resolve), the timeline, what went well,
+what went badly, and action items. Every finding is derived from the
+run itself, never invented: a missed page names the responder and
+becomes an action to check their paging delivery, a late ack names the
+lateness and the credit it kept, and slow mitigation becomes an action
+to write or rehearse a runbook. An incident nobody acked lists every
+missed level and adds a fallback-page action. Action items carry an
+owner — the responder whose page was missed or late, or the on-call
+lead for the systemic ones. With `--json` the same postmortem prints
+as JSON instead of Markdown.
+
+```sh
+python3 -m incident_lab run latency-spike --json > latency-spike.json
+python3 -m incident_lab debrief latency-spike.json
+```
 
 ## Scenarios
 
@@ -165,7 +190,8 @@ incident_lab/
   scenarios.py   built-in incident scenarios
   simulator.py   deterministic simulation + scoring
   replay.py      rebuild a saved --json run for re-printing
-  cli.py         list / run / replay
+  debrief.py     structured postmortem from a saved run
+  cli.py         list / run / replay / debrief
 tests/
   test_incident_lab.py
 scripts/
@@ -225,11 +251,10 @@ human-readable form.
 
 ## Version
 
-0.12.0 — multi-seed batch mode: `--seeds 1,2,3` or `--seeds 1-5`
-runs the same scenario once per seed and reports the score
-distribution (mean/min/max/median and per-seed scores) in both the
-human output and `--json`, where each run is also kept in full under
-`runs`.
+0.13.0 — debrief/postmortem report generator: `debrief <saved-run.json>`
+writes a structured postmortem (summary with score and grade, timeline,
+what went well / badly, action items with owners) as Markdown or with
+`--json` as JSON, every finding derived from the run itself.
 
 ## Roadmap
 
@@ -245,3 +270,4 @@ human output and `--json`, where each run is also kept in full under
 - [x] `--jitter LO-HI` for a configurable seeded ack-delay jitter range (0.10.0)
 - [x] Seeded jitter for mitigate and resolve delays, recorded in JSON, replay round-trips (0.11.0)
 - [x] Multi-seed batch mode: `--seeds 1,2,3` or `--seeds 1-5` runs the same scenario per seed and reports the score distribution (mean/min/max/median, per-seed scores) in human output and `--json` (0.12.0)
+- [x] Debrief/postmortem report generator: `debrief <saved-run.json>` writes a structured postmortem (summary with score and grade, timeline, what went well / badly, action items with owners) as Markdown or `--json`, every finding derived from the run (0.13.0)

@@ -1,0 +1,265 @@
+"""Debrief: a structured postmortem generated from one simulated run.
+
+Given a SimulationResult (in memory, or rebuilt from a saved
+`run --json` file by replay.load_result), this builds the postmortem a
+team would write after the incident: a short summary, what went well,
+what went badly, and action items. Every finding is derived from the
+run itself — the timeline, the policy levels, and the score — so the
+debrief never invents a cause the simulation did not show.
+
+Action items carry an owner: the responder whose page was missed or
+late, or "on-call lead" for the systemic ones (slow mitigation, nobody
+acking at all).
+"""
+
+from dataclasses import dataclass
+
+from .simulator import (
+    ACK_GRACE_MIN, MITIGATE_GRACE_MIN, SimulationResult,
+)
+
+
+def grade(points: int) -> str:
+    """Letter grade for a run's score: A at 90, B at 75, C at 50, else D."""
+    if points >= 90:
+        return "A"
+    if points >= 75:
+        return "B"
+    if points >= 50:
+        return "C"
+    return "D"
+
+
+@dataclass
+class Debrief:
+    incident_id: str
+    service: str
+    title: str
+    severity: str
+    points: int
+    grade: str
+    time_to_ack_min: object  # int, or None if nobody acked
+    time_to_mitigate_min: object  # int, or None if never mitigated
+    time_to_resolve_min: object  # int, or None if never resolved
+    escalations: int
+    resolved: bool
+    went_well: list  # list[str]
+    went_badly: list  # list[str]
+    # list[{"action": str, "owner": str}]
+    action_items: list
+    timeline: str  # rendered timeline, as replay prints it
+
+    def to_dict(self) -> dict:
+        """JSON-ready dict: summary, findings, action items, timeline."""
+        return {
+            "incident": {
+                "id": self.incident_id,
+                "service": self.service,
+                "title": self.title,
+                "severity": self.severity,
+            },
+            "summary": {
+                "points": self.points,
+                "grade": self.grade,
+                "time_to_ack_min": self.time_to_ack_min,
+                "time_to_mitigate_min": self.time_to_mitigate_min,
+                "time_to_resolve_min": self.time_to_resolve_min,
+                "escalations": self.escalations,
+                "resolved": self.resolved,
+            },
+            "went_well": list(self.went_well),
+            "went_badly": list(self.went_badly),
+            "action_items": [
+                {"action": item["action"], "owner": item["owner"]}
+                for item in self.action_items
+            ],
+            "timeline": self.timeline,
+        }
+
+    def render(self) -> str:
+        """The postmortem as Markdown: summary, timeline, findings."""
+        lines = [
+            f"# Postmortem: {self.title}",
+            "",
+            f"Service: {self.service} [{self.severity}]",
+            f"Score: {self.points}/100 (grade {self.grade})",
+            ("Time-to-ack: "
+             f"{self.time_to_ack_min}m" if self.time_to_ack_min is not None
+             else "Time-to-ack: nobody acked"),
+            ("Time-to-mitigate: "
+             f"{self.time_to_mitigate_min}m"
+             if self.time_to_mitigate_min is not None
+             else "Time-to-mitigate: never mitigated"),
+            ("Time-to-resolve: "
+             f"{self.time_to_resolve_min}m"
+             if self.time_to_resolve_min is not None
+             else "Time-to-resolve: never resolved"),
+            f"Escalations: {self.escalations}",
+            "",
+            "## Timeline",
+            "",
+            self.timeline,
+            "",
+            "## What went well",
+            "",
+        ]
+        if self.went_well:
+            lines.extend(f"- {item}" for item in self.went_well)
+        else:
+            lines.append("- none")
+        lines += ["", "## What went badly", ""]
+        if self.went_badly:
+            lines.extend(f"- {item}" for item in self.went_badly)
+        else:
+            lines.append("- none")
+        lines += ["", "## Action items", ""]
+        if self.action_items:
+            lines.extend(
+                f"- [ ] {item['action']} (owner: {item['owner']})"
+                for item in self.action_items
+            )
+        else:
+            lines.append("- none")
+        return "\n".join(lines)
+
+
+def generate_debrief(result: SimulationResult) -> Debrief:
+    """Build the postmortem for one simulated run.
+
+    The acking level is the first level that did not miss: with N
+    escalations, the first N levels missed and level N acked (or, when
+    nobody acked, every level missed). Findings follow from that and
+    from the score's lateness, mitigation time, and resolution.
+    """
+    score = result.score
+    incident = result.incident
+    went_well = []
+    went_badly = []
+    action_items = []
+
+    if not score.resolved:
+        # Nobody acked: every level in the chain missed the page.
+        for level in result.policy.levels:
+            went_badly.append(
+                f"{level.responder.name} ({level.responder.role}) missed "
+                f"the page — no ack within "
+                f"{level.ack_timeout_min}m")
+            action_items.append({
+                "action": (
+                    f"Check {level.responder.name}'s paging delivery and "
+                    f"alert routing — the page went unanswered for "
+                    f"{level.ack_timeout_min}m"),
+                "owner": level.responder.name,
+            })
+        went_badly.append(
+            "Nobody acked the page; the incident was never mitigated "
+            "or resolved")
+        action_items.append({
+            "action": (
+                "Add a fallback page outside the chain (for example the "
+                "on-call manager directly) for when nobody acks"),
+            "owner": "on-call lead",
+        })
+        return Debrief(
+            incident_id=incident.id,
+            service=incident.service,
+            title=incident.title,
+            severity=incident.severity,
+            points=score.points,
+            grade=grade(score.points),
+            time_to_ack_min=None,
+            time_to_mitigate_min=None,
+            time_to_resolve_min=None,
+            escalations=score.escalations,
+            resolved=False,
+            went_well=went_well,
+            went_badly=went_badly,
+            action_items=action_items,
+            timeline=result.timeline.render(),
+        )
+
+    # The first `escalations` levels missed; the next level acked.
+    missed = result.policy.levels[:score.escalations]
+    acking = result.policy.levels[score.escalations]
+    # Minutes from when the acking level was paged to its ack: the
+    # time-to-ack minus the timeouts waited out on the missed levels.
+    ack_delay_min = (score.time_to_ack_min
+                     - sum(level.ack_timeout_min for level in missed))
+    for level in missed:
+        went_badly.append(
+            f"{level.responder.name} ({level.responder.role}) missed "
+            f"the page — no ack within {level.ack_timeout_min}m")
+        action_items.append({
+            "action": (
+                f"Check {level.responder.name}'s paging delivery and "
+                f"alert routing — the page went unanswered for "
+                f"{level.ack_timeout_min}m"),
+            "owner": level.responder.name,
+        })
+
+    if score.escalations == 0:
+        went_well.append(
+            f"{acking.responder.name} ({acking.responder.role}) acked "
+            "first time, with no escalation")
+
+    if score.ack_late_min == 0:
+        went_well.append(
+            f"Ack arrived on time ({acking.responder.name} acked "
+            f"{ack_delay_min}m after being paged, within the "
+            f"{acking.ack_timeout_min}m timeout)")
+    else:
+        went_badly.append(
+            f"Ack was {score.ack_late_min}m late, keeping only "
+            f"{score.ack_credit:.0%} of the score")
+        action_items.append({
+            "action": (
+                f"Review why {acking.responder.name} acked "
+                f"{score.ack_late_min}m late and whether the "
+                f"{acking.ack_timeout_min}m {acking.responder.role} "
+                "timeout still fits"),
+            "owner": acking.responder.name,
+        })
+
+    if score.time_to_mitigate_min <= MITIGATE_GRACE_MIN:
+        went_well.append(
+            f"Mitigated within the {MITIGATE_GRACE_MIN}m target "
+            f"({score.time_to_mitigate_min}m)")
+    else:
+        over = score.time_to_mitigate_min - MITIGATE_GRACE_MIN
+        went_badly.append(
+            f"Mitigation took {score.time_to_mitigate_min}m, {over}m "
+            f"past the {MITIGATE_GRACE_MIN}m target")
+        action_items.append({
+            "action": (
+                f"Write or rehearse a runbook for {incident.title} on "
+                f"{incident.service} — mitigation took "
+                f"{score.time_to_mitigate_min}m against a "
+                f"{MITIGATE_GRACE_MIN}m target"),
+            "owner": "on-call lead",
+        })
+
+    if score.time_to_ack_min <= ACK_GRACE_MIN:
+        went_well.append(
+            f"Time-to-ack ({score.time_to_ack_min}m) was inside the "
+            f"{ACK_GRACE_MIN}m target")
+
+    went_well.append(
+        f"Incident resolved in {score.time_to_resolve_min}m")
+
+    return Debrief(
+        incident_id=incident.id,
+        service=incident.service,
+        title=incident.title,
+        severity=incident.severity,
+        points=score.points,
+        grade=grade(score.points),
+        time_to_ack_min=score.time_to_ack_min,
+        time_to_mitigate_min=score.time_to_mitigate_min,
+        time_to_resolve_min=score.time_to_resolve_min,
+        escalations=score.escalations,
+        resolved=True,
+        went_well=went_well,
+        went_badly=went_badly,
+        action_items=action_items,
+        timeline=result.timeline.render(),
+    )
