@@ -152,9 +152,14 @@ def load_result(path: str) -> SimulationResult:
         data = json.load(handle)
     if not isinstance(data, dict):
         raise ValueError("replay file: expected a JSON object")
+    seed = data.get("seed")
+    if seed is not None and (isinstance(seed, bool)
+                             or not isinstance(seed, int)):
+        raise ValueError("replay file: 'seed' must be an integer or null")
     return SimulationResult(
         incident=_incident_from_dict(data.get("incident")),
         policy=_policy_from_dict(data.get("policy")),
         timeline=_timeline_from_dict(data.get("timeline")),
         score=_score_from_dict(data.get("score")),
+        seed=seed,
     )

@@ -817,5 +817,111 @@ class TestAckTimeoutOverrides(unittest.TestCase):
             [10, 2, 5])
 
 
+class TestSeededAckDelays(unittest.TestCase):
+    def test_same_seed_reproduces_identical_result(self):
+        first = simulate(get("disk-full"), DEFAULT_POLICY, seed=7)
+        second = simulate(get("disk-full"), DEFAULT_POLICY, seed=7)
+        self.assertEqual(first.to_dict(), second.to_dict())
+
+    def test_same_seed_reproduces_identical_json_bytes(self):
+        def run_json():
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                self.assertEqual(
+                    main(["run", "disk-full", "--seed", "7", "--json"]), 0)
+            return buf.getvalue()
+        self.assertEqual(run_json(), run_json())
+
+    def test_different_seeds_vary_the_ack_delay(self):
+        # disk-full's fixed ack is 3m; the seed jitters it by up to 1m,
+        # so across many seeds at least two distinct ack times appear.
+        ack_times = {
+            simulate(get("disk-full"), DEFAULT_POLICY, seed=seed)
+            .score.time_to_ack_min
+            for seed in range(20)
+        }
+        self.assertGreater(len(ack_times), 1)
+
+    def test_seeded_delay_stays_within_one_minute_of_fixed_delay(self):
+        for seed in range(20):
+            result = simulate(get("disk-full"), DEFAULT_POLICY, seed=seed)
+            self.assertIn(result.score.time_to_ack_min, (2, 3, 4))
+
+    def test_seed_is_recorded_in_json_output(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "disk-full", "--seed", "7", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertEqual(data["seed"], 7)
+
+    def test_unseeded_run_records_null_seed(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "disk-full", "--json"]), 0)
+        data = json.loads(buf.getvalue())
+        self.assertIsNone(data["seed"])
+
+    def test_unseeded_run_uses_fixed_delays(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY)
+        self.assertIsNone(result.seed)
+        self.assertEqual(result.score.time_to_ack_min, 3)
+
+    def test_seed_shown_in_human_output(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "disk-full", "--seed", "7"]), 0)
+        self.assertIn("seed:     7", buf.getvalue())
+
+    def test_seed_does_not_change_who_acks(self):
+        # latency-spike: primary misses, secondary acks. The seed only
+        # jitters the acking responder's delay, so the escalation count
+        # and the acking level stay the same for every seed.
+        for seed in range(20):
+            result = simulate(get("latency-spike"), DEFAULT_POLICY,
+                              seed=seed)
+            self.assertEqual(result.score.escalations, 1)
+            self.assertIn(result.score.time_to_ack_min, (8, 9, 10))
+
+    def test_seeded_unacked_run_records_the_seed(self):
+        scenario = Scenario(
+            name="ghost", service="svc", title="ghost", severity="high",
+            description="", ack_delay_min=(None, None, None),
+            mitigate_delay_min=10, resolve_delay_min=10,
+        )
+        result = simulate(scenario, DEFAULT_POLICY, seed=3)
+        self.assertEqual(result.seed, 3)
+        self.assertFalse(result.score.resolved)
+
+    def test_seeded_replay_round_trip(self):
+        original = simulate(get("disk-full"), DEFAULT_POLICY, seed=7)
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(original.to_dict(), path)
+        self.addCleanup(os.unlink, path.name)
+        loaded = load_result(path.name)
+        self.assertEqual(loaded.seed, 7)
+        self.assertEqual(loaded.to_dict(), original.to_dict())
+        replay_buf = io.StringIO()
+        with redirect_stdout(replay_buf):
+            self.assertEqual(main(["replay", path.name]), 0)
+        run_buf = io.StringIO()
+        with redirect_stdout(run_buf):
+            self.assertEqual(main(["run", "disk-full", "--seed", "7"]), 0)
+        self.assertEqual(replay_buf.getvalue(), run_buf.getvalue())
+
+    def test_bad_seed_in_replay_file_raises(self):
+        data = simulate(get("cert-expiry"), DEFAULT_POLICY).to_dict()
+        data["seed"] = "seven"
+        path = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with path:
+            json.dump(data, path)
+        self.addCleanup(os.unlink, path.name)
+        with self.assertRaises(ValueError):
+            load_result(path.name)
+
+
 if __name__ == "__main__":
     unittest.main()

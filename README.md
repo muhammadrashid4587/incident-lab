@@ -36,6 +36,7 @@ python3 -m incident_lab run latency-spike --ack-timeouts 120,300,600
 python3 -m incident_lab run latency-spike --ack-timeouts primary=120 L2=300
 python3 -m incident_lab run disk-full --policy-file examples/custom-policy.json
 python3 -m incident_lab run dns-outage --json > /tmp/dns-outage.json
+python3 -m incident_lab run disk-full --seed 7 --json
 python3 -m incident_lab replay /tmp/dns-outage.json
 python3 scripts/demo.py
 ```
@@ -48,7 +49,8 @@ timeouts), the timeline in time order, and the score. The score carries
 the acking level's lateness (`ack_late_min`, 0 for an on-time ack) and
 the partial credit it kept (`ack_credit`, 1.0 on time). Unreached milestones
 serialize as `null` (for example, an incident nobody acks has
-`"time_to_ack_min": null` and `"points": 0`).
+`"time_to_ack_min": null` and `"points": 0`). The top-level `seed` records
+the `--seed` value used for the run, or `null` for an unseeded run.
 
 ## Replay
 
@@ -164,12 +166,22 @@ examples/
 make test
 ```
 
+## Seeded runs
+
+`run <scenario> --seed N` jitters each ack delay by up to 1 minute either
+way, drawn from a random generator seeded with `N`, so the same seed
+replays the same run exactly (same timeline, same score, byte-identical
+`--json` output) while different seeds vary the response times. A miss
+stays a miss, so the seed never changes who acks or how many escalations
+happen — only how quickly the acking responder answers. The seed is
+recorded in the `run --json` output (top-level `seed`) and shown in the
+human-readable output, and `replay` re-prints it from a saved run.
+
 ## Version
 
-0.8.0 — Late-ack partial credit: an ack after its level's timeout still
-counts, with credit decaying linearly from 1.0 at the timeout to 0.0 at
-twice the timeout; the acking level's lateness and the credit are shown
-in the run output and in the `run --json` score.
+0.9.0 — `--seed N` for randomized ack delays: each ack delay is jittered
+by up to 1 minute from a seeded RNG, so a run is reproducible (same seed,
+same output) and the seed is recorded in the `run --json` output.
 
 ## Roadmap
 
@@ -181,3 +193,4 @@ in the run output and in the `run --json` score.
 - [x] `replay` command: re-print a timeline from a saved `--json` run (0.6.0)
 - [x] Per-level ack timeouts on the command line (0.7.0)
 - [x] Late-ack partial credit: linear decay to zero at 2x the timeout (0.8.0)
+- [x] `--seed N` for randomized ack delays: reproducible runs (0.9.0)
