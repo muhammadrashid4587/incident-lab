@@ -406,6 +406,47 @@ SCENARIOS = {
             "invoices delayed",
         ),
     ),
+    "cdn-purge-failure": Scenario(
+        name="cdn-purge-failure",
+        service="edge-cdn",
+        title="CDN purge silently fails, stale assets keep serving",
+        severity="high",
+        description=(
+            "A bad deploy shipped new asset references, and the CDN "
+            "purge that was supposed to clear the old ones silently "
+            "failed: the purge API returned 200 and the dashboard "
+            "says purged, but nothing was actually invalidated, so "
+            "users see mixed old and new content and support tickets "
+            "spike. The primary does not believe the page at first — "
+            "the dashboard says the purge worked — and acks 3m late, "
+            "then forces a full invalidation and ships versioned "
+            "asset URLs while the stale content spreads."
+        ),
+        ack_delay_min=(8, None, None),
+        mitigate_delay_min=30,
+        resolve_delay_min=15,
+        slo_percent=99.9,
+        hints=(
+            "Check the purge by fetching the asset yourself, not by "
+            "trusting the purge dashboard: a purge API that returns "
+            "200 without purging is the classic silent failure.",
+            "Force a full invalidation and ship versioned asset "
+            "URLs: purging the same paths again will fail the same "
+            "silent way, and versioned URLs stop the old bundle "
+            "from being served at all.",
+            "Verify the fix from a cold edge node in every region: "
+            "a purge that reached one region leaves the others "
+            "serving stale assets.",
+        ),
+        impact_stages=(
+            "Some users seeing stale assets: mixed old and new "
+            "content after the deploy",
+            "Stale checkout assets: users on the old checkout flow, "
+            "support tickets spiking",
+            "Widespread stale content: most users on the old "
+            "bundle, checkout errors rising",
+        ),
+    ),
 }
 
 
