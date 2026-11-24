@@ -485,6 +485,45 @@ SCENARIOS = {
             "revenue stopped",
         ),
     ),
+    "key-rotation": Scenario(
+        name="key-rotation",
+        service="payments-tokens",
+        title="Key rotation breaks saved-card decryption",
+        severity="critical",
+        description=(
+            "A scheduled KMS key rotation retired the old data key "
+            "before the new one had propagated to every payments "
+            "worker, so stored card tokens can no longer be decrypted "
+            "and saved-card checkouts fail. The on-call is mid-handover "
+            "on another incident bridge and acks 2m late against the "
+            "sev1 policy's 3m window, then rolls the rotation back "
+            "while the impact grows from saved-card checkouts failing "
+            "to payments blocked."
+        ),
+        ack_delay_min=(5,),
+        mitigate_delay_min=35,
+        resolve_delay_min=20,
+        slo_percent=99.95,
+        hints=(
+            "Roll back the key rotation first: the old key still "
+            "decrypts the stored tokens, and a rollback is faster "
+            "than re-encrypting every token with the new key.",
+            "Check which workers got the new key: a rotation that "
+            "only reached some workers looks like a partial outage, "
+            "not a key problem, until you compare the key versions.",
+            "Verify a saved-card test payment decrypts after the "
+            "rollback before declaring the incident mitigated; "
+            "tokens that still fail will keep checkout down.",
+        ),
+        impact_stages=(
+            "Saved-card checkouts failing: stored tokens cannot be "
+            "decrypted, new cards still work",
+            "Checkout failing: token cache expiring, saved cards and "
+            "one-click checkout down",
+            "Payments blocked: tokens unusable everywhere, customers "
+            "cannot pay at all",
+        ),
+    ),
 }
 
 

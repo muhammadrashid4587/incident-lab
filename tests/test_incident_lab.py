@@ -4791,6 +4791,113 @@ class TestFraudRulesMisfireScenario(unittest.TestCase):
         self.assertIn("61/100", out)
 
 
+class TestKeyRotationScenario(unittest.TestCase):
+    """key-rotation: a KMS key rotation breaks saved-card decryption.
+
+    The on-call acks 2m late against the sev1 policy's 3m window, so
+    this is the library's first built-in run designed for the sev1
+    policy with a late ack by the first level: no miss, no escalation,
+    but the late ack keeps only a third of the score, and the chain
+    records the first impact stage while the stages spell out the
+    token-decryption failure spreading.
+    """
+
+    def test_key_rotation_scenario(self):
+        scenario = get("key-rotation")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "payments-tokens")
+        self.assertEqual(scenario.ack_delay_min, (5,))
+        self.assertEqual(scenario.slo_percent, 99.95)
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_late_ack_on_sev1_keeps_a_third_of_the_score(self):
+        result = simulate(get("key-rotation"), get_policy("sev1"))
+        score = result.score
+        # Sev1 timeouts 3m, 5m, 10m: the on-call acks at 5m, 2m late
+        # against the 3m window, with no escalation.
+        self.assertEqual(score.time_to_ack_min, 5)
+        self.assertEqual(score.time_to_mitigate_min, 40)
+        self.assertEqual(score.time_to_resolve_min, 60)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 0)
+        self.assertEqual(score.ack_late_min, 2)
+        self.assertAlmostEqual(score.ack_credit, 1 / 3)
+        # 100 - 0 (no escalations) - 0 (5m to ack inside the 5m
+        # grace) - 12 (40m to mitigate past the 15m grace, halved)
+        # = 88, scaled by the 1/3 ack credit: round(88 / 3) = 29.
+        self.assertEqual(score.points, 29)
+        # Downtime 40m against a 99.95% budget of 21.6m.
+        self.assertEqual(score.downtime_min, 40)
+        self.assertEqual(score.error_budget_burn_pct, 185.2)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 1)
+        self.assertEqual(chain[0].outcome, "acked")
+        self.assertEqual(chain[0].paged_at_min, 0)
+        self.assertEqual(chain[0].acked_at_min, 5)
+        self.assertEqual(chain[0].ack_late_min, 2)
+        self.assertEqual(
+            chain[0].impact,
+            "Saved-card checkouts failing: stored tokens cannot be "
+            "decrypted, new cards still work")
+
+    def test_late_ack_is_on_time_on_the_standard_policy(self):
+        # The same 5m ack is on time against the standard policy's
+        # 5m primary timeout, so the full credit is kept there: the
+        # lateness is a property of the sev1 policy, not the incident.
+        result = simulate(get("key-rotation"), DEFAULT_POLICY)
+        score = result.score
+        self.assertEqual(score.ack_late_min, 0)
+        self.assertAlmostEqual(score.ack_credit, 1.0)
+        self.assertEqual(score.points, 88)
+
+    def test_debrief_of_late_ack_names_the_lateness(self):
+        result = simulate(get("key-rotation"), get_policy("sev1"))
+        text = generate_debrief(result).render()
+        self.assertIn("ana", text)
+        self.assertIn("2m late", text)
+        self.assertIn("33% of the score", text)
+
+    def test_template_round_trips_key_rotation(self):
+        data = scenario_to_dict(get("key-rotation"))
+        self.assertEqual(data["ack_delay_min"], [5])
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"key-rotation": data}}, handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["key-rotation"], get("key-rotation"))
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("key-rotation"), get_policy("sev1"),
+            input_stream=io.StringIO(
+                "ack 5\nmitigate 35\nresolve 20\n"),
+            prompt_stream=io.StringIO())
+        run = simulate(get("key-rotation"), get_policy("sev1"))
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 29)
+
+    def test_cli_runs_key_rotation_sev1(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "key-rotation", "--policy", "sev1"]),
+                0)
+        out = buf.getvalue()
+        self.assertIn("29/100", out)
+
+    def test_cli_runs_key_rotation_sev1_with_hints(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "key-rotation", "--policy", "sev1",
+                      "--hints", "3"]), 0)
+        out = buf.getvalue()
+        self.assertIn("key rotation", out)
+        self.assertIn("14/100", out)
+
+
 class TestErrorBudgetBurn(unittest.TestCase):
     def _write_scenario_file(self, data):
         handle = tempfile.NamedTemporaryFile(
@@ -5167,7 +5274,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.40.0", text)
+        self.assertIn("Generated by incident-lab 0.41.0", text)
         self.assertIn("Page 1 of 1", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -5367,7 +5474,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.40.0")
+                         "incident-lab 0.41.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -6028,7 +6135,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.40.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.41.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
