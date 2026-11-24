@@ -11,8 +11,8 @@ from .bundle import (
     summarize_bundle,
     validate_bundle,
 )
-from .compare import compare_results
-from .debrief import generate_debrief
+from .compare import compare_results, compare_shifts
+from .debrief import generate_debrief, generate_shift_debrief
 from .difficulty import (
     apply_difficulty, list_difficulties, parse_difficulty,
 )
@@ -27,10 +27,11 @@ from .policy import (
     POLICIES, apply_rota, current_rota_week, list_policies, load_policy_file,
     load_rota_file, parse_ack_timeout_overrides, policy_template,
 )
-from .replay import load_result, load_saved
+from .replay import load_result, load_saved, load_shift_or_result
 from .scenarios import (
     SCENARIOS, get, list_scenarios, load_scenario_file, scenario_to_dict,
 )
+from .shift import simulate_shift
 from .simulator import simulate, simulate_batch
 from .stats import aggregate_stats
 from .whatif import what_if
@@ -347,6 +348,64 @@ def _resolve_scenario_policy(args):
     return scenario, policy, difficulty, rota_week
 
 
+def _resolve_shift(args):
+    """Load the scenarios, policy and difficulty for `shift`.
+
+    Every scenario name on the command line is resolved (built-in,
+    or from ``--scenario-file``), and the policy / difficulty / rota
+    are resolved once through `_resolve_scenario_policy` with the
+    first scenario — the policy is the same for every incident in
+    the shift. Returns ``(scenarios, policy, difficulty, rota_week)``
+    — ``difficulty`` is None when no ``--difficulty`` was given, and
+    ``rota_week`` is None when no ``--rota-file`` was given — or None
+    after printing the error, for the caller to fail with exit code 2.
+    """
+    import types
+
+    file_scenarios = {}
+    if args.scenario_file is not None:
+        try:
+            file_scenarios = load_scenario_file(args.scenario_file)
+        except OSError as exc:
+            print(f"cannot read scenario file: {exc}", file=sys.stderr)
+            return None
+        except json.JSONDecodeError as exc:
+            print(f"invalid scenario file: {exc}", file=sys.stderr)
+            return None
+        except ValueError as exc:
+            print(f"invalid scenario file: {exc}", file=sys.stderr)
+            return None
+    scenarios = []
+    for name in args.scenarios:
+        if name in file_scenarios:
+            scenarios.append(file_scenarios[name])
+        else:
+            try:
+                scenarios.append(get(name))
+            except KeyError:
+                print(f"unknown scenario: {name}", file=sys.stderr)
+                known = list_scenarios() + sorted(
+                    scenario_name for scenario_name in file_scenarios
+                    if scenario_name not in SCENARIOS)
+                print(f"known scenarios: {', '.join(known)}",
+                      file=sys.stderr)
+                return None
+    # The policy, difficulty and rota are shared by the whole shift:
+    # resolve them once, with the first scenario, and reuse them.
+    # Shifts take no --hints and no per-level ack timeouts — those
+    # belong to a single run, not a shift.
+    shim = types.SimpleNamespace(**vars(args))
+    shim.scenario = args.scenarios[0]
+    shim.ack_timeout = None
+    shim.ack_timeouts = None
+    shim.hints = 0
+    resolved = _resolve_scenario_policy(shim)
+    if resolved is None:
+        return None
+    _, policy, difficulty, rota_week = resolved
+    return scenarios, policy, difficulty, rota_week
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         prog="incident-lab",
@@ -433,6 +492,60 @@ def main(argv=None) -> int:
                           "combined with --seeds")
     run.add_argument("--json", action="store_true",
                      help="print the result as JSON instead of the replay")
+
+    shift = sub.add_parser(
+        "shift",
+        help="run several scenarios back-to-back against one shared "
+             "error budget: burn accumulates across incidents, and the "
+             "shift ends early (skipped incidents score 0) when the "
+             "budget runs out")
+    shift.add_argument("scenarios", nargs="+", metavar="SCENARIO",
+                       help="scenario names in shift order "
+                            "(see: incident-lab list)")
+    shift.add_argument("--scenario-file", default=None, metavar="PATH",
+                       help="load named scenarios from a JSON file; a file "
+                            "scenario with the same name as a built-in one "
+                            "wins (see: incident-lab template)")
+    shift.add_argument("--slo", type=float, default=None, metavar="PCT",
+                       help="the shared SLO target in percent (90 up to "
+                            "but not including 100); default: the first "
+                            "scenario's SLO, and the shift fails when no "
+                            "scenario carries one")
+    shift.add_argument("--policy", default=None,
+                       help="escalation policy to use "
+                            f"({', '.join(list_policies())})")
+    shift.add_argument("--policy-file", default=None, metavar="PATH",
+                       help="load named policies from a JSON file; use one "
+                            "with --policy, or the file's only policy if it "
+                            "has exactly one")
+    shift.add_argument("--rota-file", default=None, metavar="PATH",
+                       help="load an on-call rota from a JSON file: each "
+                            "role maps to a weekly rotation list of "
+                            "responder names, and the shift pages whoever "
+                            "is on call for --rota-week (default: this "
+                            "week)")
+    shift.add_argument("--rota-week", type=int, default=None, metavar="N",
+                       help="which week of the rota to page (0-based index "
+                            "into each role's rotation list, wrapping "
+                            "around); needs --rota-file, default: the "
+                            "current ISO calendar week")
+    shift.add_argument("--difficulty", default=None,
+                       help="difficulty level: "
+                            f"{', '.join(list_difficulties())} (or 1, 2, 3); "
+                            "scales ack timeouts, scoring targets and the "
+                            "default seeded jitter; default normal")
+    shift.add_argument("--seed", type=int, default=None, metavar="N",
+                       help="seed the RNG that jitters ack delays: "
+                            "incident i in the shift uses seed N+i, so the "
+                            "shift replays exactly while the incidents "
+                            "still vary; recorded in --json output")
+    shift.add_argument("--jitter", default=None, metavar="LO-HI",
+                       help="jitter range in minutes for seeded ack delays, "
+                            "e.g. 0-3; requires --seed, default 0-1; "
+                            "recorded in --json output")
+    shift.add_argument("--json", action="store_true",
+                       help="print the shift as JSON instead of the "
+                            "human-readable summary")
 
     drill = sub.add_parser(
         "drill",
@@ -731,7 +844,7 @@ def main(argv=None) -> int:
 
     if args.command == "replay":
         try:
-            result = load_result(args.path)
+            kind, loaded = load_shift_or_result(args.path)
         except OSError as exc:
             print(f"cannot read replay file: {exc}", file=sys.stderr)
             return 2
@@ -741,12 +854,15 @@ def main(argv=None) -> int:
         except ValueError as exc:
             print(f"invalid replay file: {exc}", file=sys.stderr)
             return 2
-        _print_result(result)
+        if kind == "shift":
+            print(loaded.render())
+        else:
+            _print_result(loaded)
         return 0
 
     if args.command == "debrief":
         try:
-            result = load_result(args.path)
+            kind, loaded = load_shift_or_result(args.path)
         except OSError as exc:
             print(f"cannot read debrief file: {exc}", file=sys.stderr)
             return 2
@@ -756,7 +872,10 @@ def main(argv=None) -> int:
         except ValueError as exc:
             print(f"invalid debrief file: {exc}", file=sys.stderr)
             return 2
-        debrief = generate_debrief(result)
+        if kind == "shift":
+            debrief = generate_shift_debrief(loaded)
+        else:
+            debrief = generate_debrief(loaded)
         if args.json:
             print(json.dumps(debrief.to_dict(), indent=2))
         else:
@@ -849,7 +968,7 @@ def main(argv=None) -> int:
         loaded = []
         for path in (args.path_a, args.path_b):
             try:
-                loaded.append(load_saved(path))
+                entry = load_saved(path)
             except OSError as exc:
                 print(f"cannot read compare file: {exc}", file=sys.stderr)
                 return 2
@@ -857,13 +976,33 @@ def main(argv=None) -> int:
                 print(f"invalid compare file: {exc}", file=sys.stderr)
                 return 2
             except ValueError as exc:
-                print(f"invalid compare file: {exc}", file=sys.stderr)
-                return 2
-        comparison = compare_results(loaded[0].result, loaded[1].result,
-                                     label_a=args.path_a,
-                                     label_b=args.path_b,
-                                     whatif_a=loaded[0].what_if,
-                                     whatif_b=loaded[1].what_if)
+                # A shift file is not a single run: load it as a
+                # shift instead, and compare shifts with shifts.
+                if "shift file" not in str(exc):
+                    print(f"invalid compare file: {exc}", file=sys.stderr)
+                    return 2
+                try:
+                    _, shift = load_shift_or_result(path)
+                except ValueError as exc:
+                    print(f"invalid compare file: {exc}", file=sys.stderr)
+                    return 2
+                loaded.append(("shift", shift, None))
+                continue
+            loaded.append(("run", entry.result, entry.what_if))
+        if loaded[0][0] == "shift" and loaded[1][0] == "shift":
+            comparison = compare_shifts(loaded[0][1], loaded[1][1],
+                                        label_a=args.path_a,
+                                        label_b=args.path_b)
+        elif loaded[0][0] != loaded[1][0]:
+            print("cannot compare a shift with a single run: compare "
+                  "two shifts, or two runs", file=sys.stderr)
+            return 2
+        else:
+            comparison = compare_results(loaded[0][1], loaded[1][1],
+                                         label_a=args.path_a,
+                                         label_b=args.path_b,
+                                         whatif_a=loaded[0][2],
+                                         whatif_b=loaded[1][2])
         if args.json:
             print(json.dumps(comparison.to_dict(), indent=2))
         else:
@@ -871,10 +1010,13 @@ def main(argv=None) -> int:
         return 0
 
     if args.command == "stats":
-        loaded = []
+        results = []
+        labels = []
+        whatifs = []
+        shift_count = 0
         for path in args.paths:
             try:
-                loaded.append(load_saved(path))
+                entry = load_saved(path)
             except OSError as exc:
                 print(f"cannot read stats file: {exc}", file=sys.stderr)
                 return 2
@@ -882,12 +1024,27 @@ def main(argv=None) -> int:
                 print(f"invalid stats file: {exc}", file=sys.stderr)
                 return 2
             except ValueError as exc:
-                print(f"invalid stats file: {exc}", file=sys.stderr)
-                return 2
-        summary = aggregate_stats([entry.result for entry in loaded],
-                                  labels=list(args.paths),
-                                  whatifs=[entry.what_if
-                                           for entry in loaded])
+                # A shift file contributes one row per incident it
+                # ran, labelled with its scenario.
+                if "shift file" not in str(exc):
+                    print(f"invalid stats file: {exc}", file=sys.stderr)
+                    return 2
+                try:
+                    _, shift = load_shift_or_result(path)
+                except ValueError as exc:
+                    print(f"invalid stats file: {exc}", file=sys.stderr)
+                    return 2
+                shift_count += 1
+                for run in shift.runs:
+                    results.append(run)
+                    labels.append(f"{path}:{run.incident.id}")
+                    whatifs.append(None)
+                continue
+            results.append(entry.result)
+            labels.append(path)
+            whatifs.append(entry.what_if)
+        summary = aggregate_stats(results, labels=labels, whatifs=whatifs,
+                                  shift_count=shift_count)
         if args.json:
             print(json.dumps(summary.to_dict(), indent=2))
         else:
@@ -960,6 +1117,40 @@ def main(argv=None) -> int:
             print(json.dumps(outcome.to_dict(), indent=2))
         else:
             print(outcome.render())
+        return 0
+
+    if args.command == "shift":
+        resolved = _resolve_shift(args)
+        if resolved is None:
+            return 2
+        scenarios, policy, difficulty, rota_week = resolved
+        if args.slo is not None and not 90 <= args.slo < 100:
+            print("--slo must be from 90 up to (but not including) 100",
+                  file=sys.stderr)
+            return 2
+        jitter = None
+        if args.jitter is not None:
+            if args.seed is None:
+                print("--jitter requires --seed", file=sys.stderr)
+                return 2
+            try:
+                jitter = parse_jitter_range(args.jitter)
+            except ValueError as exc:
+                print(f"invalid --jitter: {exc}", file=sys.stderr)
+                return 2
+        try:
+            shift = simulate_shift(scenarios, policy,
+                                   slo_percent=args.slo,
+                                   difficulty=difficulty,
+                                   seed=args.seed, jitter=jitter,
+                                   rota_week=rota_week)
+        except ValueError as exc:
+            print(f"invalid shift: {exc}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(json.dumps(shift.to_dict(), indent=2))
+        else:
+            print(shift.render())
         return 0
 
     if args.command == "run":

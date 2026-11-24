@@ -75,6 +75,10 @@ class RunStats:
     # How many runs saw their impact grow while the page went
     # unanswered (the chain's impact changed between levels).
     impact_growth_runs: int
+    # How many of the input files were shifts rather than single
+    # runs: a shift contributes one row per incident it ran, so this
+    # says how many of the rows came from shifts.
+    shift_count: int = 0
 
     def to_dict(self) -> dict:
         """JSON-ready dict: per-run rows and the aggregates."""
@@ -101,6 +105,7 @@ class RunStats:
             "impact_growth_runs": self.impact_growth_runs,
             "grades": dict(self.grade_counts),
             "what_if_runs": self.whatif_count,
+            "shift_files": self.shift_count,
             "by_scenario": {
                 name: dict(entry)
                 for name, entry in self.by_scenario.items()
@@ -146,6 +151,11 @@ class RunStats:
             lines.append(
                 f"what-if runs: {self.whatif_count} "
                 f"(hypothetical replays, flagged per run in --json)")
+        if self.shift_count:
+            lines.append(
+                f"shift files: {self.shift_count} (each incident in a "
+                f"shift counted as a run; the shift's shared-budget "
+                f"burn is in the shift file, not these rows)")
         lines.append("")
         lines.append("grades:")
         for letter in ("A", "B", "C", "D"):
@@ -192,7 +202,7 @@ def _impact_grew(result) -> bool:
 
 
 def aggregate_stats(results: list, labels: list = None,
-                    whatifs: list = None) -> RunStats:
+                    whatifs: list = None, shift_count: int = 0) -> RunStats:
     """Summarise a list of saved runs.
 
     ``labels`` names each run in the per-run rows (defaults to
@@ -200,8 +210,10 @@ def aggregate_stats(results: list, labels: list = None,
     with ``results`` of WhatIfInfo objects (from replay.load_saved,
     or None) for runs that came from a `what-if --json` file; those
     rows are flagged as what-if replays with their overrides and
-    points delta recorded. Raises ValueError on an empty list or a
-    labels / whatifs list of the wrong length.
+    points delta recorded. ``shift_count`` is how many of the input
+    files were shifts (each incident in a shift is one run here), so
+    the report can say the rows came from shifts. Raises ValueError
+    on an empty list or a labels / whatifs list of the wrong length.
     """
     results = list(results)
     if not results:
@@ -286,4 +298,5 @@ def aggregate_stats(results: list, labels: list = None,
                          if whatif is not None),
         impact_growth_runs=sum(1 for result in results
                                if _impact_grew(result)),
+        shift_count=shift_count,
     )

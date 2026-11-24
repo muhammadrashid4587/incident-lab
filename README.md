@@ -89,6 +89,13 @@ python3 -m incident_lab history --operator ana
 python3 -m incident_lab history
 python3 -m incident_lab bundle /tmp/latency-spike.json
 python3 -m incident_lab bundle --check latency-spike-bundle.zip
+python3 -m incident_lab shift disk-full latency-spike
+python3 -m incident_lab shift disk-full latency-spike --slo 99.5
+python3 -m incident_lab shift disk-full latency-spike cert-expiry --json > /tmp/shift.json
+python3 -m incident_lab replay /tmp/shift.json
+python3 -m incident_lab debrief /tmp/shift.json
+python3 -m incident_lab compare /tmp/shift.json /tmp/shift.json
+python3 -m incident_lab stats /tmp/shift.json
 python3 scripts/demo.py
 ```
 
@@ -125,6 +132,43 @@ A batch run (`--seeds`, below) prints a different JSON shape: `seeds`
 `policy`, every run in full under `runs` (each one a single-run result
 as above), and `score_distribution` with the mean, min, max and median
 points plus a `per_seed` list of `{"seed": N, "points": P}` entries.
+
+A shift run (`shift --json`, see Shifts) prints a third shape: a
+`shift` summary (`slo_percent`, `budget_minutes`, `budget_exhausted`,
+`total_burn_pct`, `shift_points`, one `incidents` entry per incident
+that ran with its scenario, points, downtime, burn against the shared
+budget and cumulative burn, plus `skipped`, `difficulty`, `seed`,
+`jitter` and `rota_week`), the shared `policy`, and every incident's
+full run under `runs` (each one a single-run result as above, with
+its own SLO burn in its own score — the shared-budget burn lives
+only in the `shift` summary).
+
+## Shifts
+
+A shift runs several incidents back-to-back against one shared error
+budget, instead of each incident's own SLO: `shift disk-full
+latency-spike` plays the two incidents in order, and the burn
+accumulates — the second incident starts with whatever budget the
+first one left. The shared SLO comes from `--slo` (a number from 90
+up to but not including 100), or from the first scenario's SLO when
+no `--slo` is given; the shift fails when no scenario carries an SLO.
+When the cumulative burn reaches 100% the budget is exhausted and
+the shift ends early: the remaining incidents are skipped, and the
+shift score counts them as 0, so a shift that spends its whole
+month's budget part-way through scores down for the incidents it
+never got to run. The shift score is the mean points over every
+scheduled incident. Each incident is simulated exactly as `run`
+would simulate it — same policy, difficulty, seed and rota, with
+`--seed N` giving incident `i` the seed `N+i` so the shift replays
+exactly — and `replay`, `debrief`, `compare` and `stats` all accept
+a saved shift file: `replay` re-prints the shift summary, `debrief`
+writes a shift postmortem (per-incident rows plus shift-level
+findings about the budget), `compare` diffs two shifts (shift points,
+total burn, incidents ran, whether each ran out of budget, and a
+per-incident points table for the scenarios both ran; a shift and a
+single run cannot be compared), and `stats` aggregates each incident
+in a shift as one run, saying how many of its files were shifts.
+`postmortem` and `bundle` work on single runs, not shifts.
 
 ## Replay
 
@@ -895,6 +939,17 @@ human-readable form.
 
 ## Version
 
+0.32.0 — Multi-incident shift with a shared error budget: `shift
+<scenario>...` runs several incidents back-to-back against one shared
+budget from a single SLO (`--slo`, or the first scenario's SLO by
+default) — burn accumulates across incidents, and when the cumulative
+burn reaches 100% the shift ends early, the remaining incidents are
+skipped and score 0, so the shift score (mean points over every
+scheduled incident) scores down for a spent budget. The shift JSON
+records the shared SLO, budget minutes, total burn, shift points and
+per-incident burn/cumulative burn, and `replay`, `debrief`, `compare`
+and `stats` all accept saved shift files.
+
 0.31.0 — On-call rota: `run` / `drill` take `--rota-file PATH` (a
 JSON file mapping each role to a weekly rotation list of responder
 names, see `examples/rota.json`) and `--rota-week N`, and page
@@ -1049,3 +1104,4 @@ resolved instead of claiming nobody acked.
 - [x] Shareable postmortem bundle: `bundle <saved-run.json>` packages the run JSON (verbatim), the HTML postmortem and a manifest with provenance (incident-lab version, incident and score, seed and difficulty, what-if overrides and points delta when the source is a what-if replay) and a SHA-256 hash of every other member into one zip, validated as it is created (hashes re-checked, `run.json` loaded back through `replay` to prove it re-imports, a failing bundle deleted); a what-if file bundles its replay as `run.json` and its base run as `base-run.json`; `bundle --check <bundle.zip>` validates a shared bundle, and the unzipped run works with `replay`, `debrief` and `postmortem` (0.29.0)
 - [x] PDF postmortem export: `postmortem <saved-run.json> --format pdf --out file.pdf` renders the same postmortem as the HTML export (score and grade, timeline, per-responder timings, hints with cost, findings and action items, what-if provenance) as a readable multi-page PDF, hand-rolled and standard library only (Letter pages, Helvetica, no embedded fonts, no new dependency), text wrapped and flowed across pages with a footer on each; `--out` is required, non-Latin-1 text folds to ASCII lookalikes, and parentheses and backslashes are escaped (0.30.0)
 - [x] On-call rota: `run` / `drill` take `--rota-file PATH` (a JSON file mapping each role to a weekly rotation list of responder names) and `--rota-week N`, and page whoever is on call for that week — the name at position `N % len(names)` per role, wrapping around; with no `--rota-week` the run uses the current ISO calendar week; a role the rota does not cover keeps the policy's responder, only names change, never roles, order or timeouts; the week is printed in the human-readable output and recorded in `run --json` (top-level `rota_week`), `replay` re-prints it, and a `what-if` replay keeps it when it keeps the original policy and drops it when the policy is swapped (0.31.0)
+- [x] Multi-incident shift with a shared error budget: `shift <scenario>...` runs several incidents back-to-back against one shared budget from a single SLO (`--slo`, or the first scenario's SLO by default) — burn accumulates across incidents in the shift, and when the cumulative burn reaches 100% the shift ends early, the remaining incidents are skipped and score 0, so the shift score (mean points over every scheduled incident) scores down for a spent budget; the shift JSON records the shared SLO, budget minutes, total burn, shift points and per-incident burn/cumulative burn, each incident's run is an ordinary single-run result, and `replay`, `debrief`, `compare` and `stats` all accept saved shift files (debrief writes a shift postmortem, compare diffs two shifts at shift level, stats counts each incident in a shift as a run) (0.32.0)

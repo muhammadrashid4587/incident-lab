@@ -319,3 +319,133 @@ def compare_results(a: SimulationResult, b: SimulationResult,
         chain_a=[step.to_dict() for step in a.escalation_chain],
         chain_b=[step.to_dict() for step in b.escalation_chain],
     )
+
+
+@dataclass
+class ShiftComparison:
+    """Side-by-side diff of two saved shifts.
+
+    Shifts are compared at shift level — shift points and total burn
+    against the shared budget, how many incidents each ran, whether
+    each ran out of budget — plus a per-incident points table for the
+    scenarios both shifts ran. Timelines are not diffed: a shift
+    holds several timelines, and the per-incident runs are what
+    `compare` is for.
+    """
+    label_a: str
+    label_b: str
+    shift_points_a: float
+    shift_points_b: float
+    total_burn_a: float
+    total_burn_b: float
+    ran_a: int
+    ran_b: int
+    skipped_a: list
+    skipped_b: list
+    exhausted_a: bool
+    exhausted_b: bool
+    slo_a: float
+    slo_b: float
+    # Per-incident points for scenarios both shifts ran:
+    # {"scenario", "a", "b", "delta"}.
+    per_incident: list
+
+    def to_dict(self) -> dict:
+        """JSON-ready dict: shift rows and the per-incident table."""
+        return {
+            "shift_a": {
+                "label": self.label_a,
+                "shift_points": self.shift_points_a,
+                "total_burn_pct": self.total_burn_a,
+                "incidents_ran": self.ran_a,
+                "skipped": list(self.skipped_a),
+                "budget_exhausted": self.exhausted_a,
+                "slo_percent": self.slo_a,
+            },
+            "shift_b": {
+                "label": self.label_b,
+                "shift_points": self.shift_points_b,
+                "total_burn_pct": self.total_burn_b,
+                "incidents_ran": self.ran_b,
+                "skipped": list(self.skipped_b),
+                "budget_exhausted": self.exhausted_b,
+                "slo_percent": self.slo_b,
+            },
+            "same_slo": self.slo_a == self.slo_b,
+            "shift_points_delta": round(
+                self.shift_points_b - self.shift_points_a, 1),
+            "total_burn_delta": round(
+                self.total_burn_b - self.total_burn_a, 1),
+            "per_incident": [dict(row) for row in self.per_incident],
+        }
+
+    def render(self) -> str:
+        """Human-readable side-by-side shift comparison."""
+        lines = [
+            f"A: {self.label_a} ({self.ran_a} ran, "
+            f"{len(self.skipped_a)} skipped)",
+            f"B: {self.label_b} ({self.ran_b} ran, "
+            f"{len(self.skipped_b)} skipped)",
+        ]
+        if self.slo_a != self.slo_b:
+            lines.append("note: different shift SLOs "
+                         f"({self.slo_a}% vs {self.slo_b}%) — burn is "
+                         "not directly comparable")
+        lines.append("")
+        lines.append("shift:")
+        lines.append(
+            f"  {'shift points':<17} A: {self.shift_points_a:<8} "
+            f"B: {self.shift_points_b:<8} "
+            f"Δ: {self.shift_points_b - self.shift_points_a:+.1f}")
+        lines.append(
+            f"  {'total burn':<17} A: {self.total_burn_a:.1f}%"
+            f"    B: {self.total_burn_b:.1f}%"
+            f"    Δ: {self.total_burn_b - self.total_burn_a:+.1f}%")
+        lines.append(
+            f"  {'budget exhausted':<17} A: "
+            f"{'yes' if self.exhausted_a else 'no':<8} B: "
+            f"{'yes' if self.exhausted_b else 'no'}")
+        if self.per_incident:
+            lines.append("")
+            lines.append("per incident (both shifts ran it):")
+            for row in self.per_incident:
+                lines.append(
+                    f"  {row['scenario']:<20} A: {row['a']:>3}/100  "
+                    f"B: {row['b']:>3}/100  Δ: {row['delta']:+d}")
+        return "\n".join(lines)
+
+
+def compare_shifts(a, b, label_a: str = "A",
+                   label_b: str = "B") -> ShiftComparison:
+    """Diff two ShiftResults at shift level.
+
+    ``a`` and ``b`` are ShiftResults (from shift.simulate_shift or
+    replay.load_shift). The per-incident table covers only the
+    scenarios both shifts actually ran.
+    """
+    points_a = {entry["scenario"]: entry["points"]
+                for entry in a.incidents}
+    points_b = {entry["scenario"]: entry["points"]
+                for entry in b.incidents}
+    per_incident = [
+        {"scenario": name, "a": points_a[name], "b": points_b[name],
+         "delta": points_b[name] - points_a[name]}
+        for name in points_a if name in points_b
+    ]
+    return ShiftComparison(
+        label_a=label_a,
+        label_b=label_b,
+        shift_points_a=a.shift_points,
+        shift_points_b=b.shift_points,
+        total_burn_a=a.total_burn_pct,
+        total_burn_b=b.total_burn_pct,
+        ran_a=len(a.runs),
+        ran_b=len(b.runs),
+        skipped_a=list(a.skipped),
+        skipped_b=list(b.skipped),
+        exhausted_a=a.budget_exhausted,
+        exhausted_b=b.budget_exhausted,
+        slo_a=a.slo_percent,
+        slo_b=b.slo_percent,
+        per_incident=per_incident,
+    )
