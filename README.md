@@ -64,6 +64,8 @@ python3 -m incident_lab stats /tmp/run-seed-1.json /tmp/run-seed-7.json
 python3 -m incident_lab stats /tmp/run-seed-1.json /tmp/run-seed-7.json --json
 python3 -m incident_lab run payments-outage --policy sev1
 python3 -m incident_lab run payments-outage --policy sev1 --json
+python3 -m incident_lab run sso-outage
+python3 -m incident_lab run sso-outage --json
 python3 -m incident_lab run payments-outage --policy sev1 --json > /tmp/payments-outage.json
 python3 -m incident_lab replay /tmp/payments-outage.json
 python3 -m incident_lab debrief /tmp/payments-outage.json
@@ -477,6 +479,7 @@ invalid scenario fails the run with exit code 2 and an error message.
 | queue-backlog | orders-queue | high | 99.5% | primary acks in 4m, scales consumers to drain backlog |
 | dns-outage | edge-dns | critical | 99.99% | primary misses the page, secondary acks in 3m, fails over |
 | payments-outage | payments-api | critical | 99.9% | SEV-1: on-call and senior miss, incident commander acks in 4m; impact grows while paging |
+| sso-outage | identity-sso | critical | 99.95% | SSO logins failing, pages go to a stale rotation, nobody acks; impact grows while paging |
 
 ## Escalation policy
 
@@ -968,6 +971,15 @@ human-readable form.
 
 ## Version
 
+0.34.0 — New scenario `sso-outage`: the identity provider fails
+every login, but the pages go to a stale on-call rotation, so every
+level misses and the incident ends unacked with a score of 0 — the
+first built-in scenario where nobody acks, so the library now
+exercises the unacked path (whole chain missed, impact growing from
+logins failing to sessions expiring, debrief naming every missed
+responder and adding a fallback-page action) with a real scenario
+instead of only through scenario files.
+
 0.33.0 — Postmortem and bundle support for shifts: `postmortem
 <saved-shift.json>` renders the shift postmortem — the shift
 summary, one row per incident that ran and one per skipped incident,
@@ -1145,3 +1157,4 @@ resolved instead of claiming nobody acked.
 - [x] PDF postmortem export: `postmortem <saved-run.json> --format pdf --out file.pdf` renders the same postmortem as the HTML export (score and grade, timeline, per-responder timings, hints with cost, findings and action items, what-if provenance) as a readable multi-page PDF, hand-rolled and standard library only (Letter pages, Helvetica, no embedded fonts, no new dependency), text wrapped and flowed across pages with a footer on each; `--out` is required, non-Latin-1 text folds to ASCII lookalikes, and parentheses and backslashes are escaped (0.30.0)
 - [x] On-call rota: `run` / `drill` take `--rota-file PATH` (a JSON file mapping each role to a weekly rotation list of responder names) and `--rota-week N`, and page whoever is on call for that week — the name at position `N % len(names)` per role, wrapping around; with no `--rota-week` the run uses the current ISO calendar week; a role the rota does not cover keeps the policy's responder, only names change, never roles, order or timeouts; the week is printed in the human-readable output and recorded in `run --json` (top-level `rota_week`), `replay` re-prints it, and a `what-if` replay keeps it when it keeps the original policy and drops it when the policy is swapped (0.31.0)
 - [x] Multi-incident shift with a shared error budget: `shift <scenario>...` runs several incidents back-to-back against one shared budget from a single SLO (`--slo`, or the first scenario's SLO by default) — burn accumulates across incidents in the shift, and when the cumulative burn reaches 100% the shift ends early, the remaining incidents are skipped and score 0, so the shift score (mean points over every scheduled incident) scores down for a spent budget; the shift JSON records the shared SLO, budget minutes, total burn, shift points and per-incident burn/cumulative burn, each incident's run is an ordinary single-run result, and `replay`, `debrief`, `compare` and `stats` all accept saved shift files (debrief writes a shift postmortem, compare diffs two shifts at shift level, stats counts each incident in a shift as a run) (0.32.0)
+- [x] Unacked-incident scenario: `sso-outage` — the identity provider fails every login while the pages go to a stale on-call rotation, so every level misses, the impact grows from logins failing to sessions expiring, and the incident ends unacked with a score of 0; the first built-in scenario where nobody acks, so the unacked path (whole chain missed, debrief naming every missed responder plus a fallback-page action) is exercised by a real scenario, with hints and an SLO like the rest of the library (0.34.0)

@@ -226,6 +226,39 @@ SCENARIOS = {
             "revenue impact growing",
         ),
     ),
+    "sso-outage": Scenario(
+        name="sso-outage",
+        service="identity-sso",
+        title="SSO logins failing, pages going unanswered",
+        severity="critical",
+        description=(
+            "The identity provider is failing every login attempt. "
+            "The alert fired, but the pages go to a stale on-call "
+            "rotation: the three responders paged have all rotated "
+            "off the team, so nobody answers while the impact grows."
+        ),
+        ack_delay_min=(None, None, None),
+        mitigate_delay_min=30,
+        resolve_delay_min=20,
+        slo_percent=99.95,
+        hints=(
+            "Fail over to the backup identity provider first; logins "
+            "are down and every minute locks out more users.",
+            "Check the pager rotation: pages to a stale group explain "
+            "why nobody acked, so fix the rotation before the next "
+            "incident.",
+            "Force a session refresh once the failover is up; sessions "
+            "that expired during the outage will not recover on "
+            "their own.",
+        ),
+        impact_stages=(
+            "Logins failing: new sign-ins erroring, existing sessions "
+            "still work",
+            "Logins down: no new sign-ins, support queue growing",
+            "Sessions expiring: existing sessions timing out, users "
+            "locked out entirely",
+        ),
+    ),
 }
 
 
