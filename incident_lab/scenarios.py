@@ -367,6 +367,45 @@ SCENARIOS = {
             "reconciliation needed once the link returns",
         ),
     ),
+    "poison-pill": Scenario(
+        name="poison-pill",
+        service="billing-queue",
+        title="Poison pill message crashing consumers",
+        severity="high",
+        description=(
+            "A single malformed billing event keeps crashing every "
+            "consumer that reads it; each crash redelivers the same "
+            "message, so the queue depth grows while throughput is "
+            "zero. The alert storm buries the primary's page, so the "
+            "primary misses; the secondary sees the queue depth "
+            "climbing and acks in 4m, then finds the bad offset, "
+            "moves it to the dead-letter queue and restarts the "
+            "consumers while the impact grows from messages backing "
+            "up to billing events stuck."
+        ),
+        ack_delay_min=(None, 4),
+        mitigate_delay_min=50,
+        resolve_delay_min=20,
+        slo_percent=99.5,
+        hints=(
+            "Check the consumer logs for the same message offset "
+            "crashing on every retry: a poison pill looks like a "
+            "traffic spike, but the queue depth grows while "
+            "throughput is zero.",
+            "Move the bad message to the dead-letter queue before "
+            "restarting the consumers: restarting without removing "
+            "it just crashes them again on the same offset.",
+            "Add a max-delivery-count guard so one bad message can "
+            "never block the queue again, and alert on dead-letter "
+            "arrivals.",
+        ),
+        impact_stages=(
+            "Messages backing up: consumers crashing on the same "
+            "offset, queue depth rising",
+            "Billing events stuck: orders placed but not billed, "
+            "invoices delayed",
+        ),
+    ),
 }
 
 
