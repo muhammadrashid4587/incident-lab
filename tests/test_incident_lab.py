@@ -3257,6 +3257,9 @@ class TestPurgeVerification(unittest.TestCase):
         self.assertEqual(
             get("key-rotation").regions,
             ("us-east", "us-west", "eu-west"))
+        self.assertEqual(
+            get("retry-storm").regions,
+            ("us-east", "us-west", "eu-west"))
         self.assertEqual(get("disk-full").regions, ())
 
     def test_verified_run_costs_vary_by_region(self):
@@ -5785,7 +5788,12 @@ class TestRetryStormScenario(unittest.TestCase):
     the fast policy: no miss, no escalation, but the late ack keeps
     only half the score, and the chain records the first impact stage
     while the stages spell out the retry flood spreading to
-    notifications fully down.
+    notifications fully down. Verifying the fix is not the same
+    price everywhere: a test push clears in 2m in us-east, 5m in
+    us-west and 8m in eu-west, where the provider's European gateway
+    is still draining the retry backlog, so the verified run costs
+    15m of checks and scores 43/100 where the default-cost run
+    scored 44.
     """
 
     def test_retry_storm_scenario(self):
@@ -5794,8 +5802,88 @@ class TestRetryStormScenario(unittest.TestCase):
         self.assertEqual(scenario.service, "notifications-push")
         self.assertEqual(scenario.ack_delay_min, (3,))
         self.assertEqual(scenario.slo_percent, 99.95)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 5, "eu-west": 8})
+        self.assertEqual(scenario.verify_delay_min_total(), 15)
         self.assertEqual(len(scenario.impact_stages), 3)
         self.assertEqual(len(scenario.hints), 3)
+
+    def test_verified_per_region_costs_retry_storm(self):
+        result = simulate(get("retry-storm"), get_policy("fast"),
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(result.score.verify_delay_min, 15)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 5, "eu-west": 8})
+        # The primary acks at 3m, so the checks land at 5m, 10m
+        # and 18m: the 8m eu-west check is what pushes mitigation
+        # to 43m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(5, "us-east"), (10, "us-west"), (18, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (2m)",
+             "fix confirmed in us-west (5m)",
+             "fix confirmed in eu-west (8m)"])
+        self.assertEqual(score.time_to_mitigate_min, 43)
+        self.assertEqual(score.time_to_resolve_min, 58)
+        # 100 - 0 (3m to ack inside the 5m grace) - 14 (43m to
+        # mitigate past the 15m grace, halved) = 86, scaled by the
+        # 0.5 late-ack credit: round(86 * 0.5) = 43 — one point
+        # below the 44 the 3m-default costs scored.
+        self.assertEqual(score.points, 43)
+        self.assertEqual(score.downtime_min, 43)
+        self.assertEqual(score.error_budget_burn_pct, 199.1)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 2m, us-west 5m, eu-west 8m, +15m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 2, "us-west": 5, "eu-west": 8})
+
+    def test_what_if_turning_verification_on_costs_four_points(self):
+        base = simulate(get("retry-storm"), get_policy("fast"))
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 43)
+        self.assertEqual(outcome.points_delta, -4)
+
+    def test_drill_matches_run_with_per_region_costs(self):
+        drill = run_drill(
+            get("retry-storm"), get_policy("fast"),
+            input_stream=io.StringIO(
+                "ack 3\nmitigate 25\nresolve 15\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("retry-storm"), get_policy("fast"),
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 43)
+
+    def test_shift_with_per_region_costs(self):
+        shift = simulate_shift(
+            [get("retry-storm")], DEFAULT_POLICY,
+            slo_percent=99.95, purge_verification="per-region")
+        self.assertEqual([run.score.points for run in shift.runs], [86])
+        self.assertEqual(shift.total_burn_pct, 199.1)
+
+    def test_cli_run_shows_per_region_breakdown(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "retry-storm", "--policy", "fast",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     15m "
+            "(us-east 2m, us-west 5m, eu-west 8m)", out)
+        self.assertIn("43/100", out)
 
     def test_late_ack_on_fast_keeps_half_the_score(self):
         result = simulate(get("retry-storm"), get_policy("fast"))
@@ -6260,7 +6348,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.47.0", text)
+        self.assertIn("Generated by incident-lab 0.48.0", text)
         self.assertIn("Page 1 of 1", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -6460,7 +6548,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.47.0")
+                         "incident-lab 0.48.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -7121,7 +7209,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.47.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.48.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

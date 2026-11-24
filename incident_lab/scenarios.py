@@ -623,12 +623,30 @@ SCENARIOS = {
             "own alerts, so they ack 1m late against the fast "
             "policy's 2m window, then kill the retry loop and drain "
             "the queue while the impact grows from retries flooding "
-            "the provider to notifications fully down."
+            "the provider to notifications fully down. The fix only "
+            "counts once a test push actually delivers in every "
+            "region: the provider's regional gateways drain the "
+            "retry backlog at different speeds, so a test push "
+            "clears in 2m in us-east, 5m in us-west, and 8m in "
+            "eu-west — where the provider's European gateway is "
+            "still draining the backlog of retries before it "
+            "accepts a fresh test push."
         ),
         ack_delay_min=(3,),
         mitigate_delay_min=25,
         resolve_delay_min=15,
         slo_percent=99.95,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test push clears in 2m in us-east, 5m in us-west, and 8m
+        # in eu-west, where the provider's European gateway is
+        # still draining the retry backlog before it accepts a
+        # fresh test push. The total is 15m, 6m more than the 3m
+        # default, so the verified run scores 43/100 where the
+        # default-cost run scored 44.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 5, "eu-west": 8,
+        },
         hints=(
             "Kill the retry loop first: retries without backoff are "
             "the flood, and every retry costs provider quota while "
@@ -636,7 +654,10 @@ SCENARIOS = {
             "Check the push provider's rate-limit status: a 429 storm "
             "right after a deploy is the deploy, not the provider.",
             "Drain the retry queue before re-enabling delivery: "
-            "re-enabling with a full queue just restarts the flood.",
+            "re-enabling with a full queue just restarts the flood, "
+            "and verify a test push delivers in every region before "
+            "declaring the incident mitigated — a gateway still "
+            "draining its backlog will drop it.",
         ),
         impact_stages=(
             "Retries flooding the provider: delivery attempts spiking, "
