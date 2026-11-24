@@ -434,12 +434,28 @@ SCENARIOS = {
             "the primary and the secondary both miss; the manager "
             "picks it up on time and fails traffic over to one "
             "datacenter while the impact grows from cross-region "
-            "timeouts to orders stuck to a split-brain risk."
+            "timeouts to orders stuck to a split-brain risk. The "
+            "failover is only real once a test checkout completes "
+            "in every region: the check takes 2m in us-east, where "
+            "traffic already routes, 6m in us-west, across the "
+            "healed link, and 9m in eu-west, where the partition "
+            "spans the most AZs and a clean checkout takes longest "
+            "to confirm."
         ),
         ack_delay_min=(None, None, 8),
         mitigate_delay_min=45,
         resolve_delay_min=25,
         slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the failover is not the same price everywhere:
+        # a test checkout completes in 2m in us-east, 6m in
+        # us-west and 9m in eu-west, where the partition spans the
+        # most AZs. The total is 17m, 8m more than the 3m default,
+        # so the verified run scores 25/100 where the default-cost
+        # run scored 29.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 6, "eu-west": 9,
+        },
         hints=(
             "Check the inter-datacenter link first: a partition "
             "looks like a service outage on each side, but the "
@@ -474,12 +490,27 @@ SCENARIOS = {
             "climbing and acks in 4m, then finds the bad offset, "
             "moves it to the dead-letter queue and restarts the "
             "consumers while the impact grows from messages backing "
-            "up to billing events stuck."
+            "up to billing events stuck. The fix is only real once "
+            "the queue is confirmed draining in every region: the "
+            "check takes 2m in us-east, 4m in us-west and 8m in "
+            "eu-west, where the bad deploy rolled out widest and "
+            "the most consumers have to be confirmed clear of the "
+            "bad offset."
         ),
         ack_delay_min=(None, 4),
         mitigate_delay_min=50,
         resolve_delay_min=20,
         slo_percent=99.5,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test billing event processes cleanly in 2m in us-east,
+        # 4m in us-west and 8m in eu-west, where the bad deploy
+        # rolled out widest. The total is 14m, 5m more than the 3m
+        # default, so the verified run scores 52/100 where the
+        # default-cost run scored 55.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 4, "eu-west": 8,
+        },
         hints=(
             "Check the consumer logs for the same message offset "
             "crashing on every retry: a poison pill looks like a "

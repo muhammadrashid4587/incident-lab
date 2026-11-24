@@ -3271,6 +3271,12 @@ class TestPurgeVerification(unittest.TestCase):
         self.assertEqual(
             get("db-failover").regions,
             ("us-east", "us-west", "eu-west"))
+        self.assertEqual(
+            get("network-partition").regions,
+            ("us-east", "us-west", "eu-west"))
+        self.assertEqual(
+            get("poison-pill").regions,
+            ("us-east", "us-west", "eu-west"))
 
     def test_verified_run_costs_vary_by_region(self):
         result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
@@ -5296,6 +5302,207 @@ class TestDbFailoverPerRegionCosts(unittest.TestCase):
         self.assertIn("17/100", out)
 
 
+class TestNetworkPartitionPerRegionCosts(unittest.TestCase):
+    """network-partition: per-region verification costs for the failover.
+
+    A test checkout must complete in every region before the
+    failover counts, and the check is slowest where the partition
+    spans the most AZs — 2m in us-east, where traffic already
+    routes, 6m in us-west, across the healed link, and 9m in
+    eu-west — so the verified run costs 8m more than the 3m
+    default and scores 25/100 where the default-cost run scored
+    29.
+    """
+
+    def test_network_partition_scenario(self):
+        scenario = get("network-partition")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "checkout-mesh")
+        self.assertEqual(scenario.ack_delay_min, (None, None, 8))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 6, "eu-west": 9})
+        self.assertEqual(scenario.verify_delay_min_total(), 17)
+        self.assertGreaterEqual(len(scenario.hints), 1)
+
+    def test_verified_per_region_costs_network_partition(self):
+        result = simulate(get("network-partition"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(result.score.verify_delay_min, 17)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 6, "eu-west": 9})
+        # The manager acks at 18m, so the checks land at 20m, 26m
+        # and 35m: the 9m eu-west check is what pushes mitigation
+        # to 80m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(20, "us-east"), (26, "us-west"), (35, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (2m)",
+             "fix confirmed in us-west (6m)",
+             "fix confirmed in eu-west (9m)"])
+        self.assertEqual(score.time_to_mitigate_min, 80)
+        self.assertEqual(score.time_to_resolve_min, 105)
+        # 100 - 30 (two escalations) - 13 (18m to ack past the 5m
+        # grace) - 32 (80m to mitigate past the 15m grace, halved)
+        # = 25, with the full ack credit kept — four points below
+        # the 29 the 3m-default costs scored.
+        self.assertEqual(score.points, 25)
+        self.assertEqual(score.downtime_min, 80)
+        self.assertEqual(score.error_budget_burn_pct, 185.2)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 2m, us-west 6m, eu-west 9m, +17m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 2, "us-west": 6, "eu-west": 9})
+
+    def test_what_if_turning_verification_on_costs_eight_points(self):
+        base = simulate(get("network-partition"), DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 25)
+        self.assertEqual(outcome.points_delta, -8)
+
+    def test_drill_matches_run_with_per_region_costs(self):
+        drill = run_drill(
+            get("network-partition"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "wait\nwait\nack 8\nmitigate 45\nresolve 25\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("network-partition"), DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 25)
+
+    def test_shift_with_per_region_costs(self):
+        shift = simulate_shift(
+            [get("network-partition")], DEFAULT_POLICY,
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual([run.score.points for run in shift.runs], [25])
+        self.assertEqual(shift.total_burn_pct, 185.2)
+
+    def test_cli_run_shows_per_region_breakdown(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "network-partition",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     17m "
+            "(us-east 2m, us-west 6m, eu-west 9m)", out)
+        self.assertIn("25/100", out)
+
+
+class TestPoisonPillPerRegionCosts(unittest.TestCase):
+    """poison-pill: per-region verification costs for the dead-letter.
+
+    The queue must be confirmed draining in every region before
+    the fix counts, and the check is slowest where the bad deploy
+    rolled out widest — 2m in us-east, 4m in us-west and 8m in
+    eu-west — so the verified run costs 5m more than the 3m
+    default and scores 52/100 where the default-cost run scored
+    55.
+    """
+
+    def test_poison_pill_scenario(self):
+        scenario = get("poison-pill")
+        self.assertEqual(scenario.severity, "high")
+        self.assertEqual(scenario.service, "billing-queue")
+        self.assertEqual(scenario.ack_delay_min, (None, 4))
+        self.assertEqual(scenario.slo_percent, 99.5)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 4, "eu-west": 8})
+        self.assertEqual(scenario.verify_delay_min_total(), 14)
+        self.assertGreaterEqual(len(scenario.hints), 1)
+
+    def test_verified_per_region_costs_poison_pill(self):
+        result = simulate(get("poison-pill"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(result.score.verify_delay_min, 14)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 4, "eu-west": 8})
+        # The secondary acks at 9m, so the checks land at 11m, 15m
+        # and 23m: the 8m eu-west check is what pushes mitigation
+        # to 73m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(11, "us-east"), (15, "us-west"), (23, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (2m)",
+             "fix confirmed in us-west (4m)",
+             "fix confirmed in eu-west (8m)"])
+        self.assertEqual(score.time_to_mitigate_min, 73)
+        self.assertEqual(score.time_to_resolve_min, 93)
+        # 100 - 15 (one escalation) - 4 (9m to ack past the 5m
+        # grace) - 29 (73m to mitigate past the 15m grace, halved)
+        # = 52, with the full ack credit kept — three points below
+        # the 55 the 3m-default costs scored.
+        self.assertEqual(score.points, 52)
+        self.assertEqual(score.downtime_min, 73)
+        self.assertEqual(score.error_budget_burn_pct, 33.8)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 2m, us-west 4m, eu-west 8m, +14m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 2, "us-west": 4, "eu-west": 8})
+
+    def test_what_if_turning_verification_on_costs_seven_points(self):
+        base = simulate(get("poison-pill"), DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 52)
+        self.assertEqual(outcome.points_delta, -7)
+
+    def test_drill_matches_run_with_per_region_costs(self):
+        drill = run_drill(
+            get("poison-pill"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "wait\nack 4\nmitigate 50\nresolve 20\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("poison-pill"), DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 52)
+
+    def test_shift_with_per_region_costs(self):
+        shift = simulate_shift(
+            [get("poison-pill")], DEFAULT_POLICY,
+            slo_percent=99.5, purge_verification="per-region")
+        self.assertEqual([run.score.points for run in shift.runs], [52])
+        self.assertEqual(shift.total_burn_pct, 33.8)
+
+    def test_cli_run_shows_per_region_breakdown(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "poison-pill",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     14m "
+            "(us-east 2m, us-west 4m, eu-west 8m)", out)
+        self.assertIn("52/100", out)
+
+
 class TestNetworkPartitionScenario(unittest.TestCase):
     """network-partition: the datacenters cannot reach each other.
 
@@ -6641,7 +6848,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.51.0", text)
+        self.assertIn("Generated by incident-lab 0.52.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -6844,7 +7051,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.51.0")
+                         "incident-lab 0.52.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -7505,7 +7712,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.51.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.52.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
