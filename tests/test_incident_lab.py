@@ -4898,6 +4898,113 @@ class TestKeyRotationScenario(unittest.TestCase):
         self.assertIn("14/100", out)
 
 
+class TestRetryStormScenario(unittest.TestCase):
+    """retry-storm: a retry storm rate-limits the push provider.
+
+    The primary acks 1m late against the fast policy's 2m window, so
+    this is the library's first built-in run exercising a late ack on
+    the fast policy: no miss, no escalation, but the late ack keeps
+    only half the score, and the chain records the first impact stage
+    while the stages spell out the retry flood spreading to
+    notifications fully down.
+    """
+
+    def test_retry_storm_scenario(self):
+        scenario = get("retry-storm")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "notifications-push")
+        self.assertEqual(scenario.ack_delay_min, (3,))
+        self.assertEqual(scenario.slo_percent, 99.95)
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_late_ack_on_fast_keeps_half_the_score(self):
+        result = simulate(get("retry-storm"), get_policy("fast"))
+        score = result.score
+        # Fast timeouts 2m, 2m, 5m: the primary acks at 3m, 1m late
+        # against the 2m window, with no escalation.
+        self.assertEqual(score.time_to_ack_min, 3)
+        self.assertEqual(score.time_to_mitigate_min, 28)
+        self.assertEqual(score.time_to_resolve_min, 43)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 0)
+        self.assertEqual(score.ack_late_min, 1)
+        self.assertAlmostEqual(score.ack_credit, 0.5)
+        # 100 - 0 (no escalations) - 0 (3m to ack inside the 5m
+        # grace) - 6 (28m to mitigate past the 15m grace, halved)
+        # = 94, scaled by the 1/2 ack credit: round(94 / 2) = 47.
+        self.assertEqual(score.points, 47)
+        # Downtime 28m against a 99.95% budget of 21.6m.
+        self.assertEqual(score.downtime_min, 28)
+        self.assertEqual(score.error_budget_burn_pct, 129.6)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 1)
+        self.assertEqual(chain[0].outcome, "acked")
+        self.assertEqual(chain[0].paged_at_min, 0)
+        self.assertEqual(chain[0].acked_at_min, 3)
+        self.assertEqual(chain[0].ack_late_min, 1)
+        self.assertEqual(
+            chain[0].impact,
+            "Retries flooding the provider: delivery attempts spiking, "
+            "push latency climbing")
+
+    def test_late_ack_is_on_time_on_the_standard_policy(self):
+        # The same 3m ack is on time against the standard policy's
+        # 5m primary timeout, so the full credit is kept there: the
+        # lateness is a property of the fast policy, not the incident.
+        result = simulate(get("retry-storm"), DEFAULT_POLICY)
+        score = result.score
+        self.assertEqual(score.ack_late_min, 0)
+        self.assertAlmostEqual(score.ack_credit, 1.0)
+        self.assertEqual(score.points, 94)
+
+    def test_debrief_of_late_ack_names_the_lateness(self):
+        result = simulate(get("retry-storm"), get_policy("fast"))
+        text = generate_debrief(result).render()
+        self.assertIn("ana", text)
+        self.assertIn("1m late", text)
+        self.assertIn("50% of the score", text)
+
+    def test_template_round_trips_retry_storm(self):
+        data = scenario_to_dict(get("retry-storm"))
+        self.assertEqual(data["ack_delay_min"], [3])
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"retry-storm": data}}, handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["retry-storm"], get("retry-storm"))
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("retry-storm"), get_policy("fast"),
+            input_stream=io.StringIO(
+                "ack 3\nmitigate 25\nresolve 15\n"),
+            prompt_stream=io.StringIO())
+        run = simulate(get("retry-storm"), get_policy("fast"))
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 47)
+
+    def test_cli_runs_retry_storm_fast(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "retry-storm", "--policy", "fast"]),
+                0)
+        out = buf.getvalue()
+        self.assertIn("47/100", out)
+
+    def test_cli_runs_retry_storm_fast_with_hints(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "retry-storm", "--policy", "fast",
+                      "--hints", "3"]), 0)
+        out = buf.getvalue()
+        self.assertIn("retry loop", out)
+        self.assertIn("32/100", out)
+
+
 class TestErrorBudgetBurn(unittest.TestCase):
     def _write_scenario_file(self, data):
         handle = tempfile.NamedTemporaryFile(
@@ -5274,7 +5381,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.41.0", text)
+        self.assertIn("Generated by incident-lab 0.42.0", text)
         self.assertIn("Page 1 of 1", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -5474,7 +5581,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.41.0")
+                         "incident-lab 0.42.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -6135,7 +6242,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.41.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.42.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

@@ -524,6 +524,45 @@ SCENARIOS = {
             "cannot pay at all",
         ),
     ),
+    "retry-storm": Scenario(
+        name="retry-storm",
+        service="notifications-push",
+        title="Retry storm rate-limits the push provider",
+        severity="critical",
+        description=(
+            "A bad deploy to the push notification service dropped the "
+            "backoff between delivery retries, so every failed push is "
+            "retried immediately; the retry loop floods the push "
+            "provider, which rate-limits the account, and no push "
+            "notifications go out at all. The primary is in the deploy "
+            "review and assumes the page is noise from the deploy's "
+            "own alerts, so they ack 1m late against the fast "
+            "policy's 2m window, then kill the retry loop and drain "
+            "the queue while the impact grows from retries flooding "
+            "the provider to notifications fully down."
+        ),
+        ack_delay_min=(3,),
+        mitigate_delay_min=25,
+        resolve_delay_min=15,
+        slo_percent=99.95,
+        hints=(
+            "Kill the retry loop first: retries without backoff are "
+            "the flood, and every retry costs provider quota while "
+            "the loop runs.",
+            "Check the push provider's rate-limit status: a 429 storm "
+            "right after a deploy is the deploy, not the provider.",
+            "Drain the retry queue before re-enabling delivery: "
+            "re-enabling with a full queue just restarts the flood.",
+        ),
+        impact_stages=(
+            "Retries flooding the provider: delivery attempts spiking, "
+            "push latency climbing",
+            "Provider rate-limiting the account: pushes throttled, "
+            "notifications delayed",
+            "Notifications fully down: no pushes going out, users "
+            "missing alerts",
+        ),
+    ),
 }
 
 
