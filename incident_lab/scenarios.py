@@ -234,12 +234,26 @@ SCENARIOS = {
         description=(
             "Authoritative DNS is returning SERVFAIL for customer domains. "
             "The primary misses the page; the secondary acks in 3m and "
-            "fails over to the backup DNS provider."
+            "fails over to the backup DNS provider. The failover is only "
+            "real once DNS resolves in every region: a test lookup clears "
+            "in 2m in us-east, where the backup provider's nameservers "
+            "answer fastest, 5m in us-west and 8m in eu-west, where "
+            "resolvers hold the old SERVFAIL longest on their TTLs."
         ),
         ack_delay_min=(None, 3, None),
         mitigate_delay_min=40,
         resolve_delay_min=25,
         slo_percent=99.99,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the failover is not the same price everywhere:
+        # a test lookup resolves in 2m in us-east, 5m in us-west
+        # and 8m in eu-west, where resolvers hold the old SERVFAIL
+        # longest on their TTLs. The total is 15m, 6m more than the
+        # 3m default, so the verified run scores 58/100 where the
+        # default-cost run scored 61.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 5, "eu-west": 8,
+        },
         hints=(
             "Fail over to the backup DNS provider first; DNS is "
             "foundational, and every minute down blocks everything "
@@ -247,9 +261,10 @@ SCENARIOS = {
             "Check whether the SERVFAIL is everywhere or one region: "
             "a regional failure points at one nameserver, not the "
             "whole provider.",
-            "Verify the failover actually resolves before declaring "
-            "the incident mitigated; a bad failover looks fixed "
-            "until the TTLs expire.",
+            "Verify the failover actually resolves in every region "
+            "before declaring the incident mitigated; a bad failover "
+            "looks fixed until the TTLs expire, and the resolvers in "
+            "eu-west hold the old SERVFAIL longest.",
         ),
     ),
     "payments-outage": Scenario(
