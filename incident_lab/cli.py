@@ -18,6 +18,7 @@ from .difficulty import (
 )
 from .drill import run_drill
 from .export_html import render_postmortem_html
+from .export_pdf import render_postmortem_pdf
 from .history import (
     DEFAULT_HISTORY_PATH, entry_from_result, load_history, record_run,
     render_all_operators, summarize_all, summarize_operator,
@@ -489,8 +490,14 @@ def main(argv=None) -> int:
                                  "whose replay is rendered with its "
                                  "provenance)")
     postmortem.add_argument("--out", default=None, metavar="PATH",
-                            help="write the HTML to PATH instead of "
-                                 "printing it")
+                            help="write the postmortem to PATH instead of "
+                                 "printing it (required with "
+                                 "--format pdf)")
+    postmortem.add_argument("--format", default="html",
+                            choices=("html", "pdf"),
+                            help="postmortem format: html (default, "
+                                 "printed or written with --out) or pdf "
+                                 "(a multi-page PDF, needs --out)")
 
     bundle = sub.add_parser(
         "bundle",
@@ -713,6 +720,25 @@ def main(argv=None) -> int:
         except ValueError as exc:
             print(f"invalid postmortem file: {exc}", file=sys.stderr)
             return 2
+        if args.format == "pdf":
+            # A PDF is binary: it is only ever written to a file,
+            # never printed to stdout.
+            if args.out is None:
+                print("postmortem --format pdf needs --out PATH: a PDF "
+                      "cannot be printed as text", file=sys.stderr)
+                return 2
+            data = render_postmortem_pdf(loaded.result,
+                                         what_if=loaded.what_if)
+            try:
+                with open(args.out, "wb") as handle:
+                    handle.write(data)
+            except OSError as exc:
+                print(f"cannot write postmortem file: {exc}",
+                      file=sys.stderr)
+                return 2
+            print(f"wrote PDF postmortem for "
+                  f"{loaded.result.incident.title!r} to {args.out}")
+            return 0
         text = render_postmortem_html(loaded.result,
                                       what_if=loaded.what_if)
         if args.out is not None:

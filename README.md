@@ -53,6 +53,7 @@ python3 -m incident_lab debrief /tmp/latency-spike.json
 python3 -m incident_lab debrief /tmp/latency-spike.json --json
 python3 -m incident_lab postmortem /tmp/latency-spike.json
 python3 -m incident_lab postmortem /tmp/latency-spike.json --out postmortem.html
+python3 -m incident_lab postmortem /tmp/latency-spike.json --format pdf --out postmortem.pdf
 python3 -m incident_lab run disk-full --seed 1 --json > /tmp/run-seed-1.json
 python3 -m incident_lab run disk-full --seed 7 --json > /tmp/run-seed-7.json
 python3 -m incident_lab compare /tmp/run-seed-1.json /tmp/run-seed-7.json
@@ -180,6 +181,28 @@ python3 -m incident_lab run latency-spike --json > latency-spike.json
 python3 -m incident_lab postmortem latency-spike.json --out postmortem.html
 python3 -m incident_lab what-if latency-spike.json --ack-timeout 5 --json > latency-spike-whatif.json
 python3 -m incident_lab postmortem latency-spike-whatif.json
+```
+
+## PDF postmortem
+
+`postmortem <path> --format pdf --out file.pdf` renders the same
+postmortem as a readable multi-page PDF — scenario, score, timeline,
+per-responder timings, hints with cost, findings and action items,
+plus the what-if provenance box for a saved `what-if --json` file —
+so it can be attached to a ticket or filed where HTML is not wanted.
+The writer is hand-rolled and standard library only (Letter pages,
+Helvetica, no embedded fonts, no new dependency); text is wrapped
+to the page width and flows across pages, each page footered with
+the generator and the page number. A PDF is binary, so `--out` is
+required — `--format pdf` without it fails with exit code 2, as does
+a missing file, bad JSON, or a file that is not a saved run. Text
+outside Latin-1 is folded to ASCII lookalikes (an em dash becomes
+`-`), and parentheses and backslashes in scenario text are escaped,
+so run text can never break the file.
+
+```sh
+python3 -m incident_lab run latency-spike --json > latency-spike.json
+python3 -m incident_lab postmortem latency-spike.json --format pdf --out postmortem.pdf
 ```
 
 ## Postmortem bundle
@@ -740,6 +763,10 @@ incident_lab/
                  score and grade, timeline, per-responder timings
                  from the escalation chain, hints used, findings and
                  action items; what-if files render with provenance
+  export_pdf.py  same postmortem as a multi-page PDF (stdlib-only,
+                 hand-rolled writer: Letter pages, Helvetica, no
+                 embedded fonts, text wrapped and flowed across
+                 pages); what-if files render with provenance
   bundle.py      shareable postmortem bundle: one zip holding the run
                  JSON, the HTML postmortem and a manifest with
                  provenance and SHA-256 hashes, validated on creation
@@ -823,6 +850,20 @@ exit code 2 and an error message. With `--json` the batch prints
 human-readable form.
 
 ## Version
+
+0.30.0 — PDF postmortem export: `postmortem <saved-run.json>
+--format pdf --out file.pdf` renders the same postmortem the HTML
+export carries (score and grade, timeline, per-responder timings
+from the escalation chain, hints used with what each one cost,
+findings and action items with owners, plus the what-if provenance
+box for a saved `what-if --json` file) as a readable multi-page PDF.
+The writer is hand-rolled and standard library only — Letter pages,
+Helvetica and Helvetica-Bold, no embedded fonts, no new dependency
+— with text wrapped to the page width and flowed across pages, each
+page footered with the generator and the page number; `--out` is
+required, since a PDF cannot be printed as text. Text outside
+Latin-1 is folded to ASCII lookalikes and parentheses and
+backslashes are escaped, so scenario text can never break the file.
 
 0.29.0 — Shareable postmortem bundle: `bundle <saved-run.json>`
 packages a saved run into one zip — `run.json` (the saved run,
@@ -948,4 +989,4 @@ resolved instead of claiming nobody acked.
 - [x] Error-budget burn: every scenario carries an SLO target (`slo_percent`), and the run reports the downtime (declaration to mitigated) as a percentage of the monthly error budget that SLO allows in a 30-day month — over 100% means one incident spent the whole month's budget; shown in `run` output and `run --json`, flagged by `debrief` when over 100%, diffed by `compare`, averaged by `stats`, recomputed by `what-if`, recorded by drills, and settable per scenario in scenario files (0.27.0)
 - [x] HTML postmortem export: `postmortem <saved-run.json>` renders the debrief as a self-contained HTML page (inline CSS, no JavaScript, no external resources) with the score and grade, the timeline, a per-responder timings table from the escalation chain, the hints used with what each one cost, findings and action items with owners; a saved `what-if --json` file renders its replay with a provenance box (the overrides, the points delta and the base run's score), `--out PATH` writes the page to a file, and every string from the run is escaped (0.28.0)
 - [x] Shareable postmortem bundle: `bundle <saved-run.json>` packages the run JSON (verbatim), the HTML postmortem and a manifest with provenance (incident-lab version, incident and score, seed and difficulty, what-if overrides and points delta when the source is a what-if replay) and a SHA-256 hash of every other member into one zip, validated as it is created (hashes re-checked, `run.json` loaded back through `replay` to prove it re-imports, a failing bundle deleted); a what-if file bundles its replay as `run.json` and its base run as `base-run.json`; `bundle --check <bundle.zip>` validates a shared bundle, and the unzipped run works with `replay`, `debrief` and `postmortem` (0.29.0)
-- [ ] PDF postmortem export
+- [x] PDF postmortem export: `postmortem <saved-run.json> --format pdf --out file.pdf` renders the same postmortem as the HTML export (score and grade, timeline, per-responder timings, hints with cost, findings and action items, what-if provenance) as a readable multi-page PDF, hand-rolled and standard library only (Letter pages, Helvetica, no embedded fonts, no new dependency), text wrapped and flowed across pages with a footer on each; `--out` is required, non-Latin-1 text folds to ASCII lookalikes, and parentheses and backslashes are escaped (0.30.0)
