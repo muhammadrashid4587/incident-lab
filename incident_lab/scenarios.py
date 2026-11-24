@@ -328,6 +328,45 @@ SCENARIOS = {
             "degrading as the cache drains",
         ),
     ),
+    "network-partition": Scenario(
+        name="network-partition",
+        service="checkout-mesh",
+        title="Network partition between datacenters",
+        severity="critical",
+        description=(
+            "The link between the us-east and us-west datacenters "
+            "dropped, cutting the services on each side off from "
+            "each other. The pages go to responders whose paging "
+            "tooling and bastion sit on the unreachable side, so "
+            "the primary and the secondary both miss; the manager "
+            "picks it up on time and fails traffic over to one "
+            "datacenter while the impact grows from cross-region "
+            "timeouts to orders stuck to a split-brain risk."
+        ),
+        ack_delay_min=(None, None, 8),
+        mitigate_delay_min=45,
+        resolve_delay_min=25,
+        slo_percent=99.9,
+        hints=(
+            "Check the inter-datacenter link first: a partition "
+            "looks like a service outage on each side, but the "
+            "services are fine — the network between them is not.",
+            "Fail traffic over to one side before repairing the "
+            "link: pick the datacenter with the freshest writes "
+            "and route everything there, then fix the link.",
+            "Check for split-brain writes before declaring the "
+            "incident resolved: both sides accepting writes will "
+            "need reconciliation once the partition heals.",
+        ),
+        impact_stages=(
+            "Cross-datacenter traffic failing: us-east cannot "
+            "reach us-west, requests timing out",
+            "Orders stuck: writes cannot reach the primary "
+            "datacenter, checkout queue growing",
+            "Split-brain risk: both sides still serving reads, "
+            "reconciliation needed once the link returns",
+        ),
+    ),
 }
 
 

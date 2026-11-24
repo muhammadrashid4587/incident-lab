@@ -70,6 +70,8 @@ python3 -m incident_lab run config-push
 python3 -m incident_lab run config-push --json
 python3 -m incident_lab run db-failover
 python3 -m incident_lab run db-failover --json
+python3 -m incident_lab run network-partition
+python3 -m incident_lab run network-partition --json
 python3 -m incident_lab run payments-outage --policy sev1 --json > /tmp/payments-outage.json
 python3 -m incident_lab replay /tmp/payments-outage.json
 python3 -m incident_lab debrief /tmp/payments-outage.json
@@ -486,6 +488,7 @@ invalid scenario fails the run with exit code 2 and an error message.
 | sso-outage | identity-sso | critical | 99.95% | SSO logins failing, pages go to a stale rotation, nobody acks; impact grows while paging |
 | config-push | edge-config | critical | 99.9% | bad config push routes checkout to a dead pool, primary misses, secondary acks 3m late |
 | db-failover | orders-db | critical | 99.95% | primary database down, primary and secondary miss, manager acks 2m late and fails over to the replica |
+| network-partition | checkout-mesh | critical | 99.9% | datacenter link drops, primary and secondary miss (paging tooling on the unreachable side), manager acks on time and fails traffic over to one datacenter |
 
 ## Escalation policy
 
@@ -977,6 +980,8 @@ human-readable form.
 
 ## Version
 
+0.37.0 — New scenario `network-partition`: the link between the us-east and us-west datacenters drops, cutting the services on each side off from each other; the pages go to responders whose paging tooling and bastion sit on the unreachable side, so the primary and the secondary both miss and the manager picks it up on time and fails traffic over to one datacenter — the first scenario exercising two misses with an on-time ack, with the impact growing across all three stages (cross-region timeouts to orders stuck to a split-brain risk) and the full ack credit kept (33/100, 145.8% of the monthly error budget burned).
+
 0.36.0 — New scenario `db-failover`: the primary database goes down and the automatic failover does not fire; the primary and the secondary both miss the page and the manager acks 2m late, then starts the manual failover to the replica, which completes partway through mitigation — the first scenario exercising two misses and a late ack together, with the impact growing across all three stages (24/100, 287.0% of the monthly error budget burned).
 
 0.35.0 — New scenario `config-push`: a bad config push (not a code deploy) flips the checkout traffic split to a decommissioned pool; the primary misses the page and the secondary acks 3m late, so the run exercises a miss and a late ack together — the impact grows from checkout errors rising to checkout down in every region, and the late ack keeps only 40% of the score (25/100, 99.5% of the monthly error budget burned).
@@ -1169,3 +1174,4 @@ resolved instead of claiming nobody acked.
 - [x] Multi-incident shift with a shared error budget: `shift <scenario>...` runs several incidents back-to-back against one shared budget from a single SLO (`--slo`, or the first scenario's SLO by default) — burn accumulates across incidents in the shift, and when the cumulative burn reaches 100% the shift ends early, the remaining incidents are skipped and score 0, so the shift score (mean points over every scheduled incident) scores down for a spent budget; the shift JSON records the shared SLO, budget minutes, total burn, shift points and per-incident burn/cumulative burn, each incident's run is an ordinary single-run result, and `replay`, `debrief`, `compare` and `stats` all accept saved shift files (debrief writes a shift postmortem, compare diffs two shifts at shift level, stats counts each incident in a shift as a run) (0.32.0)
 - [x] Unacked-incident scenario: `sso-outage` — the identity provider fails every login while the pages go to a stale on-call rotation, so every level misses, the impact grows from logins failing to sessions expiring, and the incident ends unacked with a score of 0; the first built-in scenario where nobody acks, so the unacked path (whole chain missed, debrief naming every missed responder plus a fallback-page action) is exercised by a real scenario, with hints and an SLO like the rest of the library (0.34.0)
 - [x] Late-ack scenario: `config-push` — a bad config push (not a code deploy) flips the checkout traffic split to a decommissioned pool; the primary misses the page and the secondary acks 3m late, so the run exercises a miss and a late ack together — the impact grows from checkout errors rising to checkout down in every region, the debrief names the 3m lateness and the 40% credit kept, and the incident scores 25/100 while burning 99.5% of the monthly error budget; with hints and an SLO like the rest of the library (0.35.0)
+- [x] On-time-ack-after-misses scenario: `network-partition` — the datacenter link drops and the pages go to responders whose paging tooling sits on the unreachable side, so the primary and the secondary both miss and the manager acks on time and fails traffic over to one datacenter; the first built-in scenario exercising two misses with an on-time ack, so the impact grows across all three stages (cross-region timeouts to orders stuck to a split-brain risk) while the full ack credit is kept, and the incident scores 33/100 while burning 145.8% of the monthly error budget; with hints and an SLO like the rest of the library (0.37.0)

@@ -4411,6 +4411,102 @@ class TestDbFailoverScenario(unittest.TestCase):
         self.assertIn("24/100", out)
 
 
+class TestNetworkPartitionScenario(unittest.TestCase):
+    """network-partition: the datacenters cannot reach each other.
+
+    The primary and the secondary both miss the page — their paging
+    tooling sits on the unreachable side — and the manager acks on
+    time, so this is the library's first built-in run that exercises
+    two misses with an on-time ack: the impact grows across all three
+    stages while the page goes unanswered, and the full ack credit
+    is kept.
+    """
+
+    def test_network_partition_scenario(self):
+        scenario = get("network-partition")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "checkout-mesh")
+        self.assertEqual(scenario.ack_delay_min, (None, None, 8))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_two_misses_then_on_time_ack_scores_with_full_credit(self):
+        result = simulate(get("network-partition"), DEFAULT_POLICY)
+        score = result.score
+        # Standard timeouts 5m, 5m, 10m: the primary misses at 5m,
+        # the secondary misses at 10m and the manager acks 8m after
+        # being paged, at 18m — on time against the 10m timeout.
+        self.assertEqual(score.time_to_ack_min, 18)
+        self.assertEqual(score.time_to_mitigate_min, 63)
+        self.assertEqual(score.time_to_resolve_min, 88)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 2)
+        self.assertEqual(score.ack_late_min, 0)
+        self.assertAlmostEqual(score.ack_credit, 1.0)
+        # 100 - 30 (two escalations) - 13 (18m to ack past the 5m
+        # grace) - 24 (63m to mitigate past the 15m grace, halved)
+        # = 33, with the full ack credit kept.
+        self.assertEqual(score.points, 33)
+        # Downtime 63m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 63)
+        self.assertEqual(score.error_budget_burn_pct, 145.8)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 3)
+        self.assertEqual([step.outcome for step in chain],
+                         ["missed", "missed", "acked"])
+        self.assertEqual([step.paged_at_min for step in chain], [0, 5, 10])
+        self.assertEqual(
+            [step.impact for step in chain],
+            list(get("network-partition").impact_stages))
+
+    def test_impact_grows_on_each_escalation_event(self):
+        result = simulate(get("network-partition"), DEFAULT_POLICY)
+        escalated = [event for event in result.timeline.events
+                     if event.kind == "escalated"]
+        self.assertEqual(len(escalated), 2)
+        self.assertIn("impact now: Orders stuck: writes cannot reach "
+                      "the primary datacenter, checkout queue growing",
+                      escalated[0].detail)
+        self.assertIn("impact now: Split-brain risk: both sides still "
+                      "serving reads, reconciliation needed once the "
+                      "link returns", escalated[1].detail)
+
+    def test_debrief_of_unanswered_pages_names_the_missed_responders(self):
+        result = simulate(get("network-partition"), DEFAULT_POLICY)
+        text = generate_debrief(result).render()
+        self.assertIn("ana", text)
+        self.assertIn("ben", text)
+        self.assertIn("Split-brain", text)
+
+    def test_template_round_trips_network_partition(self):
+        data = scenario_to_dict(get("network-partition"))
+        self.assertEqual(data["ack_delay_min"], [None, None, 8])
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"network-partition": data}}, handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["network-partition"],
+                         get("network-partition"))
+
+    def test_cli_runs_network_partition(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "network-partition"]), 0)
+        out = buf.getvalue()
+        self.assertIn("33/100", out)
+
+    def test_cli_runs_network_partition_with_hints(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "network-partition", "--hints", "3"]), 0)
+        out = buf.getvalue()
+        self.assertIn("inter-datacenter link", out)
+        self.assertIn("18/100", out)
+
+
 class TestErrorBudgetBurn(unittest.TestCase):
     def _write_scenario_file(self, data):
         handle = tempfile.NamedTemporaryFile(
@@ -4787,7 +4883,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.36.0", text)
+        self.assertIn("Generated by incident-lab 0.37.0", text)
         self.assertIn("Page 1 of 1", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -4987,7 +5083,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.36.0")
+                         "incident-lab 0.37.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -5648,7 +5744,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.36.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.37.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
