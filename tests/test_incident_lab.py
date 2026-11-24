@@ -1821,7 +1821,12 @@ class TestDebrief(unittest.TestCase):
         self.assertEqual(debrief.grade, "D")
         self.assertIn("Ack was 1m late, keeping only 50% of the score",
                       debrief.went_badly)
-        self.assertEqual(debrief.action_items[0]["owner"], "ana")
+        # The late-ack action names the responder; the unverified
+        # run also carries a per-region verification action, so
+        # find ana's item instead of assuming it is first.
+        ana_item = next(item for item in debrief.action_items
+                        if item["owner"] == "ana")
+        self.assertIn("acked 1m late", ana_item["action"])
 
     def test_nobody_acks_blames_every_level_and_adds_fallback(self):
         scenario = Scenario(
@@ -3260,7 +3265,9 @@ class TestPurgeVerification(unittest.TestCase):
         self.assertEqual(
             get("retry-storm").regions,
             ("us-east", "us-west", "eu-west"))
-        self.assertEqual(get("disk-full").regions, ())
+        self.assertEqual(
+            get("disk-full").regions,
+            ("us-east", "us-west", "eu-west"))
 
     def test_verified_run_costs_vary_by_region(self):
         result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
@@ -3324,7 +3331,7 @@ class TestPurgeVerification(unittest.TestCase):
 
     def test_per_region_needs_regions(self):
         with self.assertRaises(ValueError):
-            simulate(get("disk-full"), DEFAULT_POLICY,
+            simulate(get("latency-spike"), DEFAULT_POLICY,
                      purge_verification="per-region")
         with self.assertRaises(ValueError):
             simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
@@ -3398,7 +3405,7 @@ class TestPurgeVerification(unittest.TestCase):
         self.assertEqual(outcome.replayed.to_dict(), base.to_dict())
 
     def test_what_if_verification_needs_regions(self):
-        base = simulate(get("disk-full"), DEFAULT_POLICY)
+        base = simulate(get("latency-spike"), DEFAULT_POLICY)
         with self.assertRaises(ValueError):
             what_if(base, purge_verification="per-region")
         # A run saved before regions existed has none either.
@@ -3430,7 +3437,7 @@ class TestPurgeVerification(unittest.TestCase):
         err = io.StringIO()
         with redirect_stderr(err):
             self.assertEqual(main([
-                "run", "disk-full", "--verify-purge", "per-region"]), 2)
+                "run", "latency-spike", "--verify-purge", "per-region"]), 2)
         self.assertIn("no regions to verify", err.getvalue())
 
     def test_cli_run_bad_verification_value_fails(self):
@@ -3538,7 +3545,7 @@ class TestPurgeVerification(unittest.TestCase):
     def test_shift_verification_needs_regions_for_every_incident(self):
         with self.assertRaises(ValueError):
             simulate_shift(
-                [get("cdn-purge-failure"), get("disk-full")],
+                [get("cdn-purge-failure"), get("latency-spike")],
                 DEFAULT_POLICY, slo_percent=99.5,
                 purge_verification="per-region")
 
@@ -5001,6 +5008,106 @@ class TestConfigPushScenario(unittest.TestCase):
         self.assertIn("25/100", out)
 
 
+class TestDiskFullPerRegionCosts(unittest.TestCase):
+    """disk-full: per-region verification costs for the reclaimed
+    volume.
+
+    The storage team confirms the freed space in every region
+    before the incident is declared mitigated, and the check is
+    slowest where the fleet is largest — 3m in us-east, 5m in
+    us-west and 9m in eu-west — so the verified run costs 8m
+    more than the 3m default and scores 88/100 where the
+    default-cost run scored 92.
+    """
+
+    def test_disk_full_scenario(self):
+        scenario = get("disk-full")
+        self.assertEqual(scenario.severity, "high")
+        self.assertEqual(scenario.service, "payments-db")
+        self.assertEqual(scenario.ack_delay_min, (3, None, None))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 9})
+        self.assertEqual(scenario.verify_delay_min_total(), 17)
+        self.assertGreaterEqual(len(scenario.hints), 1)
+
+    def test_verified_per_region_costs_disk_full(self):
+        result = simulate(get("disk-full"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(result.score.verify_delay_min, 17)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 9})
+        # The primary acks at 3m, so the checks land at 6m, 11m
+        # and 20m: the 9m eu-west check is what pushes mitigation
+        # to 40m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(6, "us-east"), (11, "us-west"), (20, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in us-west (5m)",
+             "fix confirmed in eu-west (9m)"])
+        self.assertEqual(score.time_to_mitigate_min, 40)
+        self.assertEqual(score.time_to_resolve_min, 52)
+        # 100 - 12 (40m to mitigate past the 15m grace, halved)
+        # = 88 — four points below the 92 the 3m-default costs
+        # scored.
+        self.assertEqual(score.points, 88)
+        self.assertEqual(score.downtime_min, 40)
+        self.assertEqual(score.error_budget_burn_pct, 92.6)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 3m, us-west 5m, eu-west 9m, +17m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 3, "us-west": 5, "eu-west": 9})
+
+    def test_what_if_turning_verification_on_costs_eight_points(self):
+        base = simulate(get("disk-full"), DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 88)
+        self.assertEqual(outcome.points_delta, -8)
+
+    def test_drill_matches_run_with_per_region_costs(self):
+        drill = run_drill(
+            get("disk-full"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 3\nmitigate 20\nresolve 12\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("disk-full"), DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 88)
+
+    def test_shift_with_per_region_costs(self):
+        shift = simulate_shift(
+            [get("disk-full")], DEFAULT_POLICY,
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual([run.score.points for run in shift.runs], [88])
+        self.assertEqual(shift.total_burn_pct, 92.6)
+
+    def test_cli_run_shows_per_region_breakdown(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "disk-full",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     17m "
+            "(us-east 3m, us-west 5m, eu-west 9m)", out)
+        self.assertIn("88/100", out)
+
+
 class TestDbFailoverScenario(unittest.TestCase):
     """db-failover: the primary database fails over to a replica.
 
@@ -6417,7 +6524,10 @@ class TestPdfPostmortem(unittest.TestCase):
         data = render_postmortem_pdf(result)
         self.assertTrue(data.startswith(b"%PDF-1.4\n"))
         self.assertTrue(data.rstrip().endswith(b"%%EOF"))
-        self.assertEqual(self._pdf_page_count(data), 1)
+        # Two pages now: disk-full carries regions, so the
+        # postmortem adds the per-region verification finding and
+        # action item.
+        self.assertEqual(self._pdf_page_count(data), 2)
         text = self._pdf_text(data)
         self.assertIn("Postmortem: Disk 97% full on payments-db", text)
         self.assertIn("payments-db", text)
@@ -6428,8 +6538,8 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.49.0", text)
-        self.assertIn("Page 1 of 1", text)
+        self.assertIn("Generated by incident-lab 0.50.0", text)
+        self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
         result = simulate(get("disk-full"), DEFAULT_POLICY, hints=1)
@@ -6541,7 +6651,10 @@ class TestPdfPostmortem(unittest.TestCase):
         with open(out_path.name, "rb") as handle:
             data = handle.read()
         self.assertTrue(data.startswith(b"%PDF-"))
-        self.assertEqual(self._pdf_page_count(data), 1)
+        # Two pages now: disk-full carries regions, so the
+        # postmortem adds the per-region verification finding and
+        # action item.
+        self.assertEqual(self._pdf_page_count(data), 2)
         self.assertIn("Disk 97% full on payments-db",
                       self._pdf_text(data))
 
@@ -6628,7 +6741,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.49.0")
+                         "incident-lab 0.50.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -7289,7 +7402,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.49.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.50.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

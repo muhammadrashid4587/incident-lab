@@ -107,12 +107,28 @@ SCENARIOS = {
         severity="high",
         description=(
             "The primary database disk is 97% full and growing. "
-            "WAL archiving stalled after a bad deploy."
+            "WAL archiving stalled after a bad deploy. The reclaimed "
+            "space is only real once the storage team confirms it in "
+            "every region: the volume check takes 3m in us-east, "
+            "where the fleet is smallest, 5m in us-west and 9m in "
+            "eu-west, where the fleet is largest and the team "
+            "confirms each host's volume before signing off."
         ),
         ack_delay_min=(3, None, None),
         mitigate_delay_min=20,
         resolve_delay_min=12,
         slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: the
+        # storage team confirms the reclaimed volume in 3m in
+        # us-east, 5m in us-west and 9m in eu-west, where the fleet
+        # is largest and each host's volume is checked before the
+        # team signs off. The total is 17m, 8m more than the 3m
+        # default, so the verified run scores 88/100 where the
+        # default-cost run scored 92.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 5, "eu-west": 9,
+        },
         hints=(
             "Check WAL archiving: a stalled archiver is the usual cause "
             "of disk growth after a deploy.",
