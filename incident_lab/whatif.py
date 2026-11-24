@@ -28,7 +28,9 @@ from .debrief import grade
 from .difficulty import NORMAL
 from .policy import parse_ack_timeout_overrides
 from .scenarios import Scenario
-from .simulator import simulate
+from .simulator import (
+    PURGE_VERIFICATION_OFF, parse_purge_verification, simulate,
+)
 
 
 def _scenario_from_result(original) -> Scenario:
@@ -79,6 +81,19 @@ def _scenario_from_result(original) -> Scenario:
         if mitigate_delay < 0 or resolve_delay < 0:
             raise ValueError(
                 "what-if: saved run's milestones run backwards")
+        # The recorded mitigate delay includes any per-region
+        # verification time the base run spent; the scenario's own
+        # mitigate delay is what is left once that is taken out, so
+        # the override can re-apply verification (or not) cleanly
+        # instead of stacking it on top of the base run's.
+        verify_delay = score.verify_delay_min or 0
+        mitigate_delay -= verify_delay
+        if mitigate_delay < 1:
+            raise ValueError(
+                "what-if: saved run's mitigate delay "
+                f"({score.time_to_mitigate_min - score.time_to_ack_min}m) "
+                "is shorter than the verification time it records "
+                f"({verify_delay}m)")
     return Scenario(
         name=original.incident.id,
         service=original.incident.service,
@@ -90,6 +105,12 @@ def _scenario_from_result(original) -> Scenario:
         resolve_delay_min=resolve_delay,
         hints=tuple(hint.text for hint in original.hints),
         slo_percent=score.slo_percent,
+        # The regions the base run's scenario carried, so a
+        # per-region verification replay has regions to verify; a
+        # run saved before 0.43.0 has none, and a verification
+        # override on it fails in simulate() instead of inventing
+        # regions.
+        regions=tuple(original.regions),
         # The impact stages the original run walked through, read off
         # its recorded escalation chain: one stage per level paged,
         # in order. The replay walks the same levels (a miss stays a
@@ -178,6 +199,12 @@ class WhatIfResult:
         lines.append(
             f"  time-to-mitigate: {_fmt_maybe(self.original.score.time_to_mitigate_min)}"
             f" -> {_fmt_maybe(self.replayed.score.time_to_mitigate_min)}")
+        if (self.original.score.verify_delay_min
+                or self.replayed.score.verify_delay_min):
+            lines.append(
+                f"  verify delay:     "
+                f"{self.original.score.verify_delay_min}m"
+                f" -> {self.replayed.score.verify_delay_min}m")
         lines.append(
             f"  escalations:      {self.original.score.escalations} "
             f"-> {self.replayed.score.escalations}")
@@ -203,7 +230,8 @@ def _fmt_burn(value) -> str:
 
 
 def what_if(original, ack_timeout=None, ack_timeouts=None,
-            difficulty=None, policy=None) -> WhatIfResult:
+            difficulty=None, policy=None,
+            purge_verification=None) -> WhatIfResult:
     """Re-simulate a saved run with overridden parameters.
 
     ``ack_timeout`` sets every level's timeout to that many minutes;
@@ -211,7 +239,13 @@ def what_if(original, ack_timeout=None, ack_timeouts=None,
     list in level order, or named overrides such as ``primary=120``);
     ``difficulty`` replays the run at that difficulty; ``policy`` swaps
     in a different escalation policy (an EscalationPolicy, resolved
-    from a name by the caller). At most one of ``ack_timeout`` and
+    from a name by the caller); ``purge_verification`` ("off" or
+    "per-region") replays the run with the fix verified in every
+    region before the incident is declared mitigated, or without
+    that verification — the recorded mitigate delay is split back
+    into the mitigation work and the verification time the base run
+    spent, so the override re-applies verification cleanly instead
+    of stacking it. At most one of ``ack_timeout`` and
     ``ack_timeouts`` may be given. Difficulty scales the recorded
     timeouts relative to the original run's difficulty (the saved
     timeouts already carry the original difficulty's scaling), and the
@@ -241,6 +275,8 @@ def what_if(original, ack_timeout=None, ack_timeouts=None,
                 or ack_timeout <= 0):
             raise ValueError(
                 "ack timeout must be a positive integer number of minutes")
+    if purge_verification is not None:
+        purge_verification = parse_purge_verification(purge_verification)
     scenario = _scenario_from_result(original)
     original_difficulty = original.difficulty or NORMAL
     overrides = []
@@ -281,6 +317,18 @@ def what_if(original, ack_timeout=None, ack_timeouts=None,
                 f"{level.responder.name} ({level.responder.role}) "
                 f"{level.ack_timeout_min}m"
                 for level in policy.levels))
+    # Purge verification is a mode, not a number: the replay uses the
+    # override when it differs from the base run, and keeps the base
+    # run's mode otherwise — the same "only record a change" rule as
+    # --difficulty above. simulate() raises when per-region
+    # verification is asked of a run whose scenario has no regions.
+    replay_purge_verification = original.purge_verification
+    if purge_verification is not None:
+        replay_purge_verification = purge_verification
+        if purge_verification != original.purge_verification:
+            overrides.append(
+                "purge verification: "
+                f"{original.purge_verification} -> {purge_verification}")
     replayed = simulate(scenario, policy, difficulty=replay_difficulty,
                         hints=len(original.hints),
                         # A replay under the original policy keeps the
@@ -288,6 +336,7 @@ def what_if(original, ack_timeout=None, ack_timeouts=None,
                         # policy has its own responders, so the week no
                         # longer applies.
                         rota_week=(original.rota_week
-                                   if not policy_swapped else None))
+                                   if not policy_swapped else None),
+                        purge_verification=replay_purge_verification)
     return WhatIfResult(original=original, replayed=replayed,
                         overrides=overrides)

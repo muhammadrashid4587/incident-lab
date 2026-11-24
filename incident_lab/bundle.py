@@ -79,6 +79,7 @@ def _manifest(loaded, entries, shift=None) -> dict:
             "budget_exhausted": shift.budget_exhausted,
             "incidents": [run.incident.id for run in shift.runs],
             "skipped": list(shift.skipped),
+            "purge_verification": shift.purge_verification,
         }
         base["seed"] = shift.seed
         base["difficulty"] = (shift.difficulty.name
@@ -106,6 +107,8 @@ def _manifest(loaded, entries, shift=None) -> dict:
     base["seed"] = result.seed
     base["difficulty"] = (result.difficulty.name
                           if result.difficulty is not None else None)
+    base["purge_verification"] = result.purge_verification
+    base["verify_delay_min"] = result.score.verify_delay_min
     base["what_if"] = what_if
     return base
 
@@ -327,6 +330,10 @@ def summarize_bundle(manifest: dict) -> str:
             f"(grade {shift_info['grade']}), burned "
             f"{shift_info['total_burn_pct']:.1f}% of the monthly "
             f"error budget")
+        if shift_info.get("purge_verification") not in (None, "off"):
+            lines.append(
+                "purge verification: "
+                f"{shift_info['purge_verification']}")
         lines.append(f"files: {names}")
         return "\n".join(lines)
     incident = manifest["incident"]
@@ -335,6 +342,11 @@ def summarize_bundle(manifest: dict) -> str:
         f"incident: {incident['title']} [{incident['id']}]")
     lines.append(
         f"score: {score['points']}/100 (grade {score['grade']})")
+    if manifest.get("purge_verification") not in (None, "off"):
+        lines.append(
+            "purge verification: "
+            f"{manifest['purge_verification']} "
+            f"(+{manifest.get('verify_delay_min', 0)}m)")
     lines.append(f"files: {names}")
     what_if = manifest.get("what_if")
     if what_if is not None:

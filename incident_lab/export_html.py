@@ -52,6 +52,11 @@ def _score_rows(debrief) -> str:
     ]
     if score.difficulty is not None:
         rows.append(("Difficulty", score.difficulty.name))
+    if score.verify_delay_min:
+        rows.append((
+            "Purge verification",
+            f"per-region ({len(score.regions)} regions, "
+            f"+{score.verify_delay_min}m)"))
     if score.error_budget_burn_pct is not None:
         rows.append((
             "Error budget",
@@ -261,6 +266,10 @@ def render_shift_postmortem_html(shift) -> str:
         parts.append(
             "<tr><th>Difficulty</th>"
             f"<td>{debrief.difficulty.name}</td></tr>")
+    if shift.purge_verification != "off":
+        parts.append(
+            "<tr><th>Purge verification</th>"
+            f"<td>{shift.purge_verification}</td></tr>")
     if shift.seed is not None:
         parts.append(
             f"<tr><th>Seed</th><td>{shift.seed}</td></tr>")

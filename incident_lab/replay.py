@@ -188,7 +188,23 @@ def _score_from_dict(raw) -> Score:
         downtime_min=downtime_min,
         error_budget_burn_pct=_require_nonnegative_number_or_none(
             data, "error_budget_burn_pct", "score"),
+        # Saved runs from before 0.43.0 have no verify-delay field;
+        # they round-trip as no verification time.
+        verify_delay_min=_require_verify_delay(data),
     )
+
+
+def _require_verify_delay(data: dict) -> int:
+    """Parse an optional score verify-delay; missing means no
+    verification time (a run from before 0.43.0, or verification off)."""
+    value = data.get("verify_delay_min")
+    if value is None:
+        return 0
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError(
+            "replay file: score 'verify_delay_min' must be a "
+            "non-negative integer")
+    return value
 
 
 def _require_hint_count(data: dict, key: str) -> int:
@@ -524,6 +540,8 @@ def _shift_from_dict(data: dict):
         raise ValueError(
             "replay file: shift 'rota_week' must be a non-negative "
             "integer or null")
+    purge_verification = _purge_verification_from_dict(
+        raw_shift.get("purge_verification"))
     return ShiftResult(
         runs=runs,
         skipped=list(raw_skipped),
@@ -538,6 +556,7 @@ def _shift_from_dict(data: dict):
         seed=seed,
         jitter=jitter,
         rota_week=rota_week,
+        purge_verification=purge_verification,
     )
 
 
@@ -609,6 +628,9 @@ def _result_from_dict(data: dict) -> SimulationResult:
         raise ValueError(
             "replay file: 'rota_week' must be a non-negative integer "
             "or null")
+    regions = _regions_from_dict(data.get("regions"))
+    purge_verification = _purge_verification_from_dict(
+        data.get("purge_verification"))
     return SimulationResult(
         incident=_incident_from_dict(data.get("incident")),
         policy=_policy_from_dict(data.get("policy")),
@@ -621,4 +643,41 @@ def _result_from_dict(data: dict) -> SimulationResult:
         escalation_chain=_escalation_chain_from_dict(
             data.get("escalation_chain")),
         rota_week=rota_week,
+        regions=regions,
+        purge_verification=purge_verification,
     )
+
+
+def _regions_from_dict(raw) -> tuple:
+    """Parse an optional top-level ``regions`` list of region names.
+
+    Saved runs from before 0.43.0 have no regions key; they
+    round-trip as no regions.
+    """
+    if raw is None:
+        return ()
+    if (not isinstance(raw, list)
+            or any(not isinstance(region, str) or not region
+                   for region in raw)):
+        raise ValueError(
+            "replay file: 'regions' must be a list of non-empty "
+            "strings or null")
+    if len(set(raw)) != len(raw):
+        raise ValueError(
+            "replay file: 'regions' must not list a region twice")
+    return tuple(raw)
+
+
+def _purge_verification_from_dict(raw) -> str:
+    """Parse an optional top-level ``purge_verification`` mode.
+
+    Saved runs from before 0.43.0 have no key; they round-trip as
+    verification off.
+    """
+    if raw is None:
+        return "off"
+    if raw not in ("off", "per-region"):
+        raise ValueError(
+            "replay file: 'purge_verification' must be 'off' or "
+            "'per-region'")
+    return raw

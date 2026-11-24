@@ -55,6 +55,12 @@ class Scenario:
     # (100 - SLO)% of a 30-day month; the incident's downtime is
     # reported against it as error-budget burn.
     slo_percent: object = None
+    # The regions the remediation must reach: with per-region purge
+    # verification the fix is confirmed from a cold edge node in each
+    # one before the incident is declared mitigated. Empty means the
+    # scenario has no regions and per-region verification does not
+    # apply to it.
+    regions: tuple = ()
 
 
 SCENARIOS = {
@@ -426,6 +432,7 @@ SCENARIOS = {
         mitigate_delay_min=30,
         resolve_delay_min=15,
         slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west", "ap-southeast"),
         hints=(
             "Check the purge by fetching the asset yourself, not by "
             "trusting the purge dashboard: a purge API that returns "
@@ -467,6 +474,7 @@ SCENARIOS = {
         mitigate_delay_min=30,
         resolve_delay_min=15,
         slo_percent=99.95,
+        regions=("us-east", "us-west", "eu-west"),
         hints=(
             "Check the fraud-rules deploy first: payments declining "
             "right after a rules update is the rules until proven "
@@ -504,6 +512,7 @@ SCENARIOS = {
         mitigate_delay_min=35,
         resolve_delay_min=20,
         slo_percent=99.95,
+        regions=("us-east", "us-west", "eu-west"),
         hints=(
             "Roll back the key rotation first: the old key still "
             "decrypts the stored tokens, and a rollback is faster "
@@ -593,6 +602,7 @@ def scenario_to_dict(scenario: Scenario) -> dict:
         "hints": list(scenario.hints),
         "impact_stages": list(scenario.impact_stages),
         "slo_percent": scenario.slo_percent,
+        "regions": list(scenario.regions),
     }
 
 
@@ -655,7 +665,33 @@ def _scenario_from_dict(name: str, data) -> Scenario:
         hints=tuple(_require_hints(data, name)),
         impact_stages=tuple(_require_impact_stages(data, name)),
         slo_percent=_require_slo(data, name),
+        regions=tuple(_require_regions(data, name)),
     )
+
+
+def _require_regions(data: dict, name: str) -> list:
+    """Validate a scenario file's optional ``regions`` list.
+
+    Regions are where the remediation must be confirmed: with
+    per-region purge verification the fix is checked from a cold
+    edge node in each one before the incident is declared
+    mitigated. Absent means the scenario has no regions and
+    per-region verification does not apply to it; present it must
+    be a list of non-empty strings, with no region listed twice.
+    """
+    raw = data.get("regions", [])
+    if not isinstance(raw, list):
+        raise ValueError(
+            f"scenario {name!r}: 'regions' must be a list of strings")
+    for index, region in enumerate(raw):
+        if not isinstance(region, str) or not region:
+            raise ValueError(
+                f"scenario {name!r}: 'regions' entry {index} must be "
+                "a non-empty string")
+    if len(set(raw)) != len(raw):
+        raise ValueError(
+            f"scenario {name!r}: 'regions' must not list a region twice")
+    return raw
 
 
 def _require_slo(data: dict, name: str) -> object:

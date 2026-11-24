@@ -58,6 +58,12 @@ class Debrief:
     slo_percent: object = None
     downtime_min: object = None
     error_budget_burn_pct: object = None
+    # Purge verification: the mode the run was played with ("off" or
+    # "per-region"), the minutes the verification cost, and the
+    # regions it covered (empty when the scenario has none).
+    purge_verification: str = "off"
+    verify_delay_min: int = 0
+    regions: tuple = ()
 
     def to_dict(self) -> dict:
         """JSON-ready dict: summary, findings, action items, timeline."""
@@ -81,6 +87,9 @@ class Debrief:
                 "slo_percent": self.slo_percent,
                 "downtime_min": self.downtime_min,
                 "error_budget_burn_pct": self.error_budget_burn_pct,
+                "purge_verification": self.purge_verification,
+                "verify_delay_min": self.verify_delay_min,
+                "regions": list(self.regions),
             },
             "went_well": list(self.went_well),
             "went_badly": list(self.went_badly),
@@ -101,6 +110,11 @@ class Debrief:
         ]
         if self.difficulty is not None:
             lines.append(f"Difficulty: {self.difficulty.name}")
+        if self.verify_delay_min:
+            lines.append(
+                f"Purge verification: per-region "
+                f"({len(self.regions)} regions, "
+                f"+{self.verify_delay_min}m)")
         if self.error_budget_burn_pct is not None:
             lines.append(
                 f"Error budget: burned "
@@ -184,6 +198,50 @@ def _impact_growth(result: SimulationResult) -> tuple:
     return went_badly, action_items
 
 
+def _purge_verification_finding(result: SimulationResult) -> tuple:
+    """Findings for per-region purge verification.
+
+    Returns ``(went_well, went_badly, action_items)``. When the run
+    verified the fix in every region before declaring the incident
+    mitigated, that is a good finding naming the regions and the
+    time it cost. When the run mitigated a scenario that has regions
+    without verifying, that is a bad finding with an action to verify
+    per region before the next mitigation is declared: a purge or
+    rollback that only reached some regions leaves the others
+    serving the old state. A run that never mitigated (nobody acked,
+    or a drill ended before mitigation) reports nothing — there was
+    no fix to verify.
+    """
+    score = result.score
+    if score.time_to_mitigate_min is None or not result.regions:
+        return [], [], []
+    regions = ", ".join(result.regions)
+    if score.verify_delay_min:
+        return (
+            [f"The fix was verified in every region ({regions}) "
+             f"before the incident was declared mitigated — "
+             f"{score.verify_delay_min}m of verification, no region "
+             f"left serving the old state"],
+            [],
+            [],
+        )
+    return (
+        [],
+        [f"The fix was never verified per region — a purge or "
+         f"rollback that only reached some of {regions} would have "
+         f"left the others serving the old state while the incident "
+         f"was declared mitigated"],
+        [{
+            "action": (
+                "Verify the fix from a cold edge node in every region "
+                f"({regions}) before declaring the next incident "
+                "mitigated — a dashboard that says purged is not a "
+                "purge"),
+            "owner": "on-call lead",
+        }],
+    )
+
+
 def _error_budget_finding(result: SimulationResult) -> tuple:
     """Findings for an incident that burned its error budget.
 
@@ -251,6 +309,11 @@ def _partial_debrief(result: SimulationResult, ack_grace_min: int,
     action_items.extend(actions)
     # The downtime may have burned the month's error budget.
     badly, actions = _error_budget_finding(result)
+    went_badly.extend(badly)
+    action_items.extend(actions)
+    # The fix may or may not have been verified per region.
+    well, badly, actions = _purge_verification_finding(result)
+    went_well.extend(well)
     went_badly.extend(badly)
     action_items.extend(actions)
     if score.escalations == 0:
@@ -330,6 +393,9 @@ def _partial_debrief(result: SimulationResult, ack_grace_min: int,
         slo_percent=score.slo_percent,
         downtime_min=score.downtime_min,
         error_budget_burn_pct=score.error_budget_burn_pct,
+        purge_verification=result.purge_verification,
+        verify_delay_min=score.verify_delay_min,
+        regions=tuple(result.regions),
     )
 
 
@@ -410,6 +476,9 @@ def generate_debrief(result: SimulationResult) -> Debrief:
             slo_percent=score.slo_percent,
             downtime_min=score.downtime_min,
             error_budget_burn_pct=score.error_budget_burn_pct,
+            purge_verification=result.purge_verification,
+            verify_delay_min=score.verify_delay_min,
+            regions=tuple(result.regions),
         )
 
     # The first `escalations` levels missed; the next level acked.
@@ -438,6 +507,12 @@ def generate_debrief(result: SimulationResult) -> Debrief:
 
     # The downtime may have burned the month's error budget.
     badly, actions = _error_budget_finding(result)
+    went_badly.extend(badly)
+    action_items.extend(actions)
+
+    # The fix may or may not have been verified per region.
+    well, badly, actions = _purge_verification_finding(result)
+    went_well.extend(well)
     went_badly.extend(badly)
     action_items.extend(actions)
 
@@ -510,6 +585,9 @@ def generate_debrief(result: SimulationResult) -> Debrief:
         slo_percent=score.slo_percent,
         downtime_min=score.downtime_min,
         error_budget_burn_pct=score.error_budget_burn_pct,
+        purge_verification=result.purge_verification,
+        verify_delay_min=score.verify_delay_min,
+        regions=tuple(result.regions),
     )
 
 

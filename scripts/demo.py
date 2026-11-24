@@ -20,6 +20,19 @@ def main() -> None:
             f"escalations={score.escalations} "
             f"resolved={score.resolved} points={score.points}/100"
         )
+    # The purge-verification what-if dimension, shown on the
+    # scenario it was built for: verifying the purge in every
+    # region costs 3m per region before the incident is mitigated.
+    verified = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                        purge_verification="per-region")
+    score = verified.score
+    print(
+        f"{'cdn-purge-failure':<20} ack={score.time_to_ack_min}m "
+        f"mitigate={score.time_to_mitigate_min}m "
+        f"escalations={score.escalations} "
+        f"resolved={score.resolved} points={score.points}/100 "
+        f"(verified per region, +{score.verify_delay_min}m)"
+    )
 
 
 if __name__ == "__main__":

@@ -27,6 +27,7 @@ _SCORE_FIELDS = [
     # Error-budget burn is a percent number (115.7), not a fraction,
     # so it formats as "115.7%" rather than like ack_credit.
     ("error_budget_burn_pct", "error budget burn", "%"),
+    ("verify_delay_min", "verify delay", "m"),
 ]
 
 
@@ -64,11 +65,19 @@ class Comparison:
     # that side's run predates chains (before 0.26.0).
     chain_a: list = None
     chain_b: list = None
+    # Each side's purge-verification mode ("off" or "per-region").
+    purge_verification_a: str = "off"
+    purge_verification_b: str = "off"
 
     @property
     def chains_identical(self) -> bool:
         """True when both runs walked the same escalation chain."""
         return self.chain_a == self.chain_b
+
+    @property
+    def same_purge_verification(self) -> bool:
+        """True when both runs verified (or skipped) the same way."""
+        return self.purge_verification_a == self.purge_verification_b
 
     @property
     def timelines_identical(self) -> bool:
@@ -83,17 +92,20 @@ class Comparison:
             "run_a": {
                 "label": self.label_a,
                 "scenario": self.incident_a,
+                "purge_verification": self.purge_verification_a,
                 "what_if": (self.whatif_a.to_dict()
                             if self.whatif_a is not None else None),
             },
             "run_b": {
                 "label": self.label_b,
                 "scenario": self.incident_b,
+                "purge_verification": self.purge_verification_b,
                 "what_if": (self.whatif_b.to_dict()
                             if self.whatif_b is not None else None),
             },
             "same_scenario": self.same_scenario,
             "same_policy": self.same_policy,
+            "same_purge_verification": self.same_purge_verification,
             "score": [
                 {
                     "metric": row["metric"],
@@ -136,6 +148,12 @@ class Comparison:
                          "directly comparable")
         if not self.same_policy:
             lines.append("note: different policies")
+        if not self.same_purge_verification:
+            lines.append(
+                "note: different purge verification "
+                f"({self.purge_verification_a} vs "
+                f"{self.purge_verification_b}) — the verified run spent "
+                "time confirming the fix in every region")
         lines.append("")
         lines.append("score:")
         for row in self.score_rows:
@@ -318,6 +336,8 @@ def compare_results(a: SimulationResult, b: SimulationResult,
         whatif_b=whatif_b,
         chain_a=[step.to_dict() for step in a.escalation_chain],
         chain_b=[step.to_dict() for step in b.escalation_chain],
+        purge_verification_a=a.purge_verification,
+        purge_verification_b=b.purge_verification,
     )
 
 

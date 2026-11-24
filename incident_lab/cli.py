@@ -32,7 +32,9 @@ from .scenarios import (
     SCENARIOS, get, list_scenarios, load_scenario_file, scenario_to_dict,
 )
 from .shift import simulate_shift
-from .simulator import simulate, simulate_batch
+from .simulator import (
+    PURGE_VERIFICATION_MODES, simulate, simulate_batch,
+)
 from .stats import aggregate_stats
 from .whatif import what_if
 
@@ -119,6 +121,10 @@ def _print_result(result) -> None:
     print(f"policy:   {result.policy.name}")
     if result.difficulty is not None:
         print(f"difficulty: {result.difficulty.name}")
+    if result.purge_verification != "off":
+        print(f"purge verification: {result.purge_verification} "
+              f"({len(result.regions)} regions, "
+              f"+{result.score.verify_delay_min}m)")
     if result.rota_week is not None:
         print(f"rota week: {result.rota_week}")
     if result.seed is not None:
@@ -163,6 +169,9 @@ def _print_result(result) -> None:
     print(f"  time-to-resolve:  {score.time_to_resolve_min}m"
           if score.time_to_resolve_min is not None
           else "  time-to-resolve:  -")
+    if score.verify_delay_min:
+        print(f"  verify delay:     {score.verify_delay_min}m "
+              f"({len(result.regions)} regions)")
     if score.slo_percent is not None:
         print(f"  downtime:         {score.downtime_min}m"
               if score.downtime_min is not None else "  downtime:         -")
@@ -192,6 +201,8 @@ def _print_batch_result(batch) -> None:
     print(f"policy:   {batch.policy.name}")
     if batch.difficulty is not None:
         print(f"difficulty: {batch.difficulty.name}")
+    if batch.purge_verification != "off":
+        print(f"purge verification: {batch.purge_verification}")
     if batch.rota_week is not None:
         print(f"rota week: {batch.rota_week}")
     print(f"seeds:    {', '.join(str(seed) for seed in batch.seeds)}")
@@ -345,6 +356,12 @@ def _resolve_scenario_policy(args):
               f"{len(scenario.hints)} hint(s), asked for {args.hints}",
               file=sys.stderr)
         return None
+    if getattr(args, "verify_purge", None) == "per-region" \
+            and not scenario.regions:
+        print(f"scenario {scenario.name!r} has no regions to verify: "
+              "--verify-purge per-region needs a scenario with "
+              "regions", file=sys.stderr)
+        return None
     return scenario, policy, difficulty, rota_week
 
 
@@ -390,6 +407,16 @@ def _resolve_shift(args):
                 print(f"known scenarios: {', '.join(known)}",
                       file=sys.stderr)
                 return None
+    # Per-region verification needs every scheduled scenario to have
+    # regions: the shared resolver above only sees the first one.
+    if getattr(args, "verify_purge", None) == "per-region":
+        regionless = [scenario.name for scenario in scenarios
+                      if not scenario.regions]
+        if regionless:
+            print("--verify-purge per-region needs scenarios with "
+                  "regions; no regions: " + ", ".join(regionless),
+                  file=sys.stderr)
+            return None
     # The policy, difficulty and rota are shared by the whole shift:
     # resolve them once, with the first scenario, and reuse them.
     # Shifts take no --hints and no per-level ack timeouts — those
@@ -470,6 +497,13 @@ def main(argv=None) -> int:
                           f"{', '.join(list_difficulties())} (or 1, 2, 3); "
                           "scales ack timeouts, scoring targets and the "
                           "default seeded jitter; default normal")
+    run.add_argument("--verify-purge", default=None,
+                     choices=PURGE_VERIFICATION_MODES,
+                     help="verify the fix in every region before the "
+                          "incident is declared mitigated: off (default), "
+                          "or per-region (3m per region, so a four-region "
+                          "purge costs 12m); needs a scenario with "
+                          "regions")
     run.add_argument("--seed", type=int, default=None, metavar="N",
                      help="seed the RNG that jitters ack delays by up to "
                           "1 minute, so the same seed replays the same run "
@@ -534,6 +568,12 @@ def main(argv=None) -> int:
                             f"{', '.join(list_difficulties())} (or 1, 2, 3); "
                             "scales ack timeouts, scoring targets and the "
                             "default seeded jitter; default normal")
+    shift.add_argument("--verify-purge", default=None,
+                       choices=PURGE_VERIFICATION_MODES,
+                       help="verify each incident's fix in every region "
+                            "before it is declared mitigated: off "
+                            "(default), or per-region (3m per region); "
+                            "needs scenarios with regions")
     shift.add_argument("--seed", type=int, default=None, metavar="N",
                        help="seed the RNG that jitters ack delays: "
                             "incident i in the shift uses seed N+i, so the "
@@ -589,6 +629,13 @@ def main(argv=None) -> int:
                             f"{', '.join(list_difficulties())} (or 1, 2, 3); "
                             "scales ack timeouts and scoring targets; "
                             "default normal")
+    drill.add_argument("--verify-purge", default=None,
+                       choices=PURGE_VERIFICATION_MODES,
+                       help="verify the fix in every region before the "
+                            "incident is declared mitigated: off (default), "
+                            "or per-region (3m per region, so a four-region "
+                            "purge costs 12m); needs a scenario with "
+                            "regions")
     drill.add_argument("--hints", type=int, default=0, metavar="N",
                        help="ask for N hints up front, drawn in order "
                             "from the scenario's known-good next actions; "
@@ -718,9 +765,9 @@ def main(argv=None) -> int:
     whatif = sub.add_parser(
         "what-if",
         help="replay a saved --json run with overridden parameters "
-             "(ack timeouts, difficulty, policy) and show how the score "
-             "and grade would have changed; the original run file is "
-             "not modified")
+             "(ack timeouts, difficulty, policy, purge verification) "
+             "and show how the score and grade would have changed; "
+             "the original run file is not modified")
     whatif.add_argument("path", metavar="PATH",
                         help="path to a JSON file saved from run --json")
     whatif.add_argument("--ack-timeout", type=int, default=None,
@@ -737,6 +784,13 @@ def main(argv=None) -> int:
                              "(or 1, 2, 3); scales ack timeouts relative "
                              "to the original run's difficulty and scores "
                              "against the new difficulty's targets")
+    whatif.add_argument("--verify-purge", default=None,
+                        choices=PURGE_VERIFICATION_MODES,
+                        help="replay the run with the fix verified in "
+                             "every region before it is declared mitigated "
+                             "(per-region, 3m per region), or without that "
+                             "verification (off); needs a scenario with "
+                             "regions")
     whatif.add_argument("--policy", default=None,
                         help="replay the run under a different named "
                              "escalation policy "
@@ -1120,9 +1174,11 @@ def main(argv=None) -> int:
                       file=sys.stderr)
                 return 2
         if (args.ack_timeout is None and args.ack_timeouts is None
-                and args.difficulty is None and policy is None):
+                and args.difficulty is None and policy is None
+                and args.verify_purge is None):
             print("what-if needs an override: --ack-timeout, "
-                  "--ack-timeouts, --difficulty or --policy",
+                  "--ack-timeouts, --difficulty, --policy or "
+                  "--verify-purge",
                   file=sys.stderr)
             return 2
         difficulty = None
@@ -1135,7 +1191,8 @@ def main(argv=None) -> int:
         try:
             outcome = what_if(result, ack_timeout=args.ack_timeout,
                               ack_timeouts=args.ack_timeouts,
-                              difficulty=difficulty, policy=policy)
+                              difficulty=difficulty, policy=policy,
+                              purge_verification=args.verify_purge)
         except ValueError as exc:
             print(f"invalid what-if: {exc}", file=sys.stderr)
             return 2
@@ -1169,7 +1226,9 @@ def main(argv=None) -> int:
                                    slo_percent=args.slo,
                                    difficulty=difficulty,
                                    seed=args.seed, jitter=jitter,
-                                   rota_week=rota_week)
+                                   rota_week=rota_week,
+                                   purge_verification=(
+                                       args.verify_purge or "off"))
         except ValueError as exc:
             print(f"invalid shift: {exc}", file=sys.stderr)
             return 2
@@ -1209,7 +1268,9 @@ def main(argv=None) -> int:
                 return 2
             batch = simulate_batch(scenario, policy, seeds, jitter=jitter,
                                    difficulty=difficulty,
-                                   rota_week=rota_week)
+                                   rota_week=rota_week,
+                                   purge_verification=(
+                                       args.verify_purge or "off"))
             if args.json:
                 print(json.dumps(batch.to_dict(), indent=2))
             else:
@@ -1217,7 +1278,8 @@ def main(argv=None) -> int:
             return 0
         result = simulate(scenario, policy, seed=args.seed, jitter=jitter,
                           difficulty=difficulty, hints=args.hints,
-                          rota_week=rota_week)
+                          rota_week=rota_week,
+                          purge_verification=args.verify_purge or "off")
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:
@@ -1250,7 +1312,9 @@ def main(argv=None) -> int:
             result = run_drill(scenario, policy, difficulty=difficulty,
                                hints=args.hints,
                                input_stream=input_stream,
-                               rota_week=rota_week)
+                               rota_week=rota_week,
+                               purge_verification=(
+                                   args.verify_purge or "off"))
         except ValueError as exc:
             print(f"invalid drill: {exc}", file=sys.stderr)
             return 2

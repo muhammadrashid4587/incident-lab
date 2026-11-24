@@ -157,6 +157,10 @@ def _content_lines(result, what_if) -> list:
     add(f"Resolved: {'yes' if score.resolved else 'no'}")
     if score.difficulty is not None:
         add(f"Difficulty: {score.difficulty.name}")
+    if score.verify_delay_min:
+        add(f"Purge verification: per-region "
+            f"({len(score.regions)} regions, "
+            f"+{score.verify_delay_min}m)")
     if score.error_budget_burn_pct is not None:
         add(f"Error budget: burned {score.error_budget_burn_pct:.1f}% "
             f"of the monthly budget (SLO {score.slo_percent}%, "
@@ -345,6 +349,8 @@ def _shift_content_lines(shift) -> list:
             + ", ".join(debrief.skipped) + " never ran")
     if debrief.difficulty is not None:
         add(f"Difficulty: {debrief.difficulty.name}")
+    if shift.purge_verification != "off":
+        add(f"Purge verification: {shift.purge_verification}")
     if shift.seed is not None:
         add(f"Seed: {shift.seed}")
 

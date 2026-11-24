@@ -27,7 +27,9 @@ import statistics
 from dataclasses import dataclass
 
 from .difficulty import NORMAL
-from .simulator import error_budget_minutes, simulate
+from .simulator import (
+    PURGE_VERIFICATION_OFF, error_budget_minutes, simulate,
+)
 
 
 def _validate_slo(slo_percent) -> float:
@@ -88,6 +90,9 @@ class ShiftResult:
     # The rota week every incident was played for, or None when no
     # rota file was used.
     rota_week: object = None
+    # The purge-verification mode every incident in the shift was
+    # played with ("off" or "per-region").
+    purge_verification: str = PURGE_VERIFICATION_OFF
 
     @property
     def scheduled(self) -> list:
@@ -117,6 +122,7 @@ class ShiftResult:
                 "jitter": (list(self.jitter)
                            if self.jitter is not None else None),
                 "rota_week": self.rota_week,
+                "purge_verification": self.purge_verification,
             },
             "policy": {
                 "name": self.policy.name,
@@ -144,6 +150,9 @@ class ShiftResult:
         ]
         if self.difficulty is not None:
             lines.append(f"difficulty: {self.difficulty.name}")
+        if self.purge_verification != PURGE_VERIFICATION_OFF:
+            lines.append(
+                f"purge verification: {self.purge_verification}")
         if self.rota_week is not None:
             lines.append(f"rota week: {self.rota_week}")
         if self.seed is not None:
@@ -178,7 +187,8 @@ class ShiftResult:
 
 
 def simulate_shift(scenarios, policy, slo_percent=None, difficulty=None,
-                   seed=None, jitter=None, rota_week=None) -> ShiftResult:
+                   seed=None, jitter=None, rota_week=None,
+                   purge_verification=PURGE_VERIFICATION_OFF) -> ShiftResult:
     """Run several scenarios back-to-back against one shared budget.
 
     ``scenarios`` is the list of scenarios in shift order; ``policy``
@@ -188,9 +198,14 @@ def simulate_shift(scenarios, policy, slo_percent=None, difficulty=None,
     carries an SLO (a shared budget needs an SLO to measure against).
     ``difficulty`` defaults to normal. With ``seed`` given, incident
     ``i`` uses seed ``seed + i``, so the shift replays exactly while
-    the incidents still vary. Raises ValueError on an empty scenario
-    list, on a missing or out-of-range SLO, or on a bad seed/jitter
-    (``simulate`` validates the jitter itself).
+    the incidents still vary. ``purge_verification`` ("off" or
+    "per-region") is the mode every incident runs under: with
+    "per-region" each incident verifies its fix in every region
+    before it is declared mitigated. Raises ValueError on an empty
+    scenario list, on a missing or out-of-range SLO, or on a bad
+    seed/jitter (``simulate`` validates the jitter itself), and on
+    "per-region" when any scheduled scenario has no regions to
+    verify.
     """
     scenarios = list(scenarios)
     if not scenarios:
@@ -220,7 +235,8 @@ def simulate_shift(scenarios, policy, slo_percent=None, difficulty=None,
         incident_seed = seed + index if seed is not None else None
         result = simulate(scenario, policy, seed=incident_seed,
                           jitter=jitter, difficulty=difficulty,
-                          rota_week=rota_week)
+                          rota_week=rota_week,
+                          purge_verification=purge_verification)
         runs.append(result)
         downtime = result.score.downtime_min
         burn = (round(downtime / budget_minutes * 100, 1)
@@ -257,4 +273,5 @@ def simulate_shift(scenarios, policy, slo_percent=None, difficulty=None,
         seed=seed,
         jitter=(tuple(jitter) if jitter is not None else None),
         rota_week=rota_week,
+        purge_verification=purge_verification,
     )

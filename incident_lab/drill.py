@@ -45,8 +45,10 @@ from .incident import Incident
 from .policy import EscalationPolicy
 from .scenarios import Scenario
 from .simulator import (
-    HINT_COST_POINTS, EscalationStep, Hint, Score, SimulationResult,
+    HINT_COST_POINTS, PURGE_VERIFICATION_OFF,
+    VERIFY_MIN_PER_REGION, EscalationStep, Hint, Score, SimulationResult,
     compute_points, error_budget_burn_pct, impact_at, late_ack_credit,
+    parse_purge_verification,
 )
 from .timeline import Timeline
 
@@ -149,7 +151,9 @@ def _partial_result(incident, policy, timeline, *, escalations,
                     acked_at, acked_by, ack_late_min, ack_credit,
                     mitigated_at, mitigate_delay_min, difficulty,
                     used_hints, hint_cost, escalation_chain=None,
-                    slo_percent=None, rota_week=None) -> SimulationResult:
+                    slo_percent=None, rota_week=None,
+                    verify_delay_min=0, regions=(),
+                    purge_verification=PURGE_VERIFICATION_OFF) -> SimulationResult:
     """Build the result for a drill that stopped early.
 
     The timeline holds the events so far (plus the ``abandoned``
@@ -184,12 +188,15 @@ def _partial_result(incident, policy, timeline, *, escalations,
             downtime_min=mitigated_at,
             error_budget_burn_pct=error_budget_burn_pct(
                 slo_percent, mitigated_at),
+            verify_delay_min=verify_delay_min,
         ),
         difficulty=difficulty,
         hints=used_hints,
         escalation_chain=(list(escalation_chain)
                           if escalation_chain is not None else []),
         rota_week=rota_week,
+        regions=tuple(regions),
+        purge_verification=purge_verification,
     )
 
 
@@ -201,6 +208,7 @@ def run_drill(
     input_stream=None,
     prompt_stream=None,
     rota_week: object = None,
+    purge_verification: str = PURGE_VERIFICATION_OFF,
 ) -> SimulationResult:
     """Run one scenario as an interactive drill and return the result.
 
@@ -223,11 +231,25 @@ def run_drill(
     when no rota file was used. The operator can also type ``hint`` at any prompt to
     ask for the next hint mid-drill, at the same cost, continuing
     after the up-front ones; hints asked for that way are recorded
-    in the result exactly like up-front hints. Raises ValueError if
-    ``hints`` is negative or more than the scenario has.
+    in the result exactly like up-front hints. ``purge_verification``
+    ("off" or "per-region") decides whether the fix is verified in
+    every region before the incident is declared mitigated, exactly
+    as in ``run``: with "per-region" the operator's mitigate decision
+    is followed by one verification check per region, at
+    ``VERIFY_MIN_PER_REGION`` each, before the mitigated event.
+    Raises ValueError if ``hints`` is negative or more than the
+    scenario has, or on an unknown purge-verification mode, or on
+    "per-region" for a scenario with no regions to verify.
     """
     if difficulty is None:
         difficulty = NORMAL
+    purge_verification = parse_purge_verification(purge_verification)
+    if (purge_verification != PURGE_VERIFICATION_OFF
+            and not scenario.regions):
+        raise ValueError(
+            f"scenario {scenario.name!r} has no regions to verify: "
+            "per-region purge verification needs a scenario with "
+            "regions")
     if isinstance(hints, bool) or not isinstance(hints, int) or hints < 0:
         raise ValueError("hints must be a non-negative integer")
     if hints > len(scenario.hints):
@@ -297,7 +319,11 @@ def run_drill(
             f"{level.ack_timeout_min}m" for level in policy.levels)
         + ")\n"
         f"difficulty: {difficulty.name}\n"
-        f"{incident.description}\n\n")
+        + (f"purge verification: per-region "
+           f"({len(scenario.regions)} regions, "
+           f"+{VERIFY_MIN_PER_REGION * len(scenario.regions)}m)\n"
+           if purge_verification != PURGE_VERIFICATION_OFF else "")
+        + f"{incident.description}\n\n")
 
     t = 0
     escalations = 0
@@ -342,7 +368,9 @@ def run_drill(
                 used_hints=used_hints, hint_cost=_hint_cost(),
                 escalation_chain=chain,
                 slo_percent=scenario.slo_percent,
-                rota_week=rota_week)
+                rota_week=rota_week,
+                regions=scenario.regions,
+                purge_verification=purge_verification)
         if command == "wait":
             # Missed ack: wait out the timeout, then escalate (or give
             # up, exactly as `run` does when nobody acks).
@@ -385,7 +413,9 @@ def run_drill(
                 used_hints=used_hints, hint_cost=_hint_cost(),
                 escalation_chain=chain,
                 slo_percent=scenario.slo_percent,
-                rota_week=rota_week)
+                rota_week=rota_week,
+                regions=scenario.regions,
+                purge_verification=purge_verification)
         # The operator acks, on time or late: the same late-ack credit
         # `run` gives for an ack past its level's timeout.
         delay = arg
@@ -431,8 +461,22 @@ def run_drill(
             mitigated_at=None, mitigate_delay_min=None,
             difficulty=difficulty, used_hints=used_hints,
             hint_cost=_hint_cost(), escalation_chain=chain,
-            slo_percent=scenario.slo_percent)
-    mitigate_delay = arg
+            slo_percent=scenario.slo_percent,
+            regions=scenario.regions,
+            purge_verification=purge_verification)
+    # Per-region verification happens inside the mitigation window,
+    # before the incident is declared mitigated — the same fixed
+    # check per region `run` applies, so a drill that makes the same
+    # decisions as a `run` scores the same.
+    if purge_verification != PURGE_VERIFICATION_OFF:
+        verify_delay = VERIFY_MIN_PER_REGION * len(scenario.regions)
+        for index, region in enumerate(scenario.regions):
+            timeline.record(
+                acked_at + VERIFY_MIN_PER_REGION * (index + 1),
+                "verified", region, "fix confirmed in " + region)
+    else:
+        verify_delay = 0
+    mitigate_delay = arg + verify_delay
     mitigated_at = acked_at + mitigate_delay
     timeline.record(mitigated_at, "mitigated", acked_by)
 
@@ -455,7 +499,10 @@ def run_drill(
             mitigate_delay_min=mitigate_delay, difficulty=difficulty,
             used_hints=used_hints, hint_cost=_hint_cost(),
             escalation_chain=chain, slo_percent=scenario.slo_percent,
-            rota_week=rota_week)
+            rota_week=rota_week,
+            verify_delay_min=verify_delay,
+            regions=scenario.regions,
+            purge_verification=purge_verification)
     resolve_delay = arg
     resolved_at = mitigated_at + resolve_delay
     timeline.record(resolved_at, "resolved", acked_by)
@@ -483,9 +530,12 @@ def run_drill(
             downtime_min=mitigated_at,
             error_budget_burn_pct=error_budget_burn_pct(
                 scenario.slo_percent, mitigated_at),
+            verify_delay_min=verify_delay,
         ),
         difficulty=difficulty,
         hints=used_hints,
         escalation_chain=chain,
         rota_week=rota_week,
+        regions=tuple(scenario.regions),
+        purge_verification=purge_verification,
     )

@@ -47,6 +47,36 @@ ESCALATION_PENALTY = 15
 # A late ack earns partial credit that decays linearly to zero when the
 # ack delay reaches this many times the level's ack timeout.
 LATE_ACK_CREDIT_WINDOW = 2
+# Minutes to verify a remediation in one region: fetch the asset (or
+# run the check) from a cold edge node there and confirm the fix
+# actually landed, instead of trusting the dashboard. Verifying every
+# region costs this per region, so a four-region purge costs 12m —
+# the price of knowing no region is still serving the old state.
+VERIFY_MIN_PER_REGION = 3
+# Purge-verification modes: "off" declares the incident mitigated as
+# soon as the responder acts; "per-region" verifies the fix in every
+# region of the scenario first (see Scenario.regions), adding
+# VERIFY_MIN_PER_REGION per region to the mitigate delay.
+PURGE_VERIFICATION_OFF = "off"
+PURGE_VERIFICATION_PER_REGION = "per-region"
+PURGE_VERIFICATION_MODES = (
+    PURGE_VERIFICATION_OFF, PURGE_VERIFICATION_PER_REGION,
+)
+
+
+def parse_purge_verification(value) -> str:
+    """Validate a purge-verification mode: "off" or "per-region".
+
+    Raises ValueError on anything else, so a bad --verify-purge value
+    fails the run the same way a bad --difficulty does.
+    """
+    if value not in PURGE_VERIFICATION_MODES:
+        raise ValueError(
+            "purge verification must be one of "
+            f"{', '.join(PURGE_VERIFICATION_MODES)}, got {value!r}")
+    return value
+
+
 # Points one hint costs. Hints are the scenario's known-good next actions,
 # asked for with `run --hints N`; they are guidance, not a free answer,
 # so each one comes off the final score.
@@ -244,6 +274,12 @@ class Score:
     # percent (over 100 means the incident alone spent the whole
     # month's budget); None when there is no SLO or no downtime.
     error_budget_burn_pct: object = None
+    # Minutes spent verifying the fix in every region before the
+    # incident was declared mitigated (0 when purge verification was
+    # off, or the scenario has no regions); part of
+    # mitigate_delay_min, recorded separately so a what-if replay
+    # can tell the verification time apart from the mitigation work.
+    verify_delay_min: int = 0
 
     def to_dict(self) -> dict:
         """JSON-ready dict; unreached milestones serialize as null."""
@@ -263,6 +299,7 @@ class Score:
             "slo_percent": self.slo_percent,
             "downtime_min": self.downtime_min,
             "error_budget_burn_pct": self.error_budget_burn_pct,
+            "verify_delay_min": self.verify_delay_min,
         }
 
 
@@ -294,6 +331,14 @@ class SimulationResult:
     # file was used. Recorded in --json output so a rota run can be
     # traced back to the week whose on-call rotation it used.
     rota_week: object = None
+    # The regions the scenario's remediation must reach (the
+    # scenario's `regions`, empty for scenarios with none), and the
+    # purge-verification mode the run was played with ("off" or
+    # "per-region"). Recorded in --json output so a what-if replay
+    # can rebuild the scenario's regions and the verification the
+    # base run used.
+    regions: tuple = ()
+    purge_verification: str = PURGE_VERIFICATION_OFF
 
     def to_dict(self) -> dict:
         """JSON-ready dict of the whole result: incident, policy, timeline, score."""
@@ -304,6 +349,8 @@ class SimulationResult:
             "difficulty": (self.difficulty.name
                            if self.difficulty is not None else None),
             "rota_week": self.rota_week,
+            "regions": list(self.regions),
+            "purge_verification": self.purge_verification,
             "hints": [hint.to_dict() for hint in self.hints],
             "escalation_chain": [
                 step.to_dict() for step in self.escalation_chain
@@ -354,6 +401,9 @@ class BatchResult:
     # The rota week every run in the batch was played for, or None
     # when no rota file was used.
     rota_week: object = None
+    # The purge-verification mode every run in the batch was played
+    # with ("off" or "per-region").
+    purge_verification: str = PURGE_VERIFICATION_OFF
 
     @property
     def seeds(self) -> list:
@@ -389,6 +439,7 @@ class BatchResult:
             "difficulty": (self.difficulty.name
                            if self.difficulty is not None else None),
             "rota_week": self.rota_week,
+            "purge_verification": self.purge_verification,
             "incident": first["incident"],
             "policy": first["policy"],
             "runs": [run.to_dict() for run in self.runs],
@@ -403,6 +454,7 @@ def simulate_batch(
     jitter: object = None,
     difficulty: object = None,
     rota_week: object = None,
+    purge_verification: str = PURGE_VERIFICATION_OFF,
 ) -> BatchResult:
     """Run one scenario against one policy once per seed.
 
@@ -414,13 +466,15 @@ def simulate_batch(
     if not seeds:
         raise ValueError("batch needs at least one seed")
     runs = [simulate(scenario, policy, seed=seed, jitter=jitter,
-                     difficulty=difficulty, rota_week=rota_week)
+                     difficulty=difficulty, rota_week=rota_week,
+                     purge_verification=purge_verification)
             for seed in seeds]
     first = runs[0]
     return BatchResult(first.incident, first.policy, runs,
                        jitter=first.jitter,
                        difficulty=first.difficulty,
-                       rota_week=rota_week)
+                       rota_week=rota_week,
+                       purge_verification=purge_verification)
 
 
 def simulate(
@@ -432,6 +486,7 @@ def simulate(
     difficulty: object = None,
     hints: int = 0,
     rota_week: object = None,
+    purge_verification: str = PURGE_VERIFICATION_OFF,
 ) -> SimulationResult:
     """Run one scenario against one policy and return the full result.
 
@@ -462,9 +517,29 @@ def simulate(
     scaling, floored at 0), and is recorded on the result and in its
     ``--json`` output. Raises ValueError if ``hints`` is negative or
     more than the scenario has.
+
+    ``purge_verification`` (``"off"`` or ``"per-region"``) decides
+    whether the fix is verified in every region before the incident
+    is declared mitigated: with ``"per-region"`` the responder
+    confirms the remediation from a cold edge node in each of the
+    scenario's regions, at ``VERIFY_MIN_PER_REGION`` per region, so
+    the mitigate delay grows by that much and the timeline records
+    one ``verified`` event per region. The verification time is part
+    of the recorded mitigate delay and is also recorded on its own
+    (``score.verify_delay_min``), so a what-if replay can tell it
+    apart from the mitigation work. Raises ValueError on an unknown
+    mode, or on ``"per-region"`` for a scenario with no regions to
+    verify.
     """
     if difficulty is None:
         difficulty = NORMAL
+    purge_verification = parse_purge_verification(purge_verification)
+    if (purge_verification == PURGE_VERIFICATION_PER_REGION
+            and not scenario.regions):
+        raise ValueError(
+            f"scenario {scenario.name!r} has no regions to verify: "
+            "per-region purge verification needs a scenario with "
+            "regions")
     if isinstance(hints, bool) or not isinstance(hints, int) or hints < 0:
         raise ValueError("hints must be a non-negative integer")
     if hints > len(scenario.hints):
@@ -575,6 +650,8 @@ def simulate(
                 seed=seed, jitter=jitter_range, difficulty=difficulty,
                 hints=used_hints, escalation_chain=chain,
                 rota_week=rota_week,
+                regions=tuple(scenario.regions),
+                purge_verification=purge_verification,
             )
         if t > max_duration_min:
             timeline.record(t, "unacked", "monitor", "max duration reached")
@@ -586,6 +663,8 @@ def simulate(
                 seed=seed, jitter=jitter_range, difficulty=difficulty,
                 hints=used_hints, escalation_chain=chain,
                 rota_week=rota_week,
+                regions=tuple(scenario.regions),
+                purge_verification=purge_verification,
             )
 
     if rng is not None:
@@ -599,6 +678,21 @@ def simulate(
     else:
         mitigate_delay = scenario.mitigate_delay_min
         resolve_delay = scenario.resolve_delay_min
+    # Per-region verification happens inside the mitigation window,
+    # before the incident is declared mitigated: one check per
+    # region, at VERIFY_MIN_PER_REGION each. The verification is a
+    # fixed procedure, not jittered — the seed varies the response,
+    # not the check — and it lengthens the mitigate delay, so the
+    # downtime and the error-budget burn grow with it.
+    if purge_verification == PURGE_VERIFICATION_PER_REGION:
+        verify_delay = VERIFY_MIN_PER_REGION * len(scenario.regions)
+        for index, region in enumerate(scenario.regions):
+            timeline.record(
+                acked_at + VERIFY_MIN_PER_REGION * (index + 1),
+                "verified", region, "fix confirmed in " + region)
+    else:
+        verify_delay = 0
+    mitigate_delay += verify_delay
     mitigated_at = acked_at + mitigate_delay
     resolved_at = mitigated_at + resolve_delay
     timeline.record(mitigated_at, "mitigated", acked_by)
@@ -627,8 +721,11 @@ def simulate(
         downtime_min=mitigated_at,
         error_budget_burn_pct=error_budget_burn_pct(
             scenario.slo_percent, mitigated_at),
+        verify_delay_min=verify_delay,
     )
     return SimulationResult(incident, policy, timeline, score, seed=seed,
                             jitter=jitter_range, difficulty=difficulty,
                             hints=used_hints, escalation_chain=chain,
-                            rota_week=rota_week)
+                            rota_week=rota_week,
+                            regions=tuple(scenario.regions),
+                            purge_verification=purge_verification)

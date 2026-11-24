@@ -891,6 +891,8 @@ class TestJsonOutput(unittest.TestCase):
             "slo_percent": 99.9,
             "downtime_min": 23,
             "error_budget_burn_pct": 53.2,
+            # No regions to verify, so no verification time.
+            "verify_delay_min": 0,
         })
 
     def test_result_to_dict_unacked_serializes_nulls(self):
@@ -3221,6 +3223,369 @@ class TestWhatIfInCompareAndStats(unittest.TestCase):
         self.assertEqual(data["what_if_runs"], 1)
         self.assertEqual(data["runs"][1]["what_if"]["points_delta"], 48)
         self.assertIsNone(data["runs"][0]["what_if"])
+class TestPurgeVerification(unittest.TestCase):
+    """Per-region purge verification: confirm the fix in every region
+    before the incident is declared mitigated.
+
+    A scenario may carry ``regions``; with ``--verify-purge
+    per-region`` the responder checks the fix from a cold edge node
+    in each one, at 3m per region, before mitigation completes. The
+    verification time is part of the mitigate delay (so the score,
+    the downtime and the error-budget burn all move with it) and is
+    recorded on its own (``score.verify_delay_min``), so a what-if
+    replay can turn verification on or off without stacking it.
+    ``cdn-purge-failure`` is the scenario it was built for: four
+    regions, a purge the dashboard claims worked, and a responder
+    who has to check for real.
+    """
+
+    def _write_json(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(data, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_regions_on_purge_scenarios(self):
+        self.assertEqual(
+            get("cdn-purge-failure").regions,
+            ("us-east", "us-west", "eu-west", "ap-southeast"))
+        self.assertEqual(
+            get("fraud-rules-misfire").regions,
+            ("us-east", "us-west", "eu-west"))
+        self.assertEqual(
+            get("key-rotation").regions,
+            ("us-east", "us-west", "eu-west"))
+        self.assertEqual(get("disk-full").regions, ())
+
+    def test_verified_run_costs_three_minutes_per_region(self):
+        result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(result.purge_verification, "per-region")
+        self.assertEqual(result.regions,
+                         ("us-east", "us-west", "eu-west", "ap-southeast"))
+        # Four regions at 3m each: 12m of verification inside the
+        # mitigate delay (30m of work + 12m of checks).
+        self.assertEqual(score.verify_delay_min, 12)
+        self.assertEqual(score.mitigate_delay_min, 42)
+        self.assertEqual(score.time_to_ack_min, 8)
+        self.assertEqual(score.time_to_mitigate_min, 50)
+        self.assertEqual(score.time_to_resolve_min, 65)
+        # 100 - 3 (8m to ack past the 5m grace) - 17 (50m to mitigate
+        # past the 15m grace, halved) = 80, scaled by the 0.4
+        # late-ack credit = 32 — two points less than the unverified
+        # 34, the price of knowing every region purged.
+        self.assertEqual(score.points, 32)
+        # Downtime 50m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 50)
+        self.assertEqual(score.error_budget_burn_pct, 115.7)
+
+    def test_verified_timeline_records_one_event_per_region(self):
+        result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(11, "us-east"), (14, "us-west"),
+             (17, "eu-west"), (20, "ap-southeast")])
+        self.assertTrue(all(event.detail.startswith("fix confirmed in ")
+                            for event in verified))
+        # Every verification lands before the mitigated event.
+        mitigated = next(event for event in result.timeline.events
+                         if event.kind == "mitigated")
+        self.assertTrue(all(event.t_min < mitigated.t_min
+                            for event in verified))
+
+    def test_unverified_run_records_no_verification(self):
+        result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY)
+        self.assertEqual(result.purge_verification, "off")
+        self.assertEqual(result.score.verify_delay_min, 0)
+        self.assertEqual(
+            [event for event in result.timeline.events
+             if event.kind == "verified"], [])
+        self.assertEqual(result.score.points, 34)
+
+    def test_per_region_needs_regions(self):
+        with self.assertRaises(ValueError):
+            simulate(get("disk-full"), DEFAULT_POLICY,
+                     purge_verification="per-region")
+        with self.assertRaises(ValueError):
+            simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                     purge_verification="sometimes")
+
+    def test_verification_is_not_jittered(self):
+        # The seed varies the response, not the check: the same seed
+        # replays exactly, and the verification time is 12m for
+        # every seed.
+        first = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                         seed=7, purge_verification="per-region")
+        second = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                          seed=7, purge_verification="per-region")
+        self.assertEqual(first.to_dict(), second.to_dict())
+        for seed in range(1, 6):
+            result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                              seed=seed, purge_verification="per-region")
+            self.assertEqual(result.score.verify_delay_min, 12)
+
+    def test_json_round_trip_keeps_verification(self):
+        result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        path = self._write_json(result.to_dict())
+        self.assertEqual(load_result(path).to_dict(), result.to_dict())
+
+    def test_old_run_without_verification_fields_loads(self):
+        result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        data = result.to_dict()
+        data.pop("regions")
+        data.pop("purge_verification")
+        data["score"].pop("verify_delay_min")
+        path = self._write_json(data)
+        loaded = load_result(path)
+        self.assertEqual(loaded.regions, ())
+        self.assertEqual(loaded.purge_verification, "off")
+        self.assertEqual(loaded.score.verify_delay_min, 0)
+
+    def test_what_if_turns_verification_on(self):
+        base = simulate(get("cdn-purge-failure"), DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(
+            outcome.overrides,
+            ["purge verification: off -> per-region"])
+        self.assertEqual(outcome.points_delta, -2)
+        self.assertEqual(outcome.replayed.score.points, 32)
+        self.assertEqual(outcome.replayed.score.verify_delay_min, 12)
+        self.assertEqual(outcome.replayed.score.time_to_mitigate_min, 50)
+        self.assertEqual(
+            [event.kind for event in outcome.replayed.timeline.events
+             if event.kind == "verified"],
+            ["verified"] * 4)
+
+    def test_what_if_turns_verification_off(self):
+        base = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                        purge_verification="per-region")
+        outcome = what_if(base, purge_verification="off")
+        self.assertEqual(
+            outcome.overrides,
+            ["purge verification: per-region -> off"])
+        self.assertEqual(outcome.points_delta, 2)
+        self.assertEqual(outcome.replayed.score.points, 34)
+        self.assertEqual(outcome.replayed.score.verify_delay_min, 0)
+        self.assertEqual(outcome.replayed.score.time_to_mitigate_min, 38)
+
+    def test_what_if_same_verification_reproduces_the_run(self):
+        base = simulate(get("cdn-purge-failure"), DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="off")
+        self.assertEqual(outcome.overrides, [])
+        self.assertEqual(outcome.points_delta, 0)
+        self.assertEqual(outcome.replayed.to_dict(), base.to_dict())
+
+    def test_what_if_verification_needs_regions(self):
+        base = simulate(get("disk-full"), DEFAULT_POLICY)
+        with self.assertRaises(ValueError):
+            what_if(base, purge_verification="per-region")
+        # A run saved before regions existed has none either.
+        verified = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                            purge_verification="per-region")
+        data = verified.to_dict()
+        data.pop("regions")
+        data.pop("purge_verification")
+        data["score"].pop("verify_delay_min")
+        with self.assertRaises(ValueError):
+            what_if(load_result(self._write_json(data)),
+                    purge_verification="per-region")
+
+    def test_cli_run_verifies_per_region(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "cdn-purge-failure",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn("purge verification: per-region (4 regions, +12m)",
+                      out)
+        self.assertIn("verify delay:     12m (4 regions)", out)
+        self.assertIn("32/100", out)
+
+    def test_cli_run_verification_needs_regions(self):
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(main([
+                "run", "disk-full", "--verify-purge", "per-region"]), 2)
+        self.assertIn("no regions to verify", err.getvalue())
+
+    def test_cli_run_bad_verification_value_fails(self):
+        with self.assertRaises(SystemExit):
+            main(["run", "cdn-purge-failure",
+                  "--verify-purge", "sometimes"])
+
+    def test_cli_what_if_verification(self):
+        base = simulate(get("cdn-purge-failure"), DEFAULT_POLICY)
+        path = self._write_json(base.to_dict())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "what-if", path, "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn("purge verification: off -> per-region", out)
+        self.assertIn("-2 points", out)
+        self.assertIn("verify delay:     0m -> 12m", out)
+
+    def test_cli_what_if_needs_an_override(self):
+        base = simulate(get("cdn-purge-failure"), DEFAULT_POLICY)
+        path = self._write_json(base.to_dict())
+        err = io.StringIO()
+        with redirect_stderr(err):
+            self.assertEqual(main(["what-if", path]), 2)
+        self.assertIn("--verify-purge", err.getvalue())
+
+    def test_debrief_names_verified_regions(self):
+        result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        debrief = generate_debrief(result)
+        self.assertIn("verified in every region", " ".join(debrief.went_well))
+        self.assertIn("us-east", " ".join(debrief.went_well))
+        self.assertIn("Purge verification: per-region (4 regions, +12m)",
+                      debrief.render())
+        self.assertEqual(debrief.to_dict()["summary"]["verify_delay_min"],
+                         12)
+
+    def test_debrief_flags_unverified_fix(self):
+        result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY)
+        debrief = generate_debrief(result)
+        self.assertIn("never verified per region",
+                      " ".join(debrief.went_badly))
+        actions = [item["action"] for item in debrief.action_items]
+        self.assertTrue(any("every region" in action for action in actions))
+        self.assertTrue(any(item["owner"] == "on-call lead"
+                            for item in debrief.action_items))
+
+    def test_compare_diffs_verification(self):
+        base = simulate(get("cdn-purge-failure"), DEFAULT_POLICY)
+        verified = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                            purge_verification="per-region")
+        comparison = compare_results(base, verified)
+        rows = {row["metric"]: row for row in comparison.score_rows}
+        self.assertEqual(rows["verify_delay_min"]["delta"], 12)
+        self.assertFalse(comparison.same_purge_verification)
+        self.assertIn("different purge verification",
+                      comparison.render())
+
+    def test_stats_counts_verified_runs(self):
+        base = simulate(get("cdn-purge-failure"), DEFAULT_POLICY)
+        verified = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                            purge_verification="per-region")
+        summary = aggregate_stats([base, verified])
+        self.assertEqual(summary.verified_runs, 1)
+        self.assertEqual(summary.mean_verify_delay_min, 12.0)
+        self.assertIn("purge verified per region: 1 run(s)",
+                      summary.render())
+        row = summary.to_dict()["runs"][1]
+        self.assertEqual(row["purge_verification"], "per-region")
+        self.assertEqual(row["verify_delay_min"], 12)
+
+    def test_drill_with_verification_matches_run(self):
+        drill = run_drill(
+            get("cdn-purge-failure"), DEFAULT_POLICY,
+            input_stream=io.StringIO("ack 8\nmitigate 30\nresolve 15\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 32)
+
+    def test_shift_with_verification(self):
+        shift = simulate_shift(
+            [get("cdn-purge-failure"), get("fraud-rules-misfire")],
+            DEFAULT_POLICY, slo_percent=99.5,
+            purge_verification="per-region")
+        self.assertEqual(shift.purge_verification, "per-region")
+        self.assertEqual(len(shift.runs), 2)
+        self.assertEqual(shift.skipped, [])
+        # cdn-purge-failure verified: 32 points, 50m downtime;
+        # fraud-rules-misfire verified: 1 escalation, primary misses
+        # at 5m, secondary acks 2m later (7m), mitigate 39m (30m of
+        # work + 9m of verification), so 100 - 15 - 2 - 15 = 68.
+        self.assertEqual([run.score.points for run in shift.runs],
+                         [32, 68])
+        self.assertEqual(shift.shift_points, 50.0)
+        self.assertIn("purge verification: per-region", shift.render())
+        path = self._write_json(shift.to_dict())
+        self.assertEqual(load_shift(path).to_dict(), shift.to_dict())
+
+    def test_shift_verification_needs_regions_for_every_incident(self):
+        with self.assertRaises(ValueError):
+            simulate_shift(
+                [get("cdn-purge-failure"), get("disk-full")],
+                DEFAULT_POLICY, slo_percent=99.5,
+                purge_verification="per-region")
+
+    def test_batch_with_verification(self):
+        batch = simulate_batch(get("cdn-purge-failure"), DEFAULT_POLICY,
+                               [1, 2], purge_verification="per-region")
+        self.assertEqual(batch.purge_verification, "per-region")
+        self.assertTrue(all(run.score.verify_delay_min == 12
+                            for run in batch.runs))
+        self.assertEqual(batch.to_dict()["purge_verification"],
+                         "per-region")
+
+    def test_template_round_trips_regions(self):
+        data = scenario_to_dict(get("cdn-purge-failure"))
+        self.assertEqual(data["regions"],
+                         ["us-east", "us-west", "eu-west", "ap-southeast"])
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"cdn-purge-failure": data}}, handle)
+        self.addCleanup(os.unlink, handle.name)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["cdn-purge-failure"],
+                         get("cdn-purge-failure"))
+
+    def test_scenario_file_rejects_bad_regions(self):
+        for regions in (["us-east", "us-east"], ["us-east", 7], [""]):
+            handle = tempfile.NamedTemporaryFile(
+                "w", suffix=".json", delete=False, encoding="utf-8")
+            with handle:
+                json.dump({"scenarios": {"bad": {
+                    "service": "svc", "title": "t", "severity": "low",
+                    "description": "", "ack_delay_min": [2],
+                    "mitigate_delay_min": 5, "resolve_delay_min": 5,
+                    "regions": regions}}}, handle)
+            self.addCleanup(os.unlink, handle.name)
+            with self.assertRaises(ValueError):
+                load_scenario_file(handle.name)
+
+    def test_bundle_manifest_carries_verification(self):
+        result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        path = self._write_json(result.to_dict())
+        out = path + "-bundle.zip"
+        self.addCleanup(lambda: os.path.exists(out) and os.unlink(out))
+        manifest = create_bundle(path, out)
+        self.assertEqual(manifest["purge_verification"], "per-region")
+        self.assertEqual(manifest["verify_delay_min"], 12)
+        self.assertEqual(validate_bundle(out), manifest)
+
+    def test_html_postmortem_shows_verification(self):
+        result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        text = render_postmortem_html(result)
+        self.assertIn("Purge verification", text)
+        self.assertIn("per-region (4 regions, +12m)", text)
+        self.assertIn("verified in every region", text)
+
+    def test_pdf_postmortem_shows_verification(self):
+        result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        data = render_postmortem_pdf(result)
+        self.assertIn(b"Purge verification: per-region", data)
+
+
 class TestDrill(unittest.TestCase):
     def _drill(self, scenario, policy=DEFAULT_POLICY, decisions="",
                **kwargs):
@@ -5381,7 +5746,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.42.0", text)
+        self.assertIn("Generated by incident-lab 0.43.0", text)
         self.assertIn("Page 1 of 1", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -5581,7 +5946,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.42.0")
+                         "incident-lab 0.43.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -6242,7 +6607,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.42.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.43.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

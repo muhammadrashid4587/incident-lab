@@ -82,6 +82,8 @@ python3 -m incident_lab run poison-pill
 python3 -m incident_lab run poison-pill --json
 python3 -m incident_lab run cdn-purge-failure
 python3 -m incident_lab run cdn-purge-failure --json
+python3 -m incident_lab run cdn-purge-failure --verify-purge per-region
+python3 -m incident_lab run cdn-purge-failure --verify-purge per-region --json
 python3 -m incident_lab run payments-outage --policy sev1 --json > /tmp/payments-outage.json
 python3 -m incident_lab replay /tmp/payments-outage.json
 python3 -m incident_lab debrief /tmp/payments-outage.json
@@ -94,6 +96,9 @@ python3 -m incident_lab what-if /tmp/disk-full.json --difficulty hard
 python3 -m incident_lab what-if /tmp/disk-full.json --ack-timeouts primary=2 --json
 python3 -m incident_lab what-if /tmp/disk-full.json --policy standard
 python3 -m incident_lab what-if /tmp/disk-full.json --policy fast --difficulty hard --json
+python3 -m incident_lab run cdn-purge-failure --json > /tmp/cdn-purge-failure.json
+python3 -m incident_lab what-if /tmp/cdn-purge-failure.json --verify-purge per-region
+python3 -m incident_lab what-if /tmp/cdn-purge-failure.json --verify-purge per-region --json
 python3 -m incident_lab what-if /tmp/disk-full.json --ack-timeout 5 --json > /tmp/disk-full-whatif.json
 python3 -m incident_lab compare /tmp/disk-full.json /tmp/disk-full-whatif.json
 python3 -m incident_lab stats /tmp/run-seed-1.json /tmp/disk-full-whatif.json
@@ -146,7 +151,13 @@ top-level `jitter` records the `--jitter` range as `[lo, hi]`, or `null`
 for an unseeded run. The top-level `difficulty` records the difficulty
 the run was played at (`easy`, `normal` or `hard`; see below), and the
 top-level `rota_week` records the rota week the run was played for,
-or `null` when no rota file was used (see On-call rota).
+or `null` when no rota file was used (see On-call rota). The top-level
+`regions` lists the regions the scenario's remediation must reach
+(empty when the scenario has none), `purge_verification` records the
+mode the run was played with (`off` or `per-region`, see Per-region
+purge verification), and the score carries `verify_delay_min` — the
+minutes the verification cost, part of `mitigate_delay_min`, or `0`
+when verification was off.
 
 A batch run (`--seeds`, below) prints a different JSON shape: `seeds`
 (the seed list), `jitter`, `difficulty`, the shared `incident` and
@@ -361,11 +372,12 @@ exit code 2 and an error message.
 ## What-if replay
 
 `what-if <path> --ack-timeout N | --ack-timeouts ... | --difficulty X |
---policy NAME` replays a saved `run --json` run with overridden
+--policy NAME | --verify-purge MODE` replays a saved `run --json` run with overridden
 parameters and shows how the score and grade would have changed —
 what if the primary had had 10 minutes to ack, or the same incident
 had been played on hard, or under the standard policy instead of
-fast? The original run file is never modified; the what-if result
+fast, or with the purge verified in every region before the incident
+was declared mitigated? The original run file is never modified; the what-if result
 lives only in the output.
 
 `--policy` swaps in a different named escalation policy (built-in, or
@@ -413,6 +425,42 @@ credit halves the score. Replayed with 5m timeouts it scores 96
 gives them time to answer. Replayed under the standard policy it
 scores 96 too: the same ack is on time against the standard 5m
 timeout.
+
+## Per-region purge verification
+
+Some remediations only count when they land everywhere: a CDN purge
+that reached one region leaves the others serving stale assets, a
+fraud-rules rollback that reached one region leaves the others
+declining payments, a key rollback that reached some workers leaves
+the rest unable to decrypt. Those scenarios carry `regions` — the
+regions the fix must reach (`cdn-purge-failure` has four: us-east,
+us-west, eu-west, ap-southeast; `fraud-rules-misfire` and
+`key-rotation` have three each) — and `run` / `drill` / `shift` take
+`--verify-purge per-region` to verify the fix in every region before
+the incident is declared mitigated: one check per region, 3m each,
+recorded in the timeline as a `verified` event per region. The
+verification time is part of the mitigate delay, so the score, the
+downtime and the error-budget burn all move with it, and it is also
+recorded on its own in `run --json` (`score.verify_delay_min`).
+
+`what-if` takes the same `--verify-purge` as an override, so a saved
+run can be replayed with verification on or off: `cdn-purge-failure`
+scores 34/100 unverified and 32/100 verified per region — the 12m of
+checks push mitigation from 38m to 50m and the burn from 88.0% to
+115.7% — and the replay shows exactly what the certainty cost.
+`debrief` flags the difference both ways: a verified run is credited
+with confirming every region, and an unverified run of a scenario
+with regions gets an action item to verify per region before the
+next mitigation is declared. `compare` diffs the verify delay and
+says when the two runs verified differently, `stats` counts the
+verified runs and their mean verify delay, and `postmortem` and
+`bundle` carry the verification in the summary and the manifest.
+`--verify-purge per-region` on a scenario with no regions fails with
+exit code 2, as does a what-if replay asking for verification of a
+run whose scenario has none; a seeded run's verification time is
+never jittered, so the same seed replays the same run exactly.
+Scenario files can set their own `regions` (a list of non-empty
+strings, no repeats); `template` prints them.
 
 ## Stats
 
@@ -481,8 +529,12 @@ walks (see Escalation chain):
 }}}
 ```
 
-See `examples/custom-scenario.json`. A missing file, bad JSON, or an
-invalid scenario fails the run with exit code 2 and an error message.
+See `examples/custom-scenario.json`. An entry can also carry an
+optional `regions` list — the regions the remediation must reach,
+so `--verify-purge per-region` can confirm the fix in each one
+before the incident is declared mitigated (see Per-region purge
+verification). A missing file, bad JSON, or an invalid scenario
+fails the run with exit code 2 and an error message.
 
 ## Scenarios
 
@@ -995,6 +1047,8 @@ human-readable form.
 
 ## Version
 
+0.43.0 — Per-region purge verification as a what-if dimension: scenarios can carry `regions` (`cdn-purge-failure` has four — us-east, us-west, eu-west, ap-southeast — and `fraud-rules-misfire` and `key-rotation` have three each), and `run` / `drill` / `shift` take `--verify-purge per-region` to confirm the fix from a cold edge node in each region before the incident is declared mitigated, at 3m per region, recorded as one `verified` timeline event per region and as `score.verify_delay_min` in `run --json`; `what-if --verify-purge per-region|off` replays a saved run with verification on or off, so `cdn-purge-failure` replays from 34/100 unverified to 32/100 verified (mitigation 38m → 50m, burn 88.0% → 115.7%), and `debrief`, `compare`, `stats`, `postmortem` and `bundle` all carry the verification — a verified run is credited with confirming every region, an unverified run of a regional scenario gets an action to verify per region, `compare` diffs the verify delay, `stats` counts verified runs, and the manifest records the mode and delay. Verification on a scenario with no regions fails with exit code 2, and a seeded run's verification time is never jittered.
+
 0.42.0 — New scenario `retry-storm`: a bad deploy to the push notification service drops the backoff between delivery retries, so every failed push is retried immediately and the retry loop floods the push provider, which rate-limits the account and stops all push notifications; the primary is in the deploy review, assumes the page is noise from the deploy's own alerts, and acks 1m late against the `fast` policy's 2m window — the first scenario exercising a late ack on the `fast` policy, with no miss and no escalation, so the late ack keeps only half the score (47/100, 129.6% of the monthly error budget burned) and the run's chain records the first impact stage, with the stages spelling out the retry flood spreading (retries flooding the provider to rate-limiting to notifications fully down).
 
 0.41.0 — New scenario `key-rotation`: a scheduled KMS key rotation retires the old data key before the new one has propagated to every payments worker, so stored card tokens can no longer be decrypted and saved-card checkouts fail; the on-call is mid-handover on another incident bridge and acks 2m late against the `sev1` policy's 3m window — the first scenario exercising a late ack on the `sev1` policy, with no miss and no escalation, so the late ack keeps only a third of the score (29/100, 185.2% of the monthly error budget burned) and the run's chain records the first impact stage, with the stages spelling out the token failure spreading (saved-card checkouts failing to checkout failing to payments blocked).
@@ -1206,3 +1260,4 @@ resolved instead of claiming nobody acked.
 - [x] SEV-1 late-ack scenario: `key-rotation` — a scheduled KMS key rotation retires the old data key before the new one has propagated to every payments worker, so stored card tokens can no longer be decrypted and saved-card checkouts fail; the on-call is mid-handover on another incident bridge and acks 2m late against the sev1 policy's 3m window, then rolls the rotation back; the first built-in scenario exercising a late ack on the `sev1` policy, with no miss and no escalation, so the late ack keeps only a third of the score and the incident scores 29/100 while burning 185.2% of the monthly error budget, and the impact stages spell out the token failure spreading (saved-card checkouts failing to checkout failing to payments blocked); with hints and an SLO like the rest of the library (0.41.0)
 - [x] Fast-policy late-ack scenario: `retry-storm` — a bad deploy to the push notification service drops the backoff between delivery retries, so every failed push is retried immediately and the retry loop floods the push provider, which rate-limits the account and stops all push notifications; the primary is in the deploy review, assumes the page is noise from the deploy's own alerts, and acks 1m late against the fast policy's 2m window, then kills the retry loop and drains the queue; the first built-in scenario exercising a late ack on the `fast` policy, with no miss and no escalation, so the late ack keeps only half the score and the incident scores 47/100 while burning 129.6% of the monthly error budget, and the impact stages spell out the retry flood spreading (retries flooding the provider to rate-limiting to notifications fully down); with hints and an SLO like the rest of the library (0.42.0)
 - [x] Primary-late-ack scenario: `cdn-purge-failure` — a bad deploy ships new asset references and the CDN purge silently fails, so users see mixed old and new content and support tickets spike; the purge dashboard says purged, so the primary does not believe the page at first and acks 3m late, then forces a full invalidation and ships versioned asset URLs; the first built-in scenario exercising a late ack by the primary, with no miss and no escalation, so the late ack keeps only 40% of the score and the incident scores 34/100 while burning 88.0% of the monthly error budget, and the impact stages spell out the stale-content spread (mixed old/new content to stale checkout assets to widespread stale content); with hints and an SLO like the rest of the library (0.39.0)
+- [x] Per-region purge verification as a what-if dimension: scenarios carry `regions` (`cdn-purge-failure` four, `fraud-rules-misfire` and `key-rotation` three each), and `run` / `drill` / `shift` take `--verify-purge per-region` to confirm the fix in every region before the incident is declared mitigated (3m per region, one `verified` timeline event each, recorded as `score.verify_delay_min`); `what-if --verify-purge per-region|off` replays a saved run with verification on or off — `cdn-purge-failure` goes from 34/100 unverified to 32/100 verified, mitigation 38m → 50m, burn 88.0% → 115.7% — and `debrief`, `compare`, `stats`, `postmortem` and `bundle` all carry the verification; verification on a scenario with no regions fails with exit code 2, and a seeded run's verification time is never jittered (0.43.0)

@@ -29,6 +29,7 @@ class RunStats:
     # One row per run: {"label", "scenario", "points", "grade",
     # "time_to_ack_min", "time_to_mitigate_min", "time_to_resolve_min",
     # "escalations", "resolved", "hints_used", "impact", "what_if",
+    # "purge_verification", "verify_delay_min",
     # "error_budget_burn_pct"}; a milestone a run never reached is
     # None in its row, "impact" is the impact the run ended at from
     # its escalation chain (None when the run recorded no chain or the
@@ -75,6 +76,11 @@ class RunStats:
     # How many runs saw their impact grow while the page went
     # unanswered (the chain's impact changed between levels).
     impact_growth_runs: int
+    # How many runs verified the fix in every region before the
+    # incident was declared mitigated, and the mean verification
+    # time over those runs (None when no run verified).
+    verified_runs: int = 0
+    mean_verify_delay_min: object = None
     # How many of the input files were shifts rather than single
     # runs: a shift contributes one row per incident it ran, so this
     # says how many of the rows came from shifts.
@@ -103,6 +109,8 @@ class RunStats:
             },
             "hints_total": self.hints_total,
             "impact_growth_runs": self.impact_growth_runs,
+            "verified_runs": self.verified_runs,
+            "mean_verify_delay_min": self.mean_verify_delay_min,
             "grades": dict(self.grade_counts),
             "what_if_runs": self.whatif_count,
             "shift_files": self.shift_count,
@@ -147,6 +155,11 @@ class RunStats:
             lines.append(
                 f"impact grew while paging: {self.impact_growth_runs} "
                 f"run(s)")
+        if self.verified_runs:
+            lines.append(
+                f"purge verified per region: {self.verified_runs} "
+                f"run(s), mean verify delay "
+                f"{self.mean_verify_delay_min:.1f}m")
         if self.whatif_count:
             lines.append(
                 f"what-if runs: {self.whatif_count} "
@@ -247,6 +260,10 @@ def aggregate_stats(results: list, labels: list = None,
             # (None when the run recorded no chain or the scenario has
             # no impact stages).
             "impact": _final_impact(result),
+            # Purge verification: the mode the run was played with
+            # and the minutes the verification cost (0 when off).
+            "purge_verification": result.purge_verification,
+            "verify_delay_min": score.verify_delay_min,
             "what_if": (whatif.to_dict()
                         if whatif is not None else None),
         })
@@ -298,5 +315,10 @@ def aggregate_stats(results: list, labels: list = None,
                          if whatif is not None),
         impact_growth_runs=sum(1 for result in results
                                if _impact_grew(result)),
+        verified_runs=sum(1 for row in rows
+                          if row["verify_delay_min"]),
+        mean_verify_delay_min=_mean(
+            [row["verify_delay_min"] for row in rows
+             if row["verify_delay_min"]]),
         shift_count=shift_count,
     )

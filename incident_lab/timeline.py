@@ -11,8 +11,9 @@ from dataclasses import dataclass, field
 @dataclass(frozen=True)
 class Event:
     t_min: int
-    kind: str  # declared, paged, acked, escalated, mitigated, resolved,
-               # unacked, abandoned (a drill ended early by the operator)
+    kind: str  # declared, paged, acked, escalated, verified,
+               # mitigated, resolved, unacked, abandoned (a drill
+               # ended early by the operator)
     actor: str
     detail: str = ""
 
