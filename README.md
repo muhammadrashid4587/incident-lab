@@ -94,6 +94,9 @@ python3 -m incident_lab shift disk-full latency-spike --slo 99.5
 python3 -m incident_lab shift disk-full latency-spike cert-expiry --json > /tmp/shift.json
 python3 -m incident_lab replay /tmp/shift.json
 python3 -m incident_lab debrief /tmp/shift.json
+python3 -m incident_lab postmortem /tmp/shift.json --out shift-postmortem.html
+python3 -m incident_lab postmortem /tmp/shift.json --format pdf --out shift-postmortem.pdf
+python3 -m incident_lab bundle /tmp/shift.json
 python3 -m incident_lab compare /tmp/shift.json /tmp/shift.json
 python3 -m incident_lab stats /tmp/shift.json
 python3 scripts/demo.py
@@ -168,7 +171,14 @@ total burn, incidents ran, whether each ran out of budget, and a
 per-incident points table for the scenarios both ran; a shift and a
 single run cannot be compared), and `stats` aggregates each incident
 in a shift as one run, saying how many of its files were shifts.
-`postmortem` and `bundle` work on single runs, not shifts.
+`postmortem` and `bundle` accept shift files too: `postmortem`
+renders the shift postmortem — the shift summary, one row per
+incident that ran and one per skipped incident, the shift-level
+findings and action items, then one section per incident that ran
+with that incident's own debrief findings — as HTML or PDF, and
+`bundle` packages the shift JSON with that HTML postmortem and a
+manifest carrying the shift's score, total burn and the incidents
+that ran and were skipped, validated the same way a run bundle is.
 
 ## Replay
 
@@ -218,7 +228,11 @@ were, and the impact in effect when they were paged), and the hints the
 run used, with what each one cost. A saved `what-if --json` file renders
 its replay with a provenance box naming the overrides, the points delta
 against the base run, and the base run's score, so a hypothetical replay
-never passes as a run that happened. With `--out PATH` the HTML is
+never passes as a run that happened. A saved `shift --json` file renders
+the shift postmortem instead: the shift summary, one row per incident
+that ran and one per skipped incident, the shift-level findings and
+action items, then one section per incident that ran with that
+incident's own debrief findings. With `--out PATH` the HTML is
 written to a file instead of printed; without it, it prints to stdout.
 Every string from the run is escaped, so scenario text can never break
 out of the page. A missing file, bad JSON, or a file that is not a saved
@@ -238,6 +252,8 @@ postmortem as a readable multi-page PDF — scenario, score, timeline,
 per-responder timings, hints with cost, findings and action items,
 plus the what-if provenance box for a saved `what-if --json` file —
 so it can be attached to a ticket or filed where HTML is not wanted.
+A saved `shift --json` file renders the shift postmortem as a PDF
+instead, with the same sections the HTML shift postmortem carries.
 The writer is hand-rolled and standard library only (Letter pages,
 Helvetica, no embedded fonts, no new dependency); text is wrapped
 to the page width and flows across pages, each page footered with
@@ -279,7 +295,17 @@ python3 -m incident_lab bundle latency-spike.json
 python3 -m incident_lab bundle --check latency-spike-bundle.zip
 unzip latency-spike-bundle.zip -d shared-run
 python3 -m incident_lab replay shared-run/run.json
+python3 -m incident_lab shift disk-full latency-spike --json > shift.json
+python3 -m incident_lab bundle shift.json
+python3 -m incident_lab bundle --check shift-bundle.zip
 ```
+
+A shift bundle carries the same three members — `run.json` (the
+shift JSON, verbatim), `postmortem.html` (the shift HTML postmortem)
+and `manifest.json` — with the manifest holding the shift's points
+and grade, total burn, and the incidents that ran and were skipped
+instead of one incident's score; validation re-loads `run.json` as
+a shift and checks the postmortem covers every incident in it.
 
 ## Compare
 
@@ -850,15 +876,18 @@ incident_lab/
   export_html.py self-contained HTML postmortem from a saved run:
                  score and grade, timeline, per-responder timings
                  from the escalation chain, hints used, findings and
-                 action items; what-if files render with provenance
+                 action items; what-if files render with provenance;
+                 shift files render the shift postmortem
   export_pdf.py  same postmortem as a multi-page PDF (stdlib-only,
                  hand-rolled writer: Letter pages, Helvetica, no
                  embedded fonts, text wrapped and flowed across
-                 pages); what-if files render with provenance
+                 pages); what-if files render with provenance; shift
+                 files render the shift postmortem
   bundle.py      shareable postmortem bundle: one zip holding the run
                  JSON, the HTML postmortem and a manifest with
                  provenance and SHA-256 hashes, validated on creation
-                 and on `--check`
+                 and on `--check`; shift files bundle the same way,
+                 with the shift's score and burn in the manifest
   compare.py     side-by-side diff of two saved runs: score deltas,
                  shared-event time shifts, events only one run has
   stats.py       aggregate saved runs: score spread, mean response
@@ -938,6 +967,17 @@ exit code 2 and an error message. With `--json` the batch prints
 human-readable form.
 
 ## Version
+
+0.33.0 — Postmortem and bundle support for shifts: `postmortem
+<saved-shift.json>` renders the shift postmortem — the shift
+summary, one row per incident that ran and one per skipped incident,
+the shift-level findings and action items, then one section per
+incident that ran with that incident's own debrief findings — as
+HTML or PDF, and `bundle <saved-shift.json>` packages the shift JSON
+with that HTML postmortem and a manifest carrying the shift's score,
+total burn and the incidents that ran and were skipped, validated the
+same way a run bundle is (the shift re-loads, the hashes match, and
+the postmortem covers every incident in the shift).
 
 0.32.0 — Multi-incident shift with a shared error budget: `shift
 <scenario>...` runs several incidents back-to-back against one shared

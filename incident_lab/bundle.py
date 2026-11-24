@@ -8,10 +8,14 @@ postmortem from ``export_html`` as ``postmortem.html``, and a
 ``manifest.json`` with the provenance — incident-lab version, incident
 and score, seed and difficulty, what-if overrides and points delta
 when the source is a what-if replay — plus a SHA-256 hash of every
-other member. The bundle is validated as it is created: the written
-zip is re-opened, every hash is re-checked, and ``run.json`` is loaded
-back through ``replay`` to prove it re-imports. A bundle that fails
-validation is deleted, never left behind.
+other member. A saved `shift --json` file bundles the same way: the
+shift JSON verbatim as ``run.json``, the shift HTML postmortem as
+``postmortem.html``, and a manifest with the shift's score, total
+burn and the incidents that ran and were skipped. The bundle is
+validated as it is created: the written zip is re-opened, every hash
+is re-checked, and ``run.json`` is loaded back through ``replay`` to
+prove it re-imports. A bundle that fails validation is deleted, never
+left behind.
 
 ``bundle --check <bundle.zip>`` validates a bundle someone shared:
 same checks, no re-creation. Either way the run inside a bundle is a
@@ -28,8 +32,10 @@ from datetime import datetime, timezone
 
 from . import __version__
 from .debrief import grade
-from .export_html import render_postmortem_html
-from .replay import _result_from_dict, load_saved
+from .export_html import render_postmortem_html, render_shift_postmortem_html
+from .replay import (
+    _result_from_dict, _shift_from_dict, load_saved, load_shift,
+)
 
 BUNDLE_FORMAT = "incident-lab-bundle"
 BUNDLE_FORMAT_VERSION = 1
@@ -49,8 +55,36 @@ def _file_entry(name: str, data: bytes) -> dict:
     return {"name": name, "sha256": _sha256(data), "bytes": len(data)}
 
 
-def _manifest(loaded, entries) -> dict:
-    """The bundle manifest: provenance plus one entry per member."""
+def _manifest(loaded, entries, shift=None) -> dict:
+    """The bundle manifest: provenance plus one entry per member.
+
+    ``loaded`` is a LoadedRun for a single run (or a what-if file);
+    ``shift`` is a ShiftResult for a shift bundle, in which case the
+    manifest carries the shift's score and burn instead of one
+    incident's score.
+    """
+    base = {
+        "format": BUNDLE_FORMAT,
+        "format_version": BUNDLE_FORMAT_VERSION,
+        "generator": f"incident-lab {__version__}",
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "files": entries,
+    }
+    if shift is not None:
+        base["shift"] = {
+            "shift_points": shift.shift_points,
+            "grade": grade(shift.shift_points),
+            "slo_percent": shift.slo_percent,
+            "total_burn_pct": shift.total_burn_pct,
+            "budget_exhausted": shift.budget_exhausted,
+            "incidents": [run.incident.id for run in shift.runs],
+            "skipped": list(shift.skipped),
+        }
+        base["seed"] = shift.seed
+        base["difficulty"] = (shift.difficulty.name
+                              if shift.difficulty is not None else None)
+        base["what_if"] = None
+        return base
     result = loaded.result
     what_if = None
     if loaded.what_if is not None:
@@ -59,57 +93,68 @@ def _manifest(loaded, entries) -> dict:
             "points_delta": loaded.what_if.points_delta,
             "base_points": loaded.what_if.base_points,
         }
-    return {
-        "format": BUNDLE_FORMAT,
-        "format_version": BUNDLE_FORMAT_VERSION,
-        "generator": f"incident-lab {__version__}",
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "incident": {
-            "id": result.incident.id,
-            "service": result.incident.service,
-            "title": result.incident.title,
-            "severity": result.incident.severity,
-        },
-        "score": {
-            "points": result.score.points,
-            "grade": grade(result.score.points),
-        },
-        "seed": result.seed,
-        "difficulty": (result.difficulty.name
-                       if result.difficulty is not None else None),
-        "what_if": what_if,
-        "files": entries,
+    base["incident"] = {
+        "id": result.incident.id,
+        "service": result.incident.service,
+        "title": result.incident.title,
+        "severity": result.incident.severity,
     }
+    base["score"] = {
+        "points": result.score.points,
+        "grade": grade(result.score.points),
+    }
+    base["seed"] = result.seed
+    base["difficulty"] = (result.difficulty.name
+                          if result.difficulty is not None else None)
+    base["what_if"] = what_if
+    return base
 
 
 def create_bundle(run_path: str, out_path: str) -> dict:
-    """Package a saved run as a bundle zip at ``out_path``.
+    """Package a saved run — or a saved shift — as a bundle zip at
+    ``out_path``.
 
     Returns the manifest. Raises FileNotFoundError if the run file is
     missing, json.JSONDecodeError on bad JSON, and ValueError on a
-    run file that is not a saved run (or a what-if file whose delta
-    does not match its runs), or on a bundle that fails its own
-    validation — in which case the output file is removed.
+    run file that is not a saved run or shift (or a what-if file
+    whose delta does not match its runs), or on a bundle that fails
+    its own validation — in which case the output file is removed.
     """
-    loaded = load_saved(run_path)
+    try:
+        loaded = load_saved(run_path)
+    except ValueError as exc:
+        # A shift file holds several runs, not one: load it as a
+        # shift instead, and bundle the shift.
+        if "shift file" not in str(exc):
+            raise
+        loaded = None
+        shift = load_shift(run_path)
+    else:
+        shift = None
     with open(run_path, "rb") as handle:
         source_bytes = handle.read()
-    if loaded.what_if is None:
+    if shift is not None:
         run_data = source_bytes
         base_data = None
+        html_text = render_shift_postmortem_html(shift)
+    elif loaded.what_if is None:
+        run_data = source_bytes
+        base_data = None
+        html_text = render_postmortem_html(loaded.result,
+                                           what_if=loaded.what_if)
     else:
         run_data = (json.dumps(loaded.result.to_dict(), indent=2)
                     + "\n").encode("utf-8")
         base_data = (json.dumps(loaded.what_if.base_result.to_dict(),
                                 indent=2) + "\n").encode("utf-8")
-    html_text = render_postmortem_html(loaded.result,
-                                       what_if=loaded.what_if)
+        html_text = render_postmortem_html(loaded.result,
+                                           what_if=loaded.what_if)
     members = [(RUN_NAME, run_data)]
     if base_data is not None:
         members.append((BASE_RUN_NAME, base_data))
     members.append((POSTMORTEM_NAME, html_text.encode("utf-8")))
     entries = [_file_entry(name, data) for name, data in members]
-    manifest = _manifest(loaded, entries)
+    manifest = _manifest(loaded, entries, shift=shift)
     manifest_bytes = (json.dumps(manifest, indent=2) + "\n").encode("utf-8")
     try:
         with zipfile.ZipFile(out_path, "w",
@@ -196,6 +241,32 @@ def validate_bundle(zip_path: str) -> dict:
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise ValueError(f"bundle: {RUN_NAME} is not valid JSON: "
                              f"{exc}")
+        shift_info = manifest.get("shift")
+        if shift_info is not None:
+            try:
+                shift = _shift_from_dict(run_data)
+            except ValueError as exc:
+                raise ValueError(f"bundle: {RUN_NAME} is not a saved "
+                                 f"shift: {exc}")
+            if POSTMORTEM_NAME not in names:
+                raise ValueError(f"bundle: missing {POSTMORTEM_NAME}")
+            html_bytes = bundle.read(POSTMORTEM_NAME)
+            if b"<!DOCTYPE html>" not in html_bytes:
+                raise ValueError(f"bundle: {POSTMORTEM_NAME} is not an "
+                                 f"HTML postmortem")
+            if b"Shift postmortem" not in html_bytes:
+                raise ValueError(f"bundle: {POSTMORTEM_NAME} is not a "
+                                 f"shift postmortem")
+            for run in shift.runs:
+                if html.escape(run.incident.id).encode("utf-8") \
+                        not in html_bytes:
+                    raise ValueError(
+                        f"bundle: {POSTMORTEM_NAME} does not cover "
+                        f"the bundled shift's {run.incident.id!r}")
+            if shift_info.get("shift_points") != shift.shift_points:
+                raise ValueError("bundle: shift points do not match "
+                                 "the bundled shift")
+            return manifest
         try:
             result = _result_from_dict(run_data)
         except ValueError as exc:
@@ -239,16 +310,32 @@ def validate_bundle(zip_path: str) -> dict:
 
 def summarize_bundle(manifest: dict) -> str:
     """One short human-readable summary of a validated bundle."""
-    incident = manifest["incident"]
-    score = manifest["score"]
     names = ", ".join(entry["name"] for entry in manifest["files"])
     lines = [
         f"bundle: {manifest['format']} v{manifest['format_version']} "
         f"({manifest['generator']})",
-        f"incident: {incident['title']} [{incident['id']}]",
-        f"score: {score['points']}/100 (grade {score['grade']})",
-        f"files: {names}",
     ]
+    shift_info = manifest.get("shift")
+    if shift_info is not None:
+        lines.append(
+            f"shift: {len(shift_info['incidents'])} incident(s) ran"
+            + (f", {len(shift_info['skipped'])} skipped"
+               if shift_info["skipped"] else "")
+            + f" ({', '.join(shift_info['incidents'])})")
+        lines.append(
+            f"score: {shift_info['shift_points']}/100 "
+            f"(grade {shift_info['grade']}), burned "
+            f"{shift_info['total_burn_pct']:.1f}% of the monthly "
+            f"error budget")
+        lines.append(f"files: {names}")
+        return "\n".join(lines)
+    incident = manifest["incident"]
+    score = manifest["score"]
+    lines.append(
+        f"incident: {incident['title']} [{incident['id']}]")
+    lines.append(
+        f"score: {score['points']}/100 (grade {score['grade']})")
+    lines.append(f"files: {names}")
     what_if = manifest.get("what_if")
     if what_if is not None:
         lines.append(

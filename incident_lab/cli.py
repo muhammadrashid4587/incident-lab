@@ -17,8 +17,8 @@ from .difficulty import (
     apply_difficulty, list_difficulties, parse_difficulty,
 )
 from .drill import run_drill
-from .export_html import render_postmortem_html
-from .export_pdf import render_postmortem_pdf
+from .export_html import render_postmortem_html, render_shift_postmortem_html
+from .export_pdf import render_postmortem_pdf, render_shift_postmortem_pdf
 from .history import (
     DEFAULT_HISTORY_PATH, entry_from_result, load_history, record_run,
     render_all_operators, summarize_all, summarize_operator,
@@ -27,7 +27,7 @@ from .policy import (
     POLICIES, apply_rota, current_rota_week, list_policies, load_policy_file,
     load_rota_file, parse_ack_timeout_overrides, policy_template,
 )
-from .replay import load_result, load_saved, load_shift_or_result
+from .replay import load_result, load_saved, load_shift, load_shift_or_result
 from .scenarios import (
     SCENARIOS, get, list_scenarios, load_scenario_file, scenario_to_dict,
 )
@@ -651,12 +651,13 @@ def main(argv=None) -> int:
         "postmortem",
         help="render a saved --json run as a self-contained HTML "
              "postmortem: score and grade, timeline, per-responder "
-             "timings, hints used, findings and action items")
+             "timings, hints used, findings and action items; a saved "
+             "shift --json file renders the shift postmortem instead")
     postmortem.add_argument("path", metavar="PATH",
                             help="path to a JSON file saved from run "
                                  "--json (or a saved what-if --json file, "
                                  "whose replay is rendered with its "
-                                 "provenance)")
+                                 "provenance), or from shift --json")
     postmortem.add_argument("--out", default=None, metavar="PATH",
                             help="write the postmortem to PATH instead of "
                                  "printing it (required with "
@@ -672,11 +673,13 @@ def main(argv=None) -> int:
         help="package a saved --json run as a shareable zip: the run "
              "JSON, the HTML postmortem and a manifest with provenance "
              "and SHA-256 hashes, validated as it is created; "
-             "--check validates a bundle someone shared")
+             "--check validates a bundle someone shared; a saved "
+             "shift --json file bundles the shift the same way")
     bundle.add_argument("path", metavar="PATH", nargs="?",
                         help="path to a JSON file saved from run --json "
-                             "(or a saved what-if --json file), or to a "
-                             "bundle zip with --check")
+                             "(or a saved what-if --json file, or a saved "
+                             "shift --json file), or to a bundle zip with "
+                             "--check")
     bundle.add_argument("--out", default=None, metavar="PATH",
                         help="write the bundle zip to PATH instead of "
                              "<run>-bundle.zip")
@@ -885,6 +888,7 @@ def main(argv=None) -> int:
     if args.command == "postmortem":
         try:
             loaded = load_saved(args.path)
+            shift = None
         except OSError as exc:
             print(f"cannot read postmortem file: {exc}", file=sys.stderr)
             return 2
@@ -892,8 +896,17 @@ def main(argv=None) -> int:
             print(f"invalid postmortem file: {exc}", file=sys.stderr)
             return 2
         except ValueError as exc:
-            print(f"invalid postmortem file: {exc}", file=sys.stderr)
-            return 2
+            # A shift file holds several runs, not one: render the
+            # shift postmortem instead.
+            if "shift file" not in str(exc):
+                print(f"invalid postmortem file: {exc}", file=sys.stderr)
+                return 2
+            try:
+                shift = load_shift(args.path)
+            except ValueError as exc:
+                print(f"invalid postmortem file: {exc}", file=sys.stderr)
+                return 2
+            loaded = None
         if args.format == "pdf":
             # A PDF is binary: it is only ever written to a file,
             # never printed to stdout.
@@ -901,8 +914,14 @@ def main(argv=None) -> int:
                 print("postmortem --format pdf needs --out PATH: a PDF "
                       "cannot be printed as text", file=sys.stderr)
                 return 2
-            data = render_postmortem_pdf(loaded.result,
-                                         what_if=loaded.what_if)
+            if shift is not None:
+                data = render_shift_postmortem_pdf(shift)
+                label = (f"shift postmortem "
+                         f"({len(shift.runs)} incident(s) ran)")
+            else:
+                data = render_postmortem_pdf(loaded.result,
+                                             what_if=loaded.what_if)
+                label = f"{loaded.result.incident.title!r}"
             try:
                 with open(args.out, "wb") as handle:
                     handle.write(data)
@@ -910,11 +929,16 @@ def main(argv=None) -> int:
                 print(f"cannot write postmortem file: {exc}",
                       file=sys.stderr)
                 return 2
-            print(f"wrote PDF postmortem for "
-                  f"{loaded.result.incident.title!r} to {args.out}")
+            print(f"wrote PDF postmortem for {label} to {args.out}")
             return 0
-        text = render_postmortem_html(loaded.result,
-                                      what_if=loaded.what_if)
+        if shift is not None:
+            text = render_shift_postmortem_html(shift)
+            label = (f"shift postmortem "
+                     f"({len(shift.runs)} incident(s) ran)")
+        else:
+            text = render_postmortem_html(loaded.result,
+                                          what_if=loaded.what_if)
+            label = f"{loaded.result.incident.title!r}"
         if args.out is not None:
             try:
                 with open(args.out, "w", encoding="utf-8") as handle:
@@ -923,8 +947,7 @@ def main(argv=None) -> int:
                 print(f"cannot write postmortem file: {exc}",
                       file=sys.stderr)
                 return 2
-            print(f"wrote postmortem for "
-                  f"{loaded.result.incident.title!r} to {args.out}")
+            print(f"wrote postmortem for {label} to {args.out}")
             return 0
         print(text)
         return 0
@@ -959,9 +982,12 @@ def main(argv=None) -> int:
             print(f"invalid bundle file: {exc}", file=sys.stderr)
             return 2
         names = ", ".join(entry["name"] for entry in manifest["files"])
-        print(f"wrote bundle for "
-              f"{manifest['incident']['title']!r} to {out_path} "
-              f"({names})")
+        if manifest.get("shift") is not None:
+            label = (f"shift of "
+                     f"{len(manifest['shift']['incidents'])} incident(s)")
+        else:
+            label = f"{manifest['incident']['title']!r}"
+        print(f"wrote bundle for {label} to {out_path} ({names})")
         return 0
 
     if args.command == "compare":

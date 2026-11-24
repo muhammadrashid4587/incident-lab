@@ -17,7 +17,7 @@ page carries a footer naming the generator and the page number.
 """
 
 from . import __version__
-from .debrief import generate_debrief
+from .debrief import generate_debrief, generate_shift_debrief
 
 # Letter, in points, with a 3/4-inch margin all round.
 PAGE_WIDTH = 612
@@ -308,6 +308,116 @@ def _build_pdf(pages) -> bytes:
     out += (f"trailer\n<< /Size {total} /Root 1 0 R >>\n"
             f"startxref\n{xref_at}\n%%EOF\n").encode()
     return bytes(out)
+
+
+def _shift_content_lines(shift) -> list:
+    """The shift postmortem as a flat list of styled lines, in
+    reading order, mirroring the HTML shift export section for
+    section: the shift summary, one row per incident, the
+    shift-level findings and action items, then one section per
+    incident that ran with its own debrief findings."""
+    debrief = generate_shift_debrief(shift)
+    lines = []
+
+    def add(text, font=_FONT_REGULAR, size=10, gap=0):
+        for wrapped in _wrap(text, size):
+            lines.append((wrapped, font, size, gap))
+            gap = 0
+
+    def heading(text):
+        add(text, font=_FONT_BOLD, size=12, gap=14)
+
+    def bullet(text):
+        add(f"- {text}")
+
+    add("Shift postmortem", font=_FONT_BOLD, size=16)
+    add(f"{len(shift.runs)} incident(s) ran, "
+        f"{len(shift.skipped)} skipped", gap=4)
+
+    heading("Summary")
+    add(f"Shift score: {debrief.shift_points}/100 "
+        f"(grade {debrief.grade})")
+    add(f"Error budget: burned {debrief.total_burn_pct:.1f}% of the "
+        f"monthly budget (SLO {debrief.slo_percent}%, "
+        f"{debrief.budget_minutes:.1f}m)")
+    if debrief.budget_exhausted:
+        add("The budget ran out mid-shift: "
+            + ", ".join(debrief.skipped) + " never ran")
+    if debrief.difficulty is not None:
+        add(f"Difficulty: {debrief.difficulty.name}")
+    if shift.seed is not None:
+        add(f"Seed: {shift.seed}")
+
+    heading("Incidents")
+    for entry in debrief.incidents:
+        downtime = (f"{entry['downtime_min']}m"
+                    if entry["downtime_min"] is not None else "-")
+        add(f"{entry['scenario']}: {entry['points']}/100 "
+            f"(grade {entry['grade']}), downtime {downtime}, burned "
+            f"{entry['burn_pct']:.1f}% (cumulative "
+            f"{entry['cumulative_burn_pct']:.1f}%)")
+    for name in debrief.skipped:
+        add(f"{name}: skipped (error budget exhausted)")
+
+    heading("What went well")
+    if debrief.went_well:
+        for item in debrief.went_well:
+            bullet(item)
+    else:
+        add("none")
+
+    heading("What went badly")
+    if debrief.went_badly:
+        for item in debrief.went_badly:
+            bullet(item)
+    else:
+        add("none")
+
+    heading("Action items")
+    if debrief.action_items:
+        for item in debrief.action_items:
+            bullet(f"[ ] {item['action']} (owner: {item['owner']})")
+    else:
+        add("none")
+
+    for run in shift.runs:
+        incident_debrief = generate_debrief(run)
+        heading(run.incident.title)
+        add(f"Service: {run.incident.service} "
+            f"[{run.incident.severity}] — "
+            f"{incident_debrief.points}/100 "
+            f"(grade {incident_debrief.grade})")
+        add("What went well:", font=_FONT_BOLD, size=10, gap=8)
+        if incident_debrief.went_well:
+            for item in incident_debrief.went_well:
+                bullet(item)
+        else:
+            add("none")
+        add("What went badly:", font=_FONT_BOLD, size=10, gap=8)
+        if incident_debrief.went_badly:
+            for item in incident_debrief.went_badly:
+                bullet(item)
+        else:
+            add("none")
+        add("Action items:", font=_FONT_BOLD, size=10, gap=8)
+        if incident_debrief.action_items:
+            for item in incident_debrief.action_items:
+                bullet(f"[ ] {item['action']} "
+                       f"(owner: {item['owner']})")
+        else:
+            add("none")
+    return lines
+
+
+def render_shift_postmortem_pdf(shift) -> bytes:
+    """Render a saved shift as a PDF postmortem.
+
+    ``shift`` is a ShiftResult (a saved `shift --json` file). The
+    findings come from ``debrief.generate_shift_debrief`` and each
+    incident's own ``generate_debrief``, so the PDF never invents
+    a cause the simulation did not show.
+    """
+    return _build_pdf(_flow_pages(_shift_content_lines(shift)))
 
 
 def render_postmortem_pdf(result, what_if=None) -> bytes:
