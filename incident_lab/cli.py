@@ -511,8 +511,8 @@ def main(argv=None) -> int:
                      choices=PURGE_VERIFICATION_MODES,
                      help="verify the fix in every region before the "
                           "incident is declared mitigated: off (default), "
-                          "or per-region (3m per region, so a four-region "
-                          "purge costs 12m); needs a scenario with "
+                          "or per-region (3m per region unless the scenario "
+                          "prices a region differently); needs a scenario with "
                           "regions")
     run.add_argument("--seed", type=int, default=None, metavar="N",
                      help="seed the RNG that jitters ack delays by up to "
@@ -643,8 +643,8 @@ def main(argv=None) -> int:
                        choices=PURGE_VERIFICATION_MODES,
                        help="verify the fix in every region before the "
                             "incident is declared mitigated: off (default), "
-                            "or per-region (3m per region, so a four-region "
-                            "purge costs 12m); needs a scenario with "
+                            "or per-region (3m per region unless the scenario "
+                            "prices a region differently); needs a scenario with "
                             "regions")
     drill.add_argument("--hints", type=int, default=0, metavar="N",
                        help="ask for N hints up front, drawn in order "

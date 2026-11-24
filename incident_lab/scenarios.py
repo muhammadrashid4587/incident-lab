@@ -462,13 +462,28 @@ SCENARIOS = {
             "spike. The primary does not believe the page at first — "
             "the dashboard says the purge worked — and acks 3m late, "
             "then forces a full invalidation and ships versioned "
-            "asset URLs while the stale content spreads."
+            "asset URLs while the stale content spreads. Confirming "
+            "the fix costs more the farther the region: a cold edge "
+            "node in us-east fetches the new asset in 2m, us-west in "
+            "4m, eu-west in 6m, and ap-southeast — where the cold "
+            "edge node has to pull the new asset across the Pacific "
+            "before the check can confirm it — in 8m."
         ),
         ack_delay_min=(8, None, None),
         mitigate_delay_min=30,
         resolve_delay_min=15,
         slo_percent=99.9,
         regions=("us-east", "us-west", "eu-west", "ap-southeast"),
+        # Verifying the fix is not the same price everywhere: a
+        # cold edge node fetches the new asset in 2m in us-east,
+        # 4m in us-west and 6m in eu-west, but 8m in ap-southeast,
+        # where the cold edge node has to pull the new asset across
+        # the Pacific before the check can confirm it. The total is
+        # 20m, 8m more than the 3m default, so the verified run
+        # scores 30/100 where the default-cost run scored 32.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 4, "eu-west": 6, "ap-southeast": 8,
+        },
         hints=(
             "Check the purge by fetching the asset yourself, not by "
             "trusting the purge dashboard: a purge API that returns "

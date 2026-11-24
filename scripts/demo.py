@@ -21,8 +21,10 @@ def main() -> None:
             f"resolved={score.resolved} points={score.points}/100"
         )
     # The purge-verification what-if dimension, shown on the
-    # scenario it was built for: verifying the purge in every
-    # region costs 3m per region before the incident is mitigated.
+    # scenario it was built for: verifying the purge costs more
+    # the farther the region — 2m in us-east, 4m in us-west, 6m in
+    # eu-west and 8m in ap-southeast — before the incident is
+    # mitigated.
     verified = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
                         purge_verification="per-region")
     score = verified.score
