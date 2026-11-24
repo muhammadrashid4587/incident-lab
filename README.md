@@ -70,6 +70,10 @@ python3 -m incident_lab run key-rotation --policy sev1
 python3 -m incident_lab run key-rotation --policy sev1 --json
 python3 -m incident_lab run retry-storm --policy fast
 python3 -m incident_lab run retry-storm --policy fast --json
+python3 -m incident_lab run waf-rules-block
+python3 -m incident_lab run waf-rules-block --json
+python3 -m incident_lab run waf-rules-block --verify-purge per-region
+python3 -m incident_lab run waf-rules-block --verify-purge per-region --json
 python3 -m incident_lab run sso-outage
 python3 -m incident_lab run sso-outage --json
 python3 -m incident_lab run config-push
@@ -459,6 +463,11 @@ run can be replayed with verification on or off: `cdn-purge-failure`
 scores 34/100 unverified and 32/100 verified per region — the 12m of
 checks push mitigation from 38m to 50m and the burn from 88.0% to
 115.7% — and the replay shows exactly what the certainty cost.
+`waf-rules-block` is the scenario where verification costs a whole
+grade: it scores 100/100 unverified (mitigates in 15m, inside the
+grace) and 89/100 verified per region — the 14m ap-southeast check
+pushes mitigation to 37m, past the grace, and the grade drops from
+A to B.
 `debrief` flags the difference both ways: a verified run is credited
 with confirming every region, and an unverified run of a scenario
 with regions gets an action item to verify per region before the
@@ -574,6 +583,7 @@ fails the run with exit code 2 and an error message.
 | fraud-rules-misfire | payments-fraud | critical | 99.95% | fraud-rules update declines every legitimate payment, primary misses, secondary acks in 2m on the fast policy |
 | key-rotation | payments-tokens | critical | 99.95% | KMS key rotation retires the old key before it propagates, saved-card decryption breaks, on-call acks 2m late on the sev1 policy |
 | retry-storm | notifications-push | critical | 99.95% | bad deploy drops retry backoff, retry loop floods the push provider, provider rate-limits the account, primary acks 1m late on the fast policy |
+| waf-rules-block | edge-waf | critical | 99.9% | WAF rules update blocks legitimate checkout traffic, primary acks in 2m on time, verifying the rollback in ap-southeast takes 14m and costs a grade |
 
 ## Escalation policy
 

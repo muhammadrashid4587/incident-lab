@@ -617,6 +617,58 @@ SCENARIOS = {
             "missing alerts",
         ),
     ),
+    "waf-rules-block": Scenario(
+        name="waf-rules-block",
+        service="edge-waf",
+        title="WAF rules update blocking legitimate checkout traffic",
+        severity="critical",
+        description=(
+            "A WAF rules update shipped to the edge WAF starts blocking "
+            "legitimate checkout requests as suspected bots: checkout "
+            "itself is up, but real customers cannot pay, so revenue "
+            "stops. The primary sees the block rate spike and acks in "
+            "2m — on time — then rolls the rules update back while the "
+            "impact grows from checkout requests blocked to checkout "
+            "down. The rollback is only real once it is confirmed in "
+            "every region, and the far region is slow to confirm: the "
+            "ap-southeast edge PoP only pulls WAF rules every 15 "
+            "minutes, so checking the fix there waits out the poll."
+        ),
+        ack_delay_min=(2, None, None),
+        mitigate_delay_min=13,
+        resolve_delay_min=10,
+        slo_percent=99.9,
+        regions=("us-east", "eu-west", "ap-southeast"),
+        # Verifying the rollback is not the same price everywhere:
+        # a test request clears in 3m in us-east and 5m in eu-west,
+        # but ap-southeast takes 14m — the edge PoP there only pulls
+        # WAF rules every 15 minutes, so the check waits out the
+        # poll. The total is 22m, and that is the point: without
+        # verification the incident mitigates in 15m, inside the
+        # grace, and scores 100 (grade A); verified in every region
+        # it mitigates in 37m and scores 89 (grade B) — the slow far
+        # region costs a whole grade.
+        verify_delay_min_by_region={
+            "us-east": 3, "eu-west": 5, "ap-southeast": 14,
+        },
+        hints=(
+            "Check the WAF rules deploy first: legitimate checkouts "
+            "blocked right after a rules update is the rules until "
+            "proven otherwise.",
+            "Roll back the rules update before digging into the block "
+            "reasons: a rollback is fast, and every minute of blocks "
+            "costs revenue.",
+            "Verify a test checkout goes through after the rollback "
+            "before declaring the incident mitigated; a rollback that "
+            "only reached one region leaves the others blocking.",
+        ),
+        impact_stages=(
+            "Checkout requests blocked: legitimate customers flagged "
+            "as bots, checkout success rate falling",
+            "Checkout down: most checkouts blocked, orders failing, "
+            "revenue stopped",
+        ),
+    ),
 }
 
 

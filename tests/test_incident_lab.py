@@ -5347,6 +5347,149 @@ class TestFraudRulesMisfireScenario(unittest.TestCase):
         self.assertIn("61/100", out)
 
 
+class TestWafRulesBlockScenario(unittest.TestCase):
+    """waf-rules-block: a WAF rules update blocks legitimate checkout.
+
+    The primary acks in 2m, on time, and the rollback itself takes
+    13m, so without verification the incident mitigates in 15m —
+    exactly inside the 15m grace — and scores 100 (grade A). But the
+    rollback is only real once it is confirmed in every region, and
+    the far region is slow: ap-southeast takes 14m to confirm,
+    because its edge PoP only pulls WAF rules every 15 minutes, so
+    verifying in every region costs 22m, mitigation lands at 37m
+    and the score drops to 89 (grade B) — the slow far region costs
+    a whole grade relative to the same incident mitigated on time.
+    """
+
+    def test_waf_rules_block_scenario(self):
+        scenario = get("waf-rules-block")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "edge-waf")
+        self.assertEqual(scenario.ack_delay_min, (2, None, None))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "eu-west", "ap-southeast"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "eu-west": 5, "ap-southeast": 14})
+        self.assertEqual(scenario.verify_delay_min_total(), 22)
+        self.assertEqual(len(scenario.impact_stages), 2)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_unverified_mitigates_inside_the_grace_and_scores_100(self):
+        result = simulate(get("waf-rules-block"), DEFAULT_POLICY)
+        score = result.score
+        self.assertEqual(score.time_to_ack_min, 2)
+        self.assertEqual(score.time_to_mitigate_min, 15)
+        self.assertEqual(score.time_to_resolve_min, 25)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 0)
+        self.assertEqual(score.ack_late_min, 0)
+        self.assertAlmostEqual(score.ack_credit, 1.0)
+        self.assertEqual(score.verify_delay_min, 0)
+        # 100 - 0 - 0 (2m to ack inside the 5m grace) - 0 (15m to
+        # mitigate inside the 15m grace) = 100, grade A.
+        self.assertEqual(score.points, 100)
+        self.assertEqual(grade(score.points), "A")
+        # Downtime 15m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 15)
+        self.assertEqual(score.error_budget_burn_pct, 34.7)
+
+    def test_verified_per_region_costs_a_grade(self):
+        result = simulate(get("waf-rules-block"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(score.verify_delay_min, 22)
+        # The checks land at 5m, 10m and 24m: the 14m ap-southeast
+        # check is what pushes mitigation past the grace.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(5, "us-east"), (10, "eu-west"), (24, "ap-southeast")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in eu-west (5m)",
+             "fix confirmed in ap-southeast (14m)"])
+        self.assertEqual(score.time_to_mitigate_min, 37)
+        self.assertEqual(score.time_to_resolve_min, 47)
+        # 100 - 11 (37m to mitigate past the 15m grace, halved)
+        # = 89, grade B — one grade below the unverified run.
+        self.assertEqual(score.points, 89)
+        self.assertEqual(grade(score.points), "B")
+        self.assertEqual(score.downtime_min, 37)
+        self.assertEqual(score.error_budget_burn_pct, 85.6)
+
+    def test_what_if_turning_verification_on_costs_a_grade(self):
+        base = simulate(get("waf-rules-block"), DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 89)
+        self.assertEqual(outcome.points_delta, -11)
+        self.assertEqual(grade(outcome.replayed.score.points), "B")
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("waf-rules-block"), DEFAULT_POLICY,
+            input_stream=io.StringIO("ack 2\nmitigate 13\nresolve 10\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("waf-rules-block"), DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 89)
+        plain_drill = run_drill(
+            get("waf-rules-block"), DEFAULT_POLICY,
+            input_stream=io.StringIO("ack 2\nmitigate 13\nresolve 10\n"),
+            prompt_stream=io.StringIO())
+        plain_run = simulate(get("waf-rules-block"), DEFAULT_POLICY)
+        self.assertEqual(plain_drill.to_dict(), plain_run.to_dict())
+        self.assertEqual(plain_drill.score.points, 100)
+
+    def test_template_round_trips_waf_rules_block(self):
+        data = scenario_to_dict(get("waf-rules-block"))
+        self.assertEqual(data["ack_delay_min"], [2, None, None])
+        self.assertEqual(data["regions"],
+                         ["us-east", "eu-west", "ap-southeast"])
+        self.assertEqual(data["verify_delay_min_by_region"],
+                         {"us-east": 3, "eu-west": 5, "ap-southeast": 14})
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"waf-rules-block": data}}, handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["waf-rules-block"],
+                         get("waf-rules-block"))
+
+    def test_shift_runs_waf_rules_block_like_a_run(self):
+        shift = simulate_shift(
+            [get("waf-rules-block"), get("disk-full")], DEFAULT_POLICY,
+            slo_percent=99.9)
+        self.assertEqual(
+            [run.score.points for run in shift.runs], [100, 96])
+        verified = simulate_shift(
+            [get("waf-rules-block")], DEFAULT_POLICY,
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual(
+            [run.score.points for run in verified.runs], [89])
+        self.assertEqual(verified.total_burn_pct, 85.6)
+
+    def test_cli_runs_waf_rules_block(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "waf-rules-block"]), 0)
+        self.assertIn("100/100", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "waf-rules-block",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     22m "
+            "(us-east 3m, eu-west 5m, ap-southeast 14m)", out)
+        self.assertIn("89/100", out)
+
+
 class TestKeyRotationScenario(unittest.TestCase):
     """key-rotation: a KMS key rotation breaks saved-card decryption.
 
@@ -5937,7 +6080,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.44.0", text)
+        self.assertIn("Generated by incident-lab 0.45.0", text)
         self.assertIn("Page 1 of 1", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -6137,7 +6280,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.44.0")
+                         "incident-lab 0.45.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -6798,7 +6941,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.44.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.45.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

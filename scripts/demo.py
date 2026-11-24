@@ -33,6 +33,20 @@ def main() -> None:
         f"resolved={score.resolved} points={score.points}/100 "
         f"(verified per region, +{score.verify_delay_min}m)"
     )
+    # The same dimension on the scenario it costs a grade for:
+    # waf-rules-block mitigates in 15m unverified (100 points, grade
+    # A) but in 37m verified per region (89 points, grade B) — the
+    # 14m check in ap-southeast is what pushes it past the grace.
+    verified = simulate(get("waf-rules-block"), DEFAULT_POLICY,
+                        purge_verification="per-region")
+    score = verified.score
+    print(
+        f"{'waf-rules-block':<20} ack={score.time_to_ack_min}m "
+        f"mitigate={score.time_to_mitigate_min}m "
+        f"escalations={score.escalations} "
+        f"resolved={score.resolved} points={score.points}/100 "
+        f"(verified per region, +{score.verify_delay_min}m)"
+    )
 
 
 if __name__ == "__main__":
