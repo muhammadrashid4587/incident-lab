@@ -631,6 +631,8 @@ def _result_from_dict(data: dict) -> SimulationResult:
     regions = _regions_from_dict(data.get("regions"))
     purge_verification = _purge_verification_from_dict(
         data.get("purge_verification"))
+    verify_delay_min_by_region = _verify_delay_by_region_from_dict(
+        data.get("verify_delay_min_by_region"), regions)
     return SimulationResult(
         incident=_incident_from_dict(data.get("incident")),
         policy=_policy_from_dict(data.get("policy")),
@@ -644,6 +646,7 @@ def _result_from_dict(data: dict) -> SimulationResult:
             data.get("escalation_chain")),
         rota_week=rota_week,
         regions=regions,
+        verify_delay_min_by_region=verify_delay_min_by_region,
         purge_verification=purge_verification,
     )
 
@@ -666,6 +669,43 @@ def _regions_from_dict(raw) -> tuple:
         raise ValueError(
             "replay file: 'regions' must not list a region twice")
     return tuple(raw)
+
+
+def _verify_delay_by_region_from_dict(raw, regions: tuple) -> dict:
+    """Parse an optional top-level ``verify_delay_min_by_region``.
+
+    A mapping from region name to the minutes verifying the fix in
+    that region cost. Saved runs from before 0.44.0 have no key;
+    they round-trip as no per-region costs (the default per region
+    applies on a what-if replay, which is what 0.43.0 charged).
+    Every key must be one of the run's regions, and every value a
+    positive integer number of minutes.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise ValueError(
+            "replay file: 'verify_delay_min_by_region' must be an "
+            "object mapping region names to minutes or null")
+    if not regions:
+        # A run with no regions has no per-region costs: a file
+        # from before regions existed (or one with the regions key
+        # removed) round-trips as no costs, whatever the map says.
+        return {}
+    costs = {}
+    for region, minutes in raw.items():
+        if region not in regions:
+            raise ValueError(
+                "replay file: 'verify_delay_min_by_region' names "
+                f"{region!r}, which is not one of the run's regions")
+        if (isinstance(minutes, bool) or not isinstance(minutes, int)
+                or minutes <= 0):
+            raise ValueError(
+                "replay file: 'verify_delay_min_by_region' for "
+                f"{region!r} must be a positive integer number of "
+                "minutes")
+        costs[region] = minutes
+    return costs
 
 
 def _purge_verification_from_dict(raw) -> str:

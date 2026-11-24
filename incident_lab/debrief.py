@@ -12,7 +12,7 @@ late, or "on-call lead" for the systemic ones (slow mitigation, nobody
 acking at all).
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from .simulator import (
     ACK_GRACE_MIN, MITIGATE_GRACE_MIN, SimulationResult,
@@ -64,6 +64,11 @@ class Debrief:
     purge_verification: str = "off"
     verify_delay_min: int = 0
     regions: tuple = ()
+    # Minutes verifying the fix cost in each region, by region — the
+    # scenario's own per-region cost where it gives one, else the
+    # default. Recorded so the postmortem can name each region's
+    # cost instead of only the total.
+    verify_delay_min_by_region: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         """JSON-ready dict: summary, findings, action items, timeline."""
@@ -89,6 +94,8 @@ class Debrief:
                 "error_budget_burn_pct": self.error_budget_burn_pct,
                 "purge_verification": self.purge_verification,
                 "verify_delay_min": self.verify_delay_min,
+                "verify_delay_min_by_region": dict(
+                    self.verify_delay_min_by_region),
                 "regions": list(self.regions),
             },
             "went_well": list(self.went_well),
@@ -111,10 +118,21 @@ class Debrief:
         if self.difficulty is not None:
             lines.append(f"Difficulty: {self.difficulty.name}")
         if self.verify_delay_min:
-            lines.append(
-                f"Purge verification: per-region "
-                f"({len(self.regions)} regions, "
-                f"+{self.verify_delay_min}m)")
+            if (self.verify_delay_min_by_region
+                    and len(set(
+                        self.verify_delay_min_by_region.values())) > 1):
+                breakdown = ", ".join(
+                    f"{region} "
+                    f"{self.verify_delay_min_by_region[region]}m"
+                    for region in self.regions)
+                lines.append(
+                    f"Purge verification: per-region "
+                    f"({breakdown}, +{self.verify_delay_min}m)")
+            else:
+                lines.append(
+                    f"Purge verification: per-region "
+                    f"({len(self.regions)} regions, "
+                    f"+{self.verify_delay_min}m)")
         if self.error_budget_burn_pct is not None:
             lines.append(
                 f"Error budget: burned "
@@ -395,6 +413,8 @@ def _partial_debrief(result: SimulationResult, ack_grace_min: int,
         error_budget_burn_pct=score.error_budget_burn_pct,
         purge_verification=result.purge_verification,
         verify_delay_min=score.verify_delay_min,
+        verify_delay_min_by_region=dict(
+            result.verify_delay_min_by_region),
         regions=tuple(result.regions),
     )
 
@@ -478,6 +498,8 @@ def generate_debrief(result: SimulationResult) -> Debrief:
             error_budget_burn_pct=score.error_budget_burn_pct,
             purge_verification=result.purge_verification,
             verify_delay_min=score.verify_delay_min,
+            verify_delay_min_by_region=dict(
+                result.verify_delay_min_by_region),
             regions=tuple(result.regions),
         )
 
@@ -587,6 +609,8 @@ def generate_debrief(result: SimulationResult) -> Debrief:
         error_budget_burn_pct=score.error_budget_burn_pct,
         purge_verification=result.purge_verification,
         verify_delay_min=score.verify_delay_min,
+        verify_delay_min_by_region=dict(
+            result.verify_delay_min_by_region),
         regions=tuple(result.regions),
     )
 

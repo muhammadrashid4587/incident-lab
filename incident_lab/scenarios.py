@@ -21,12 +21,28 @@ A scenario may also carry ``slo_percent``: the service's SLO target
 is reported against the monthly error budget that SLO allows, as
 error-budget burn in percent; a scenario without an SLO reports no
 burn.
+
+A scenario may also carry ``verify_delay_min_by_region``: the
+minutes verifying the fix costs in one region, by region. A region
+listed there costs what it says instead of the 3m default — a far
+or slow region costs more to confirm than a near one — and a region
+left out costs the default, so a scenario that gives no costs at
+all verifies at 3m per region, exactly as before.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import json
 
 from .incident import SEVERITIES
+
+
+# Minutes to verify a remediation in one region when the scenario
+# gives no per-region cost for it: fetch the asset (or run the
+# check) from a cold edge node there and confirm the fix actually
+# landed, instead of trusting the dashboard. A scenario can give a
+# region its own cost with ``verify_delay_min_by_region`` — a far or
+# slow region costs more to check than a near one.
+DEFAULT_VERIFY_MIN_PER_REGION = 3
 
 
 @dataclass(frozen=True)
@@ -61,6 +77,26 @@ class Scenario:
     # scenario has no regions and per-region verification does not
     # apply to it.
     regions: tuple = ()
+    # Minutes to verify the fix in one region, by region: a region
+    # listed here costs that many minutes to check instead of the
+    # default (``DEFAULT_VERIFY_MIN_PER_REGION``) — a far or slow
+    # region costs more to confirm than a near one. A region not
+    # listed here costs the default, so a scenario that gives no
+    # costs at all verifies at 3m per region, exactly as before.
+    verify_delay_min_by_region: dict = field(default_factory=dict)
+
+    def verify_delay_min_for(self, region: str) -> int:
+        """Minutes to verify the fix in ``region``: the scenario's own
+        per-region cost when it gives one, else the default."""
+        return self.verify_delay_min_by_region.get(
+            region, DEFAULT_VERIFY_MIN_PER_REGION)
+
+    def verify_delay_min_total(self) -> int:
+        """Minutes to verify the fix in every region, in order: the
+        sum of each region's own cost (or the default where the
+        scenario gives none)."""
+        return sum(self.verify_delay_min_for(region)
+                   for region in self.regions)
 
 
 SCENARIOS = {
@@ -475,6 +511,15 @@ SCENARIOS = {
         resolve_delay_min=15,
         slo_percent=99.95,
         regions=("us-east", "us-west", "eu-west"),
+        # Verifying the rollback is not the same price everywhere:
+        # a test payment clears fast in the two US regions (2m each),
+        # but eu-west takes 5m — the test card must clear 3-D Secure
+        # with a European issuer before the rollback is confirmed.
+        # The total is 9m, the same as the 3m default, so the score
+        # is unchanged; only the checks land at different times.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 2, "eu-west": 5,
+        },
         hints=(
             "Check the fraud-rules deploy first: payments declining "
             "right after a rules update is the rules until proven "
@@ -603,6 +648,8 @@ def scenario_to_dict(scenario: Scenario) -> dict:
         "impact_stages": list(scenario.impact_stages),
         "slo_percent": scenario.slo_percent,
         "regions": list(scenario.regions),
+        "verify_delay_min_by_region": dict(
+            scenario.verify_delay_min_by_region),
     }
 
 
@@ -651,6 +698,7 @@ def _scenario_from_dict(name: str, data) -> Scenario:
                 "be a positive integer number of minutes or null")
         else:
             delays.append(raw)
+    regions = _require_regions(data, name)
     return Scenario(
         name=name,
         service=_require_string(data, "service", name),
@@ -665,8 +713,42 @@ def _scenario_from_dict(name: str, data) -> Scenario:
         hints=tuple(_require_hints(data, name)),
         impact_stages=tuple(_require_impact_stages(data, name)),
         slo_percent=_require_slo(data, name),
-        regions=tuple(_require_regions(data, name)),
+        regions=tuple(regions),
+        verify_delay_min_by_region=_require_verify_delay_by_region(
+            data, name, regions),
     )
+
+
+def _require_verify_delay_by_region(data: dict, name: str,
+                                    regions: list) -> dict:
+    """Validate a scenario file's optional ``verify_delay_min_by_region``.
+
+    A mapping from region name to the minutes verifying the fix in
+    that region costs. Absent means every region costs the default
+    (``DEFAULT_VERIFY_MIN_PER_REGION``); a region listed here costs
+    what it says, and a region left out keeps the default. Every key
+    must be one of the scenario's ``regions`` — a cost for a region
+    the scenario never verifies is a typo — and every value must be
+    a positive integer number of minutes.
+    """
+    raw = data.get("verify_delay_min_by_region", {})
+    if not isinstance(raw, dict):
+        raise ValueError(
+            f"scenario {name!r}: 'verify_delay_min_by_region' must be "
+            "an object mapping region names to minutes")
+    for region, minutes in raw.items():
+        if region not in regions:
+            raise ValueError(
+                f"scenario {name!r}: 'verify_delay_min_by_region' names "
+                f"{region!r}, which is not one of the scenario's "
+                f"regions {regions}")
+        if (isinstance(minutes, bool) or not isinstance(minutes, int)
+                or minutes <= 0):
+            raise ValueError(
+                f"scenario {name!r}: 'verify_delay_min_by_region' for "
+                f"{region!r} must be a positive integer number of "
+                "minutes")
+    return dict(raw)
 
 
 def _require_regions(data: dict, name: str) -> list:

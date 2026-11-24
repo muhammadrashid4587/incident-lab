@@ -111,6 +111,13 @@ def _scenario_from_result(original) -> Scenario:
         # override on it fails in simulate() instead of inventing
         # regions.
         regions=tuple(original.regions),
+        # The per-region verification costs the base run's scenario
+        # carried, so a replay re-verifies at those same costs: a
+        # run saved before 0.44.0 has none, and the replay falls
+        # back to the default per region, which is what 0.43.0
+        # charged.
+        verify_delay_min_by_region=dict(
+            original.verify_delay_min_by_region),
         # The impact stages the original run walked through, read off
         # its recorded escalation chain: one stage per level paged,
         # in order. The replay walks the same levels (a miss stays a

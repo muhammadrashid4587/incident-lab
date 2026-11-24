@@ -170,8 +170,18 @@ def _print_result(result) -> None:
           if score.time_to_resolve_min is not None
           else "  time-to-resolve:  -")
     if score.verify_delay_min:
-        print(f"  verify delay:     {score.verify_delay_min}m "
-              f"({len(result.regions)} regions)")
+        costs = getattr(result, "verify_delay_min_by_region", {}) or {}
+        if costs and len(set(costs.values())) > 1:
+            # Regions priced differently: name each region's cost
+            # instead of the flat count, so the check that cost
+            # the most is visible.
+            breakdown = ", ".join(
+                f"{region} {costs[region]}m" for region in result.regions)
+            print(f"  verify delay:     {score.verify_delay_min}m "
+                  f"({breakdown})")
+        else:
+            print(f"  verify delay:     {score.verify_delay_min}m "
+                  f"({len(result.regions)} regions)")
     if score.slo_percent is not None:
         print(f"  downtime:         {score.downtime_min}m"
               if score.downtime_min is not None else "  downtime:         -")

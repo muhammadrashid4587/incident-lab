@@ -3585,6 +3585,197 @@ class TestPurgeVerification(unittest.TestCase):
         data = render_postmortem_pdf(result)
         self.assertIn(b"Purge verification: per-region", data)
 
+    def test_fraud_rules_regions_cost_differently(self):
+        # eu-west takes 5m to confirm (the test card must clear
+        # 3-D Secure with a European issuer); the US regions take
+        # 2m each. The total is 9m, the same as the 3m default, so
+        # the score is unchanged — only the checks land at
+        # different times.
+        scenario = get("fraud-rules-misfire")
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 2, "eu-west": 5})
+        self.assertEqual(scenario.verify_delay_min_for("us-east"), 2)
+        self.assertEqual(scenario.verify_delay_min_for("eu-west"), 5)
+        self.assertEqual(scenario.verify_delay_min_total(), 9)
+        result = simulate(scenario, DEFAULT_POLICY,
+                          purge_verification="per-region")
+        self.assertEqual(result.score.verify_delay_min, 9)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 2, "eu-west": 5})
+        # Primary misses at 5m, secondary acks 2m later (7m), so
+        # the checks land at 9m, 11m and 16m; mitigation at 46m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(9, "us-east"), (11, "us-west"), (16, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (2m)",
+             "fix confirmed in us-west (2m)",
+             "fix confirmed in eu-west (5m)"])
+        self.assertEqual(result.score.time_to_mitigate_min, 46)
+        self.assertEqual(result.score.points, 68)
+
+    def test_default_cost_is_three_minutes_per_region(self):
+        # A scenario that gives no per-region costs verifies at
+        # the 3m default everywhere, exactly as before.
+        scenario = get("cdn-purge-failure")
+        self.assertEqual(scenario.verify_delay_min_by_region, {})
+        self.assertEqual(scenario.verify_delay_min_for("us-east"), 3)
+        self.assertEqual(scenario.verify_delay_min_total(), 12)
+
+    def _write_scenario_file(self, scenario):
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"slow-edge": scenario}}, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def test_scenario_file_per_region_costs(self):
+        raw = {
+            "service": "edge-cdn", "title": "Slow edge purge",
+            "severity": "high", "description": "",
+            "ack_delay_min": [2],
+            "mitigate_delay_min": 15, "resolve_delay_min": 10,
+            "regions": ["us-east", "eu-west"],
+            "verify_delay_min_by_region": {"us-east": 2, "eu-west": 5},
+        }
+        loaded = load_scenario_file(self._write_scenario_file(raw))
+        scenario = loaded["slow-edge"]
+        self.assertEqual(scenario.verify_delay_min_for("us-east"), 2)
+        self.assertEqual(scenario.verify_delay_min_for("eu-west"), 5)
+        # The template round-trips the costs, so a saved scenario
+        # file keeps them.
+        self.assertEqual(scenario_to_dict(scenario)
+                         ["verify_delay_min_by_region"],
+                         {"us-east": 2, "eu-west": 5})
+        self.assertEqual(load_scenario_file(
+            self._write_scenario_file(scenario_to_dict(scenario))),
+            loaded)
+        # 2m + 5m of verification, not the 6m the default would
+        # charge: mitigation 24m, so the score moves with it.
+        result = simulate(scenario, DEFAULT_POLICY,
+                          purge_verification="per-region")
+        self.assertEqual(result.score.verify_delay_min, 7)
+        self.assertEqual(result.score.mitigate_delay_min, 22)
+        self.assertEqual(result.score.time_to_mitigate_min, 24)
+        self.assertEqual(result.score.points, 96)
+
+    def test_scenario_file_region_without_a_cost_uses_the_default(self):
+        raw = {
+            "service": "edge-cdn", "title": "Slow edge purge",
+            "severity": "high", "description": "",
+            "ack_delay_min": [2],
+            "mitigate_delay_min": 15, "resolve_delay_min": 10,
+            "regions": ["us-east", "eu-west"],
+            "verify_delay_min_by_region": {"eu-west": 5},
+        }
+        scenario = load_scenario_file(
+            self._write_scenario_file(raw))["slow-edge"]
+        self.assertEqual(scenario.verify_delay_min_for("us-east"), 3)
+        self.assertEqual(scenario.verify_delay_min_total(), 8)
+
+    def test_scenario_file_rejects_bad_verify_costs(self):
+        base = {
+            "service": "edge-cdn", "title": "Slow edge purge",
+            "severity": "high", "description": "",
+            "ack_delay_min": [2],
+            "mitigate_delay_min": 15, "resolve_delay_min": 10,
+            "regions": ["us-east", "eu-west"],
+        }
+        bad_costs = [
+            # A cost for a region the scenario never verifies.
+            {"ap-south": 2},
+            # Not a positive integer number of minutes.
+            {"us-east": 0},
+            {"us-east": -1},
+            {"us-east": "5"},
+            {"us-east": True},
+            {"us-east": 2.5},
+            # Not an object at all.
+            ["us-east"],
+            "us-east",
+        ]
+        for costs in bad_costs:
+            raw = dict(base)
+            raw["verify_delay_min_by_region"] = costs
+            with self.assertRaises(ValueError):
+                load_scenario_file(self._write_scenario_file(raw))
+
+    def test_what_if_replays_per_region_costs(self):
+        base = simulate(get("fraud-rules-misfire"), DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.verify_delay_min, 9)
+        self.assertEqual(outcome.replayed.score.points, 68)
+        self.assertEqual(
+            [(event.t_min, event.actor)
+             for event in outcome.replayed.timeline.events
+             if event.kind == "verified"],
+            [(9, "us-east"), (11, "us-west"), (16, "eu-west")])
+        # The same mode replays the run exactly, costs included.
+        verified = simulate(get("fraud-rules-misfire"), DEFAULT_POLICY,
+                            purge_verification="per-region")
+        same = what_if(verified, purge_verification="per-region")
+        self.assertEqual(same.overrides, [])
+        self.assertEqual(same.replayed.to_dict(), verified.to_dict())
+
+    def test_old_run_without_per_region_costs_replays_at_default(self):
+        verified = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
+                            purge_verification="per-region")
+        data = verified.to_dict()
+        data.pop("verify_delay_min_by_region")
+        loaded = load_result(self._write_json(data))
+        self.assertEqual(loaded.verify_delay_min_by_region, {})
+        # A run saved before 0.44.0 replays at the 3m default, which
+        # is what 0.43.0 charged, so the replay still matches.
+        outcome = what_if(loaded, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.verify_delay_min, 12)
+        self.assertEqual(outcome.replayed.to_dict(), verified.to_dict())
+
+    def test_json_round_trip_keeps_per_region_costs(self):
+        result = simulate(get("fraud-rules-misfire"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        path = self._write_json(result.to_dict())
+        self.assertEqual(load_result(path).to_dict(), result.to_dict())
+
+    def test_drill_with_per_region_costs_matches_run(self):
+        drill = run_drill(
+            get("fraud-rules-misfire"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "wait\nack 2\nmitigate 30\nresolve 15\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("fraud-rules-misfire"), DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 68)
+
+    def test_cli_run_shows_per_region_breakdown(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "fraud-rules-misfire",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     9m (us-east 2m, us-west 2m, eu-west 5m)",
+            out)
+        self.assertIn("68/100", out)
+
+    def test_debrief_names_per_region_costs(self):
+        result = simulate(get("fraud-rules-misfire"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 2m, us-west 2m, eu-west 5m, +9m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 2, "us-west": 2, "eu-west": 5})
+
 
 class TestDrill(unittest.TestCase):
     def _drill(self, scenario, policy=DEFAULT_POLICY, decisions="",
@@ -5746,7 +5937,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.43.0", text)
+        self.assertIn("Generated by incident-lab 0.44.0", text)
         self.assertIn("Page 1 of 1", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -5946,7 +6137,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.43.0")
+                         "incident-lab 0.44.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -6607,7 +6798,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.43.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.44.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

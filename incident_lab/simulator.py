@@ -38,7 +38,7 @@ import statistics
 from .difficulty import NORMAL
 from .incident import Incident
 from .policy import EscalationPolicy
-from .scenarios import Scenario
+from .scenarios import DEFAULT_VERIFY_MIN_PER_REGION, Scenario
 from .timeline import Timeline
 
 ACK_GRACE_MIN = 5
@@ -49,14 +49,19 @@ ESCALATION_PENALTY = 15
 LATE_ACK_CREDIT_WINDOW = 2
 # Minutes to verify a remediation in one region: fetch the asset (or
 # run the check) from a cold edge node there and confirm the fix
-# actually landed, instead of trusting the dashboard. Verifying every
-# region costs this per region, so a four-region purge costs 12m —
-# the price of knowing no region is still serving the old state.
-VERIFY_MIN_PER_REGION = 3
+# actually landed, instead of trusting the dashboard. A scenario can
+# give a region its own cost (``Scenario.verify_delay_min_by_region``);
+# a region with no cost of its own costs this. Verifying every region
+# costs the sum of the regions' costs, so a four-region purge at the
+# default costs 12m — the price of knowing no region is still serving
+# the old state.
+VERIFY_MIN_PER_REGION = DEFAULT_VERIFY_MIN_PER_REGION
 # Purge-verification modes: "off" declares the incident mitigated as
 # soon as the responder acts; "per-region" verifies the fix in every
-# region of the scenario first (see Scenario.regions), adding
-# VERIFY_MIN_PER_REGION per region to the mitigate delay.
+# region of the scenario first (see Scenario.regions), adding each
+# region's own verification cost — the scenario's
+# ``verify_delay_min_by_region``, or VERIFY_MIN_PER_REGION where it
+# gives none — to the mitigate delay.
 PURGE_VERIFICATION_OFF = "off"
 PURGE_VERIFICATION_PER_REGION = "per-region"
 PURGE_VERIFICATION_MODES = (
@@ -339,6 +344,13 @@ class SimulationResult:
     # base run used.
     regions: tuple = ()
     purge_verification: str = PURGE_VERIFICATION_OFF
+    # Minutes verifying the fix cost in each region, by region — the
+    # scenario's own per-region cost where it gives one, else the
+    # default (see Scenario.verify_delay_min_for). Recorded in
+    # --json output alongside the regions, so a what-if replay of a
+    # run whose scenario priced regions differently replays those
+    # same costs instead of falling back to the default.
+    verify_delay_min_by_region: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         """JSON-ready dict of the whole result: incident, policy, timeline, score."""
@@ -350,6 +362,8 @@ class SimulationResult:
                            if self.difficulty is not None else None),
             "rota_week": self.rota_week,
             "regions": list(self.regions),
+            "verify_delay_min_by_region": dict(
+                self.verify_delay_min_by_region),
             "purge_verification": self.purge_verification,
             "hints": [hint.to_dict() for hint in self.hints],
             "escalation_chain": [
@@ -522,9 +536,11 @@ def simulate(
     whether the fix is verified in every region before the incident
     is declared mitigated: with ``"per-region"`` the responder
     confirms the remediation from a cold edge node in each of the
-    scenario's regions, at ``VERIFY_MIN_PER_REGION`` per region, so
-    the mitigate delay grows by that much and the timeline records
-    one ``verified`` event per region. The verification time is part
+    scenario's regions, at that region's own cost (the scenario's
+    ``verify_delay_min_by_region``, or the ``VERIFY_MIN_PER_REGION``
+    default where it gives none), so the mitigate delay grows by
+    the sum of the regions' costs and the timeline records one
+    ``verified`` event per region. The verification time is part
     of the recorded mitigate delay and is also recorded on its own
     (``score.verify_delay_min``), so a what-if replay can tell it
     apart from the mitigation work. Raises ValueError on an unknown
@@ -563,6 +579,13 @@ def simulate(
                     "integers with lo <= hi")
     else:
         jitter_range = None
+    # What verifying the fix costs in each region: the scenario's own
+    # per-region cost where it gives one, else the default. Recorded
+    # on the result whatever the mode, so a what-if replay of an
+    # unverified run replays the same costs when verification is
+    # turned on, instead of falling back to the default.
+    verify_costs = {region: scenario.verify_delay_min_for(region)
+                    for region in scenario.regions}
     incident = Incident(
         id=scenario.name,
         service=scenario.service,
@@ -651,6 +674,7 @@ def simulate(
                 hints=used_hints, escalation_chain=chain,
                 rota_week=rota_week,
                 regions=tuple(scenario.regions),
+                verify_delay_min_by_region=verify_costs,
                 purge_verification=purge_verification,
             )
         if t > max_duration_min:
@@ -664,6 +688,7 @@ def simulate(
                 hints=used_hints, escalation_chain=chain,
                 rota_week=rota_week,
                 regions=tuple(scenario.regions),
+                verify_delay_min_by_region=verify_costs,
                 purge_verification=purge_verification,
             )
 
@@ -680,16 +705,22 @@ def simulate(
         resolve_delay = scenario.resolve_delay_min
     # Per-region verification happens inside the mitigation window,
     # before the incident is declared mitigated: one check per
-    # region, at VERIFY_MIN_PER_REGION each. The verification is a
-    # fixed procedure, not jittered — the seed varies the response,
-    # not the check — and it lengthens the mitigate delay, so the
+    # region, at that region's own cost (the default where the
+    # scenario gives none), recorded in order so each check lands
+    # after the ones before it. The verification is a fixed
+    # procedure, not jittered — the seed varies the response, not
+    # the check — and it lengthens the mitigate delay, so the
     # downtime and the error-budget burn grow with it.
     if purge_verification == PURGE_VERIFICATION_PER_REGION:
-        verify_delay = VERIFY_MIN_PER_REGION * len(scenario.regions)
-        for index, region in enumerate(scenario.regions):
+        verify_delay = scenario.verify_delay_min_total()
+        elapsed = 0
+        for region in scenario.regions:
+            elapsed += scenario.verify_delay_min_for(region)
             timeline.record(
-                acked_at + VERIFY_MIN_PER_REGION * (index + 1),
-                "verified", region, "fix confirmed in " + region)
+                acked_at + elapsed,
+                "verified", region,
+                f"fix confirmed in {region} "
+                f"({scenario.verify_delay_min_for(region)}m)")
     else:
         verify_delay = 0
     mitigate_delay += verify_delay
@@ -728,4 +759,5 @@ def simulate(
                             hints=used_hints, escalation_chain=chain,
                             rota_week=rota_week,
                             regions=tuple(scenario.regions),
+                            verify_delay_min_by_region=verify_costs,
                             purge_verification=purge_verification)

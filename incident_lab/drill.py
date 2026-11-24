@@ -46,7 +46,7 @@ from .policy import EscalationPolicy
 from .scenarios import Scenario
 from .simulator import (
     HINT_COST_POINTS, PURGE_VERIFICATION_OFF,
-    VERIFY_MIN_PER_REGION, EscalationStep, Hint, Score, SimulationResult,
+    EscalationStep, Hint, Score, SimulationResult,
     compute_points, error_budget_burn_pct, impact_at, late_ack_credit,
     parse_purge_verification,
 )
@@ -153,7 +153,8 @@ def _partial_result(incident, policy, timeline, *, escalations,
                     used_hints, hint_cost, escalation_chain=None,
                     slo_percent=None, rota_week=None,
                     verify_delay_min=0, regions=(),
-                    purge_verification=PURGE_VERIFICATION_OFF) -> SimulationResult:
+                    purge_verification=PURGE_VERIFICATION_OFF,
+                    verify_delay_min_by_region=None) -> SimulationResult:
     """Build the result for a drill that stopped early.
 
     The timeline holds the events so far (plus the ``abandoned``
@@ -196,6 +197,9 @@ def _partial_result(incident, policy, timeline, *, escalations,
                           if escalation_chain is not None else []),
         rota_week=rota_week,
         regions=tuple(regions),
+        verify_delay_min_by_region=(
+            dict(verify_delay_min_by_region)
+            if verify_delay_min_by_region is not None else {}),
         purge_verification=purge_verification,
     )
 
@@ -235,8 +239,10 @@ def run_drill(
     ("off" or "per-region") decides whether the fix is verified in
     every region before the incident is declared mitigated, exactly
     as in ``run``: with "per-region" the operator's mitigate decision
-    is followed by one verification check per region, at
-    ``VERIFY_MIN_PER_REGION`` each, before the mitigated event.
+    is followed by one verification check per region, at that
+    region's own cost (the scenario's ``verify_delay_min_by_region``,
+    or ``VERIFY_MIN_PER_REGION`` where it gives none), before the
+    mitigated event.
     Raises ValueError if ``hints`` is negative or more than the
     scenario has, or on an unknown purge-verification mode, or on
     "per-region" for a scenario with no regions to verify.
@@ -256,6 +262,13 @@ def run_drill(
         raise ValueError(
             f"scenario {scenario.name!r} has only "
             f"{len(scenario.hints)} hint(s), asked for {hints}")
+    # What verifying the fix costs in each region: the scenario's own
+    # per-region cost where it gives one, else the default. Recorded
+    # on the result whatever the mode, so a what-if replay of an
+    # unverified drill replays the same costs when verification is
+    # turned on, instead of falling back to the default.
+    verify_costs = {region: scenario.verify_delay_min_for(region)
+                    for region in scenario.regions}
     used_hints = [Hint(text) for text in scenario.hints[:hints]]
     if input_stream is None:
         input_stream = sys.stdin
@@ -321,7 +334,7 @@ def run_drill(
         f"difficulty: {difficulty.name}\n"
         + (f"purge verification: per-region "
            f"({len(scenario.regions)} regions, "
-           f"+{VERIFY_MIN_PER_REGION * len(scenario.regions)}m)\n"
+           f"+{scenario.verify_delay_min_total()}m)\n"
            if purge_verification != PURGE_VERIFICATION_OFF else "")
         + f"{incident.description}\n\n")
 
@@ -370,6 +383,7 @@ def run_drill(
                 slo_percent=scenario.slo_percent,
                 rota_week=rota_week,
                 regions=scenario.regions,
+                verify_delay_min_by_region=verify_costs,
                 purge_verification=purge_verification)
         if command == "wait":
             # Missed ack: wait out the timeout, then escalate (or give
@@ -415,6 +429,7 @@ def run_drill(
                 slo_percent=scenario.slo_percent,
                 rota_week=rota_week,
                 regions=scenario.regions,
+                verify_delay_min_by_region=verify_costs,
                 purge_verification=purge_verification)
         # The operator acks, on time or late: the same late-ack credit
         # `run` gives for an ack past its level's timeout.
@@ -463,17 +478,22 @@ def run_drill(
             hint_cost=_hint_cost(), escalation_chain=chain,
             slo_percent=scenario.slo_percent,
             regions=scenario.regions,
+            verify_delay_min_by_region=verify_costs,
             purge_verification=purge_verification)
     # Per-region verification happens inside the mitigation window,
     # before the incident is declared mitigated — the same fixed
     # check per region `run` applies, so a drill that makes the same
     # decisions as a `run` scores the same.
     if purge_verification != PURGE_VERIFICATION_OFF:
-        verify_delay = VERIFY_MIN_PER_REGION * len(scenario.regions)
-        for index, region in enumerate(scenario.regions):
+        verify_delay = scenario.verify_delay_min_total()
+        elapsed = 0
+        for region in scenario.regions:
+            elapsed += scenario.verify_delay_min_for(region)
             timeline.record(
-                acked_at + VERIFY_MIN_PER_REGION * (index + 1),
-                "verified", region, "fix confirmed in " + region)
+                acked_at + elapsed,
+                "verified", region,
+                f"fix confirmed in {region} "
+                f"({scenario.verify_delay_min_for(region)}m)")
     else:
         verify_delay = 0
     mitigate_delay = arg + verify_delay
@@ -502,6 +522,7 @@ def run_drill(
             rota_week=rota_week,
             verify_delay_min=verify_delay,
             regions=scenario.regions,
+            verify_delay_min_by_region=verify_costs,
             purge_verification=purge_verification)
     resolve_delay = arg
     resolved_at = mitigated_at + resolve_delay
@@ -537,5 +558,6 @@ def run_drill(
         escalation_chain=chain,
         rota_week=rota_week,
         regions=tuple(scenario.regions),
+        verify_delay_min_by_region=verify_costs,
         purge_verification=purge_verification,
     )
