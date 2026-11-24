@@ -311,12 +311,30 @@ SCENARIOS = {
             "traffic split to a decommissioned pool. The primary "
             "misses the page; the secondary acks 3m late and rolls "
             "the config back, while the impact grows from checkout "
-            "errors rising to checkout down in every region."
+            "errors rising to checkout down in every region. The "
+            "rollback is only real once it is confirmed in every "
+            "region: the edge-config agents pull the new config at "
+            "different speeds, so the rollback lands in 2m in "
+            "us-east, where the config service lives, 4m in us-west "
+            "and 7m in eu-west, where the agents poll on a slower "
+            "schedule and hold the bad traffic split in cache "
+            "longest."
         ),
         ack_delay_min=(None, 8, None),
         mitigate_delay_min=30,
         resolve_delay_min=20,
         slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the rollback is not the same price everywhere:
+        # the edge-config agents pull the new config in 2m in
+        # us-east, 4m in us-west and 7m in eu-west, where the agents
+        # poll on a slower schedule and hold the bad split longest.
+        # The total is 13m, 4m more than the 3m default, so the
+        # verified run scores 23/100 where the default-cost run
+        # scored 24.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 4, "eu-west": 7,
+        },
         hints=(
             "Check the last config change before the code deploys: "
             "a bad config push looks exactly like a bad deploy but "
