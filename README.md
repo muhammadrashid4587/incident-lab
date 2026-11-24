@@ -68,6 +68,8 @@ python3 -m incident_lab run sso-outage
 python3 -m incident_lab run sso-outage --json
 python3 -m incident_lab run config-push
 python3 -m incident_lab run config-push --json
+python3 -m incident_lab run db-failover
+python3 -m incident_lab run db-failover --json
 python3 -m incident_lab run payments-outage --policy sev1 --json > /tmp/payments-outage.json
 python3 -m incident_lab replay /tmp/payments-outage.json
 python3 -m incident_lab debrief /tmp/payments-outage.json
@@ -483,6 +485,7 @@ invalid scenario fails the run with exit code 2 and an error message.
 | payments-outage | payments-api | critical | 99.9% | SEV-1: on-call and senior miss, incident commander acks in 4m; impact grows while paging |
 | sso-outage | identity-sso | critical | 99.95% | SSO logins failing, pages go to a stale rotation, nobody acks; impact grows while paging |
 | config-push | edge-config | critical | 99.9% | bad config push routes checkout to a dead pool, primary misses, secondary acks 3m late |
+| db-failover | orders-db | critical | 99.95% | primary database down, primary and secondary miss, manager acks 2m late and fails over to the replica |
 
 ## Escalation policy
 
@@ -973,6 +976,8 @@ exit code 2 and an error message. With `--json` the batch prints
 human-readable form.
 
 ## Version
+
+0.36.0 — New scenario `db-failover`: the primary database goes down and the automatic failover does not fire; the primary and the secondary both miss the page and the manager acks 2m late, then starts the manual failover to the replica, which completes partway through mitigation — the first scenario exercising two misses and a late ack together, with the impact growing across all three stages (24/100, 287.0% of the monthly error budget burned).
 
 0.35.0 — New scenario `config-push`: a bad config push (not a code deploy) flips the checkout traffic split to a decommissioned pool; the primary misses the page and the secondary acks 3m late, so the run exercises a miss and a late ack together — the impact grows from checkout errors rising to checkout down in every region, and the late ack keeps only 40% of the score (25/100, 99.5% of the monthly error budget burned).
 

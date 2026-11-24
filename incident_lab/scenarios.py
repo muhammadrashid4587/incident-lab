@@ -292,6 +292,42 @@ SCENARIOS = {
             "cannot pay",
         ),
     ),
+    "db-failover": Scenario(
+        name="db-failover",
+        service="orders-db",
+        title="Primary database down, failing over to replica",
+        severity="critical",
+        description=(
+            "The primary database stopped accepting writes and the "
+            "automatic failover did not fire. The primary and the "
+            "secondary both miss the page; the manager picks it up "
+            "2m late and starts the manual failover to the replica, "
+            "which completes partway through mitigation while the "
+            "impact grows from writes failing to orders down."
+        ),
+        ack_delay_min=(None, None, 12),
+        mitigate_delay_min=40,
+        resolve_delay_min=25,
+        slo_percent=99.95,
+        hints=(
+            "Promote the replica first: writes are down until the "
+            "failover completes, and every minute costs orders.",
+            "Check the replica's replication lag before promoting: "
+            "a replica hours behind will lose orders when it "
+            "becomes the primary.",
+            "Verify writes are landing on the new primary before "
+            "declaring the incident mitigated; a failover that only "
+            "half-completed looks fixed until the next write.",
+        ),
+        impact_stages=(
+            "Writes failing: primary down, reads still serving "
+            "from cache",
+            "Orders failing: replica promotion started, cache "
+            "expiring",
+            "Failover in progress: replica catching up, reads "
+            "degrading as the cache drains",
+        ),
+    ),
 }
 
 
