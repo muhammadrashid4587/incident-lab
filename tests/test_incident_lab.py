@@ -3268,6 +3268,9 @@ class TestPurgeVerification(unittest.TestCase):
         self.assertEqual(
             get("disk-full").regions,
             ("us-east", "us-west", "eu-west"))
+        self.assertEqual(
+            get("db-failover").regions,
+            ("us-east", "us-west", "eu-west"))
 
     def test_verified_run_costs_vary_by_region(self):
         result = simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
@@ -5193,6 +5196,106 @@ class TestDbFailoverScenario(unittest.TestCase):
         self.assertIn("24/100", out)
 
 
+class TestDbFailoverPerRegionCosts(unittest.TestCase):
+    """db-failover: per-region verification costs for the failover.
+
+    The storage team confirms the reclaimed volume in every region
+    before the incident is declared mitigated, and the check is
+    slowest where the fleet is largest — 3m in us-east, 5m in
+    us-west and 9m in eu-west — so the verified run costs 8m
+    more than the 3m default and scores 17/100 where the
+    default-cost run scored 20.
+    """
+
+    def test_db_failover_scenario(self):
+        scenario = get("db-failover")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "orders-db")
+        self.assertEqual(scenario.ack_delay_min, (None, None, 12))
+        self.assertEqual(scenario.slo_percent, 99.95)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 9})
+        self.assertEqual(scenario.verify_delay_min_total(), 17)
+        self.assertGreaterEqual(len(scenario.hints), 1)
+
+    def test_verified_per_region_costs_db_failover(self):
+        result = simulate(get("db-failover"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(result.score.verify_delay_min, 17)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 9})
+        # The manager acks at 22m, so the checks land at 25m, 30m
+        # and 39m: the 9m eu-west check is what pushes mitigation
+        # to 79m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(25, "us-east"), (30, "us-west"), (39, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in us-west (5m)",
+             "fix confirmed in eu-west (9m)"])
+        self.assertEqual(score.time_to_mitigate_min, 79)
+        self.assertEqual(score.time_to_resolve_min, 104)
+        # 100 - 30 (two escalations) - 17 (22m to ack past the 5m
+        # grace) - 32 (79m to mitigate past the 15m grace, halved)
+        # = 21, scaled by the 80% late-ack credit — three points
+        # below the 20 the 3m-default costs scored.
+        self.assertEqual(score.points, 17)
+        self.assertEqual(score.downtime_min, 79)
+        self.assertEqual(score.error_budget_burn_pct, 365.7)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 3m, us-west 5m, eu-west 9m, +17m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 3, "us-west": 5, "eu-west": 9})
+
+    def test_what_if_turning_verification_on_costs_seven_points(self):
+        base = simulate(get("db-failover"), DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 17)
+        self.assertEqual(outcome.points_delta, -7)
+
+    def test_drill_matches_run_with_per_region_costs(self):
+        drill = run_drill(
+            get("db-failover"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "wait\nwait\nack 12\nmitigate 40\nresolve 25\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("db-failover"), DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 17)
+
+    def test_shift_with_per_region_costs(self):
+        shift = simulate_shift(
+            [get("db-failover")], DEFAULT_POLICY,
+            slo_percent=99.95, purge_verification="per-region")
+        self.assertEqual([run.score.points for run in shift.runs], [17])
+        self.assertEqual(shift.total_burn_pct, 365.7)
+
+    def test_cli_run_shows_per_region_breakdown(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "db-failover",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     17m "
+            "(us-east 3m, us-west 5m, eu-west 9m)", out)
+        self.assertIn("17/100", out)
+
+
 class TestNetworkPartitionScenario(unittest.TestCase):
     """network-partition: the datacenters cannot reach each other.
 
@@ -6538,7 +6641,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.50.0", text)
+        self.assertIn("Generated by incident-lab 0.51.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -6741,7 +6844,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.50.0")
+                         "incident-lab 0.51.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -7402,7 +7505,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.50.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.51.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

@@ -379,12 +379,29 @@ SCENARIOS = {
             "secondary both miss the page; the manager picks it up "
             "2m late and starts the manual failover to the replica, "
             "which completes partway through mitigation while the "
-            "impact grows from writes failing to orders down."
+            "impact grows from writes failing to orders down. The "
+            "failover is only real once the storage team confirms "
+            "the reclaimed volume in every region: the volume check "
+            "takes 3m in us-east, where the fleet is smallest, 5m "
+            "in us-west and 9m in eu-west, where the fleet is "
+            "largest and the team confirms each host's volume "
+            "before signing off."
         ),
         ack_delay_min=(None, None, 12),
         mitigate_delay_min=40,
         resolve_delay_min=25,
         slo_percent=99.95,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the failover is not the same price everywhere:
+        # the storage team confirms the reclaimed volume in 3m in
+        # us-east, 5m in us-west and 9m in eu-west, where the fleet
+        # is largest and each host's volume is checked before the
+        # team signs off. The total is 17m, 8m more than the 3m
+        # default, so the verified run scores 17/100 where the
+        # default-cost run scored 20.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 5, "eu-west": 9,
+        },
         hints=(
             "Promote the replica first: writes are down until the "
             "failover completes, and every minute costs orders.",
