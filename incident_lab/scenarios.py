@@ -259,6 +259,39 @@ SCENARIOS = {
             "locked out entirely",
         ),
     ),
+    "config-push": Scenario(
+        name="config-push",
+        service="edge-config",
+        title="Bad config push routes checkout to a dead pool",
+        severity="critical",
+        description=(
+            "A config push, not a code deploy, flipped the checkout "
+            "traffic split to a decommissioned pool. The primary "
+            "misses the page; the secondary acks 3m late and rolls "
+            "the config back, while the impact grows from checkout "
+            "errors rising to checkout down in every region."
+        ),
+        ack_delay_min=(None, 8, None),
+        mitigate_delay_min=30,
+        resolve_delay_min=20,
+        slo_percent=99.9,
+        hints=(
+            "Check the last config change before the code deploys: "
+            "a bad config push looks exactly like a bad deploy but "
+            "rolls back differently.",
+            "Roll back the config push first: push the previous "
+            "known-good config, then verify the traffic split is "
+            "back before declaring the incident mitigated.",
+            "Verify the config actually propagated to every region; "
+            "a rollback that only reached one region leaves the "
+            "others broken.",
+        ),
+        impact_stages=(
+            "Checkout errors rising: 15% of checkouts failing",
+            "Checkout down in all regions: orders failing, customers "
+            "cannot pay",
+        ),
+    ),
 }
 
 
