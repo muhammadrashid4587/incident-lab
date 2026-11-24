@@ -4685,6 +4685,112 @@ class TestCdnPurgeFailureScenario(unittest.TestCase):
         self.assertIn("19/100", out)
 
 
+class TestFraudRulesMisfireScenario(unittest.TestCase):
+    """fraud-rules-misfire: a fraud-rules update declines every payment.
+
+    The primary misses the page — phone on silent in the rules-deploy
+    review — and the secondary acks in 2m, inside the fast policy's 2m
+    window, so this is the library's first built-in run designed for
+    the fast policy: the chain fires after just 2m, the incident is
+    acked in 4m with the full credit kept, and the impact grows across
+    both stages while payments are declined.
+    """
+
+    def test_fraud_rules_misfire_scenario(self):
+        scenario = get("fraud-rules-misfire")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "payments-fraud")
+        self.assertEqual(scenario.ack_delay_min, (None, 2))
+        self.assertEqual(scenario.slo_percent, 99.95)
+        self.assertEqual(len(scenario.impact_stages), 2)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_miss_then_fast_on_time_ack_scores_with_full_credit(self):
+        result = simulate(get("fraud-rules-misfire"), get_policy("fast"))
+        score = result.score
+        # Fast timeouts 2m, 2m, 5m: the primary misses at 2m and the
+        # secondary acks 2m after being paged, at 4m — on time against
+        # the 2m timeout.
+        self.assertEqual(score.time_to_ack_min, 4)
+        self.assertEqual(score.time_to_mitigate_min, 34)
+        self.assertEqual(score.time_to_resolve_min, 49)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 1)
+        self.assertEqual(score.ack_late_min, 0)
+        self.assertAlmostEqual(score.ack_credit, 1.0)
+        # 100 - 15 (one escalation) - 0 (4m to ack inside the 5m
+        # grace) - 9 (34m to mitigate past the 15m grace, halved)
+        # = 76, with the full ack credit kept.
+        self.assertEqual(score.points, 76)
+        # Downtime 34m against a 99.95% budget of 21.6m.
+        self.assertEqual(score.downtime_min, 34)
+        self.assertEqual(score.error_budget_burn_pct, 157.4)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 2)
+        self.assertEqual([step.outcome for step in chain],
+                         ["missed", "acked"])
+        self.assertEqual([step.paged_at_min for step in chain], [0, 2])
+        self.assertEqual(
+            [step.impact for step in chain],
+            list(get("fraud-rules-misfire").impact_stages))
+
+    def test_impact_grows_on_the_escalation_event(self):
+        result = simulate(get("fraud-rules-misfire"), get_policy("fast"))
+        escalated = [event for event in result.timeline.events
+                     if event.kind == "escalated"]
+        self.assertEqual(len(escalated), 1)
+        self.assertIn("impact now: Checkout blocked: most payments "
+                      "declined, orders failing, revenue stopped",
+                      escalated[0].detail)
+
+    def test_debrief_of_missed_page_names_the_missed_responder(self):
+        result = simulate(get("fraud-rules-misfire"), get_policy("fast"))
+        text = generate_debrief(result).render()
+        self.assertIn("ana", text)
+        self.assertIn("ben", text)
+        self.assertIn("Checkout blocked", text)
+
+    def test_template_round_trips_fraud_rules_misfire(self):
+        data = scenario_to_dict(get("fraud-rules-misfire"))
+        self.assertEqual(data["ack_delay_min"], [None, 2])
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"fraud-rules-misfire": data}}, handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["fraud-rules-misfire"],
+                         get("fraud-rules-misfire"))
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("fraud-rules-misfire"), get_policy("fast"),
+            input_stream=io.StringIO(
+                "wait\nack 2\nmitigate 30\nresolve 15\n"),
+            prompt_stream=io.StringIO())
+        run = simulate(get("fraud-rules-misfire"), get_policy("fast"))
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 76)
+
+    def test_cli_runs_fraud_rules_misfire_fast(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "fraud-rules-misfire", "--policy", "fast"]),
+                0)
+        out = buf.getvalue()
+        self.assertIn("76/100", out)
+
+    def test_cli_runs_fraud_rules_misfire_fast_with_hints(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "fraud-rules-misfire", "--policy", "fast",
+                      "--hints", "3"]), 0)
+        out = buf.getvalue()
+        self.assertIn("fraud-rules deploy", out)
+        self.assertIn("61/100", out)
+
+
 class TestErrorBudgetBurn(unittest.TestCase):
     def _write_scenario_file(self, data):
         handle = tempfile.NamedTemporaryFile(
@@ -5061,7 +5167,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.39.0", text)
+        self.assertIn("Generated by incident-lab 0.40.0", text)
         self.assertIn("Page 1 of 1", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -5261,7 +5367,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.39.0")
+                         "incident-lab 0.40.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -5922,7 +6028,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.39.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.40.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

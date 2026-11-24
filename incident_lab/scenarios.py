@@ -447,6 +447,44 @@ SCENARIOS = {
             "bundle, checkout errors rising",
         ),
     ),
+    "fraud-rules-misfire": Scenario(
+        name="fraud-rules-misfire",
+        service="payments-fraud",
+        title="Fraud rules update declining every legitimate payment",
+        severity="critical",
+        description=(
+            "A fraud-rules update shipped to the payments fraud service "
+            "starts declining every legitimate card payment as suspected "
+            "fraud. Checkout itself is up, but no payment goes through, "
+            "so revenue stops. The primary is in the rules-deploy review "
+            "with their phone on silent and misses the page; the secondary "
+            "sees payments being declined and acks in 2m — inside the "
+            "fast policy's 2m window — then rolls back the rules update "
+            "while the impact grows from payments declining to checkout "
+            "blocked."
+        ),
+        ack_delay_min=(None, 2),
+        mitigate_delay_min=30,
+        resolve_delay_min=15,
+        slo_percent=99.95,
+        hints=(
+            "Check the fraud-rules deploy first: payments declining "
+            "right after a rules update is the rules until proven "
+            "otherwise.",
+            "Roll back the rules update before digging into the decline "
+            "codes: a rollback is fast, and every minute of declines "
+            "costs revenue.",
+            "Verify a test payment goes through after the rollback "
+            "before declaring the incident mitigated; a rollback that "
+            "only reached one region leaves the others declining.",
+        ),
+        impact_stages=(
+            "Payments declining: legitimate cards flagged as fraud, "
+            "checkout success rate falling",
+            "Checkout blocked: most payments declined, orders failing, "
+            "revenue stopped",
+        ),
+    ),
 }
 
 
