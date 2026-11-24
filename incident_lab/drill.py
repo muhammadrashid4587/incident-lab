@@ -149,7 +149,7 @@ def _partial_result(incident, policy, timeline, *, escalations,
                     acked_at, acked_by, ack_late_min, ack_credit,
                     mitigated_at, mitigate_delay_min, difficulty,
                     used_hints, hint_cost, escalation_chain=None,
-                    slo_percent=None) -> SimulationResult:
+                    slo_percent=None, rota_week=None) -> SimulationResult:
     """Build the result for a drill that stopped early.
 
     The timeline holds the events so far (plus the ``abandoned``
@@ -189,6 +189,7 @@ def _partial_result(incident, policy, timeline, *, escalations,
         hints=used_hints,
         escalation_chain=(list(escalation_chain)
                           if escalation_chain is not None else []),
+        rota_week=rota_week,
     )
 
 
@@ -199,6 +200,7 @@ def run_drill(
     hints: int = 0,
     input_stream=None,
     prompt_stream=None,
+    rota_week: object = None,
 ) -> SimulationResult:
     """Run one scenario as an interactive drill and return the result.
 
@@ -216,7 +218,9 @@ def run_drill(
     policy, as the CLI does. ``hints`` asks for that many hints up
     front, drawn in order from the scenario's known-good next actions,
     each costing ``HINT_COST_POINTS`` off the final score, exactly as
-    in ``run``. The operator can also type ``hint`` at any prompt to
+    in ``run``. ``rota_week`` is the rota week the drill was played
+    for (see ``apply_rota``); it is recorded on the result, or None
+    when no rota file was used. The operator can also type ``hint`` at any prompt to
     ask for the next hint mid-drill, at the same cost, continuing
     after the up-front ones; hints asked for that way are recorded
     in the result exactly like up-front hints. Raises ValueError if
@@ -337,7 +341,8 @@ def run_drill(
                 mitigate_delay_min=None, difficulty=difficulty,
                 used_hints=used_hints, hint_cost=_hint_cost(),
                 escalation_chain=chain,
-                slo_percent=scenario.slo_percent)
+                slo_percent=scenario.slo_percent,
+                rota_week=rota_week)
         if command == "wait":
             # Missed ack: wait out the timeout, then escalate (or give
             # up, exactly as `run` does when nobody acks).
@@ -379,7 +384,8 @@ def run_drill(
                 mitigate_delay_min=None, difficulty=difficulty,
                 used_hints=used_hints, hint_cost=_hint_cost(),
                 escalation_chain=chain,
-                slo_percent=scenario.slo_percent)
+                slo_percent=scenario.slo_percent,
+                rota_week=rota_week)
         # The operator acks, on time or late: the same late-ack credit
         # `run` gives for an ack past its level's timeout.
         delay = arg
@@ -448,7 +454,8 @@ def run_drill(
             mitigated_at=mitigated_at,
             mitigate_delay_min=mitigate_delay, difficulty=difficulty,
             used_hints=used_hints, hint_cost=_hint_cost(),
-            escalation_chain=chain, slo_percent=scenario.slo_percent)
+            escalation_chain=chain, slo_percent=scenario.slo_percent,
+            rota_week=rota_week)
     resolve_delay = arg
     resolved_at = mitigated_at + resolve_delay
     timeline.record(resolved_at, "resolved", acked_by)
@@ -480,4 +487,5 @@ def run_drill(
         difficulty=difficulty,
         hints=used_hints,
         escalation_chain=chain,
+        rota_week=rota_week,
     )

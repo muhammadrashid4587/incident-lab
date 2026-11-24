@@ -32,9 +32,10 @@ from incident_lab.history import (
     summarize_all, summarize_operator,
 )
 from incident_lab.policy import (
-    DEFAULT_POLICY, EscalationPolicy, Level, Responder, get_policy,
-    list_policies, load_policy_file, parse_ack_timeout_overrides,
-    policy_template, policy_to_dict,
+    DEFAULT_POLICY, EscalationPolicy, Level, Responder, apply_rota,
+    current_rota_week, get_policy, list_policies, load_policy_file,
+    load_rota_file, parse_ack_timeout_overrides, policy_template,
+    policy_to_dict,
 )
 from incident_lab.replay import load_result, load_saved
 from incident_lab.scenarios import (
@@ -270,6 +271,250 @@ class TestPolicyFile(unittest.TestCase):
         self.assertEqual(
             [level["ack_timeout_min"] for level in data["policy"]["levels"]],
             [7, 7, 7])
+
+
+class TestRota(unittest.TestCase):
+    def _write_rota_file(self, data):
+        handle = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with handle:
+            if isinstance(data, str):
+                handle.write(data)
+            else:
+                json.dump(data, handle)
+        self.addCleanup(os.unlink, handle.name)
+        return handle.name
+
+    def _rota_data(self):
+        return {"rota": {
+            "primary": ["ana", "dave", "erin"],
+            "secondary": ["ben", "fay"],
+            "manager": ["carla"],
+        }}
+
+    def _run_json(self, argv):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(argv), 0)
+        return json.loads(buf.getvalue())
+
+    def test_loads_rota_by_role(self):
+        path = self._write_rota_file(self._rota_data())
+        rota = load_rota_file(path)
+        self.assertEqual(rota, {
+            "primary": ("ana", "dave", "erin"),
+            "secondary": ("ben", "fay"),
+            "manager": ("carla",),
+        })
+
+    def test_missing_file_raises(self):
+        with self.assertRaises(FileNotFoundError):
+            load_rota_file("/no/such/rota-file.json")
+
+    def test_malformed_json_raises(self):
+        path = self._write_rota_file("{not json")
+        with self.assertRaises(json.JSONDecodeError):
+            load_rota_file(path)
+
+    def test_missing_rota_key_raises(self):
+        path = self._write_rota_file({"rotation": {}})
+        with self.assertRaises(ValueError):
+            load_rota_file(path)
+
+    def test_empty_rotation_list_raises(self):
+        path = self._write_rota_file({"rota": {"primary": []}})
+        with self.assertRaises(ValueError):
+            load_rota_file(path)
+
+    def test_empty_name_raises(self):
+        path = self._write_rota_file({"rota": {"primary": ["ana", ""]}})
+        with self.assertRaises(ValueError):
+            load_rota_file(path)
+
+    def test_apply_rota_picks_by_week_and_wraps(self):
+        rota = load_rota_file(self._write_rota_file(self._rota_data()))
+        names = [
+            [level.responder.name for level in
+             apply_rota(DEFAULT_POLICY, rota, week).levels]
+            for week in (0, 1, 2, 3, 4)
+        ]
+        self.assertEqual(names, [
+            ["ana", "ben", "carla"],
+            ["dave", "fay", "carla"],
+            ["erin", "ben", "carla"],
+            ["ana", "fay", "carla"],
+            ["dave", "ben", "carla"],
+        ])
+
+    def test_apply_rota_leaves_unlisted_roles_alone(self):
+        rota = {"primary": ("dave",)}
+        resolved = apply_rota(DEFAULT_POLICY, rota, 0)
+        self.assertEqual(
+            [level.responder.name for level in resolved.levels],
+            ["dave", "ben", "carla"])
+        self.assertEqual(
+            [level.responder.role for level in resolved.levels],
+            ["primary", "secondary", "manager"])
+
+    def test_apply_rota_keeps_timeouts_and_ignores_unknown_roles(self):
+        rota = {"primary": ("dave",), "pager-duty": ("zoe",)}
+        resolved = apply_rota(DEFAULT_POLICY, rota, 0)
+        self.assertEqual(
+            [level.ack_timeout_min for level in resolved.levels],
+            [5, 5, 10])
+
+    def test_apply_rota_rejects_negative_week(self):
+        rota = load_rota_file(self._write_rota_file(self._rota_data()))
+        with self.assertRaises(ValueError):
+            apply_rota(DEFAULT_POLICY, rota, -1)
+
+    def test_current_rota_week_is_iso_week(self):
+        import datetime
+        self.assertEqual(
+            current_rota_week(),
+            datetime.date.today().isocalendar()[1])
+
+    def test_cli_run_pages_rota_responder_and_records_week(self):
+        path = self._write_rota_file(self._rota_data())
+        data = self._run_json(["run", "cert-expiry", "--rota-file", path,
+                               "--rota-week", "1", "--json"])
+        self.assertEqual(data["rota_week"], 1)
+        self.assertEqual(
+            [level["responder"]["name"]
+             for level in data["policy"]["levels"]],
+            ["dave", "fay", "carla"])
+        self.assertEqual(
+            [level["ack_timeout_min"]
+             for level in data["policy"]["levels"]],
+            [5, 5, 10])
+
+    def test_cli_run_prints_rota_week(self):
+        path = self._write_rota_file(self._rota_data())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(
+                main(["run", "cert-expiry", "--rota-file", path,
+                      "--rota-week", "2"]), 0)
+        out = buf.getvalue()
+        self.assertIn("rota week: 2", out)
+        self.assertIn("erin (primary)", out)
+
+    def test_cli_run_without_week_uses_current_week(self):
+        path = self._write_rota_file(self._rota_data())
+        data = self._run_json(["run", "cert-expiry", "--rota-file", path,
+                               "--json"])
+        self.assertEqual(data["rota_week"], current_rota_week())
+
+    def test_cli_run_without_rota_file_has_null_rota_week(self):
+        data = self._run_json(["run", "cert-expiry", "--json"])
+        self.assertIsNone(data["rota_week"])
+
+    def test_cli_rota_week_without_rota_file_fails(self):
+        self.assertEqual(
+            main(["run", "cert-expiry", "--rota-week", "1"]), 2)
+
+    def test_cli_negative_rota_week_fails(self):
+        path = self._write_rota_file(self._rota_data())
+        self.assertEqual(
+            main(["run", "cert-expiry", "--rota-file", path,
+                  "--rota-week", "-1"]), 2)
+
+    def test_cli_missing_rota_file_fails(self):
+        self.assertEqual(
+            main(["run", "cert-expiry", "--rota-file",
+                  "/no/such/rota-file.json"]), 2)
+
+    def test_cli_invalid_rota_file_fails(self):
+        path = self._write_rota_file("{not json")
+        self.assertEqual(
+            main(["run", "cert-expiry", "--rota-file", path]), 2)
+
+    def test_cli_batch_records_rota_week(self):
+        path = self._write_rota_file(self._rota_data())
+        data = self._run_json(["run", "disk-full", "--seeds", "1,2",
+                               "--rota-file", path, "--rota-week", "1",
+                               "--json"])
+        self.assertEqual(data["rota_week"], 1)
+        for run in data["runs"]:
+            self.assertEqual(run["rota_week"], 1)
+            self.assertEqual(
+                run["policy"]["levels"][0]["responder"]["name"], "dave")
+
+    def test_cli_drill_pages_rota_responder(self):
+        import sys
+        path = self._write_rota_file(self._rota_data())
+        old_stdin = sys.stdin
+        sys.stdin = io.StringIO("ack 3\nmitigate 20\nresolve 12\n")
+        try:
+            data = self._run_json(
+                ["drill", "disk-full", "--rota-file", path,
+                 "--rota-week", "2", "--json"])
+        finally:
+            sys.stdin = old_stdin
+        self.assertEqual(data["rota_week"], 2)
+        self.assertEqual(
+            data["policy"]["levels"][0]["responder"]["name"], "erin")
+
+    def test_replay_round_trips_rota_week(self):
+        path = self._write_rota_file(self._rota_data())
+        data = self._run_json(["run", "cert-expiry", "--rota-file", path,
+                               "--rota-week", "1", "--json"])
+        saved = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with saved:
+            json.dump(data, saved)
+        self.addCleanup(os.unlink, saved.name)
+        loaded = load_saved(saved.name)
+        self.assertEqual(loaded.result.rota_week, 1)
+        self.assertEqual(
+            loaded.result.policy.levels[0].responder.name, "dave")
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["replay", saved.name]), 0)
+        self.assertIn("rota week: 1", buf.getvalue())
+
+    def test_replay_rejects_bad_rota_week(self):
+        data = self._run_json(["run", "cert-expiry", "--json"])
+        data["rota_week"] = -1
+        saved = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with saved:
+            json.dump(data, saved)
+        self.addCleanup(os.unlink, saved.name)
+        with self.assertRaises(ValueError):
+            load_saved(saved.name)
+
+    def test_whatif_keeps_rota_week_without_policy_swap(self):
+        path = self._write_rota_file(self._rota_data())
+        data = self._run_json(["run", "disk-full", "--rota-file", path,
+                               "--rota-week", "1", "--json"])
+        saved = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with saved:
+            json.dump(data, saved)
+        self.addCleanup(os.unlink, saved.name)
+        out = self._run_json(["what-if", saved.name, "--difficulty",
+                              "hard", "--json"])
+        self.assertEqual(out["what_if"]["rota_week"], 1)
+        self.assertEqual(
+            out["what_if"]["policy"]["levels"][0]["responder"]["name"],
+            "dave")
+
+    def test_whatif_drops_rota_week_when_policy_swapped(self):
+        path = self._write_rota_file(self._rota_data())
+        data = self._run_json(["run", "disk-full", "--rota-file", path,
+                               "--rota-week", "1", "--json"])
+        saved = tempfile.NamedTemporaryFile(
+            mode="w", suffix=".json", delete=False)
+        with saved:
+            json.dump(data, saved)
+        self.addCleanup(os.unlink, saved.name)
+        out = self._run_json(["what-if", saved.name, "--policy", "fast",
+                              "--json"])
+        self.assertIsNone(out["what_if"]["rota_week"])
+        self.assertEqual(
+            out["what_if"]["policy"]["levels"][0]["responder"]["name"],
+            "ana")
 
 
 class TestPolicyTemplates(unittest.TestCase):
@@ -4290,7 +4535,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.30.0", text)
+        self.assertIn("Generated by incident-lab 0.31.0", text)
         self.assertIn("Page 1 of 1", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -4490,7 +4735,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.30.0")
+                         "incident-lab 0.31.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")

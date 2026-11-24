@@ -5,8 +5,9 @@ in minutes: if the paged responder does not acknowledge the incident within
 that window, the incident escalates to the next level.
 """
 
+import datetime
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 
 @dataclass(frozen=True)
@@ -232,6 +233,83 @@ def _policy_from_dict(name: str, data) -> EscalationPolicy:
                 "be an integer number of minutes")
         levels.append(Level(Responder(responder_name, role), timeout))
     return EscalationPolicy(name=name, levels=tuple(levels))
+
+
+def load_rota_file(path: str) -> dict:
+    """Load an on-call rota from a JSON file.
+
+    The file is an object with a "rota" mapping, each entry a role
+    (``"primary"``, ``"secondary"``, ``"manager"``, or any role a
+    policy uses) to a non-empty list of responder names in rotation
+    order — one name per week::
+
+        {"rota": {"primary": ["ana", "dave", "erin"],
+                  "secondary": ["ben", "fay"],
+                  "manager": ["carla"]}}
+
+    Returns a dict of lowercase role -> tuple of names. Raises
+    FileNotFoundError if the file is missing,
+    json.JSONDecodeError on bad JSON, and ValueError on a wrong
+    shape or an empty rotation list.
+    """
+    with open(path, encoding="utf-8") as handle:
+        data = json.load(handle)
+    if not isinstance(data, dict):
+        raise ValueError("rota file: expected a JSON object")
+    raw_rota = data.get("rota")
+    if not isinstance(raw_rota, dict) or not raw_rota:
+        raise ValueError(
+            "rota file: 'rota' must be a non-empty object mapping "
+            "roles to lists of responder names")
+    rota = {}
+    for role, raw_names in raw_rota.items():
+        if not isinstance(role, str) or not role:
+            raise ValueError("rota file: roles must be non-empty strings")
+        if (not isinstance(raw_names, list) or not raw_names
+                or any(not isinstance(name, str) or not name
+                       for name in raw_names)):
+            raise ValueError(
+                f"rota file: role {role!r} must map to a non-empty "
+                "list of non-empty responder names")
+        rota[role.lower()] = tuple(raw_names)
+    return rota
+
+
+def current_rota_week() -> int:
+    """The current ISO calendar week number (1-53).
+
+    The default week for a rota run: whoever is on call this week
+    is whoever the rota names for this week.
+    """
+    return datetime.date.today().isocalendar()[1]
+
+
+def apply_rota(policy: EscalationPolicy, rota: dict, week: int) -> EscalationPolicy:
+    """Resolve a policy's responders from a rota for one week.
+
+    For each level whose role appears in the rota, the responder is
+    the name at position ``week % len(names)`` in that role's
+    rotation list, so the pager moves to the next person each week
+    and wraps around at the end of the list. A level whose role the
+    rota does not cover keeps its responder, and a rota entry for a
+    role no level uses changes nothing. Only the names change — the
+    roles, the order and the ack timeouts are the policy's own.
+    ``week`` must be a non-negative integer; raises ValueError
+    otherwise.
+    """
+    if isinstance(week, bool) or not isinstance(week, int) or week < 0:
+        raise ValueError(
+            f"rota week {week!r} must be a non-negative integer")
+    levels = []
+    for level in policy.levels:
+        names = rota.get(level.responder.role.lower())
+        if names is None:
+            levels.append(level)
+            continue
+        responder = Responder(names[week % len(names)],
+                              level.responder.role)
+        levels.append(replace(level, responder=responder))
+    return replace(policy, levels=tuple(levels))
 
 
 def policy_to_dict(policy: EscalationPolicy) -> dict:

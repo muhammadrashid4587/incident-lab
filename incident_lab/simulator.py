@@ -290,6 +290,10 @@ class SimulationResult:
     # Recorded in --json output; runs saved before 0.26.0 have no
     # chain and round-trip as an empty list.
     escalation_chain: list = field(default_factory=list)
+    # The rota week the run was played for, or None when no rota
+    # file was used. Recorded in --json output so a rota run can be
+    # traced back to the week whose on-call rotation it used.
+    rota_week: object = None
 
     def to_dict(self) -> dict:
         """JSON-ready dict of the whole result: incident, policy, timeline, score."""
@@ -299,6 +303,7 @@ class SimulationResult:
                        else None),
             "difficulty": (self.difficulty.name
                            if self.difficulty is not None else None),
+            "rota_week": self.rota_week,
             "hints": [hint.to_dict() for hint in self.hints],
             "escalation_chain": [
                 step.to_dict() for step in self.escalation_chain
@@ -346,6 +351,9 @@ class BatchResult:
     jitter: object = None
     # Difficulty every run in the batch was played at.
     difficulty: object = None
+    # The rota week every run in the batch was played for, or None
+    # when no rota file was used.
+    rota_week: object = None
 
     @property
     def seeds(self) -> list:
@@ -380,6 +388,7 @@ class BatchResult:
                        else None),
             "difficulty": (self.difficulty.name
                            if self.difficulty is not None else None),
+            "rota_week": self.rota_week,
             "incident": first["incident"],
             "policy": first["policy"],
             "runs": [run.to_dict() for run in self.runs],
@@ -393,6 +402,7 @@ def simulate_batch(
     seeds: list,
     jitter: object = None,
     difficulty: object = None,
+    rota_week: object = None,
 ) -> BatchResult:
     """Run one scenario against one policy once per seed.
 
@@ -404,12 +414,13 @@ def simulate_batch(
     if not seeds:
         raise ValueError("batch needs at least one seed")
     runs = [simulate(scenario, policy, seed=seed, jitter=jitter,
-                     difficulty=difficulty)
+                     difficulty=difficulty, rota_week=rota_week)
             for seed in seeds]
     first = runs[0]
     return BatchResult(first.incident, first.policy, runs,
                        jitter=first.jitter,
-                       difficulty=first.difficulty)
+                       difficulty=first.difficulty,
+                       rota_week=rota_week)
 
 
 def simulate(
@@ -420,6 +431,7 @@ def simulate(
     jitter: object = None,
     difficulty: object = None,
     hints: int = 0,
+    rota_week: object = None,
 ) -> SimulationResult:
     """Run one scenario against one policy and return the full result.
 
@@ -562,6 +574,7 @@ def simulate(
                       slo_percent=scenario.slo_percent),
                 seed=seed, jitter=jitter_range, difficulty=difficulty,
                 hints=used_hints, escalation_chain=chain,
+                rota_week=rota_week,
             )
         if t > max_duration_min:
             timeline.record(t, "unacked", "monitor", "max duration reached")
@@ -572,6 +585,7 @@ def simulate(
                       slo_percent=scenario.slo_percent),
                 seed=seed, jitter=jitter_range, difficulty=difficulty,
                 hints=used_hints, escalation_chain=chain,
+                rota_week=rota_week,
             )
 
     if rng is not None:
@@ -616,4 +630,5 @@ def simulate(
     )
     return SimulationResult(incident, policy, timeline, score, seed=seed,
                             jitter=jitter_range, difficulty=difficulty,
-                            hints=used_hints, escalation_chain=chain)
+                            hints=used_hints, escalation_chain=chain,
+                            rota_week=rota_week)

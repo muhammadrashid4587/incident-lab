@@ -244,6 +244,7 @@ def what_if(original, ack_timeout=None, ack_timeouts=None,
     scenario = _scenario_from_result(original)
     original_difficulty = original.difficulty or NORMAL
     overrides = []
+    policy_swapped = policy is not None
     if policy is not None:
         # Swap in the named policy, scaled to the original run's
         # difficulty first (see the docstring); the difficulty block
@@ -281,6 +282,12 @@ def what_if(original, ack_timeout=None, ack_timeouts=None,
                 f"{level.ack_timeout_min}m"
                 for level in policy.levels))
     replayed = simulate(scenario, policy, difficulty=replay_difficulty,
-                        hints=len(original.hints))
+                        hints=len(original.hints),
+                        # A replay under the original policy keeps the
+                        # rota week the run was played for; a swapped-in
+                        # policy has its own responders, so the week no
+                        # longer applies.
+                        rota_week=(original.rota_week
+                                   if not policy_swapped else None))
     return WhatIfResult(original=original, replayed=replayed,
                         overrides=overrides)

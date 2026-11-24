@@ -412,6 +412,13 @@ def _result_from_dict(data: dict) -> SimulationResult:
             difficulty = parse_difficulty(raw_difficulty)
         except ValueError as exc:
             raise ValueError(f"replay file: {exc}")
+    rota_week = data.get("rota_week")
+    if rota_week is not None and (isinstance(rota_week, bool)
+                                  or not isinstance(rota_week, int)
+                                  or rota_week < 0):
+        raise ValueError(
+            "replay file: 'rota_week' must be a non-negative integer "
+            "or null")
     return SimulationResult(
         incident=_incident_from_dict(data.get("incident")),
         policy=_policy_from_dict(data.get("policy")),
@@ -423,4 +430,5 @@ def _result_from_dict(data: dict) -> SimulationResult:
         hints=_hints_from_dict(data.get("hints")),
         escalation_chain=_escalation_chain_from_dict(
             data.get("escalation_chain")),
+        rota_week=rota_week,
     )

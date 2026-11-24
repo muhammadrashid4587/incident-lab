@@ -42,6 +42,8 @@ python3 -m incident_lab run disk-full --policy-file examples/custom-policy.json
 python3 -m incident_lab policy-template > my-policy.json
 python3 -m incident_lab policy-template fast --out my-fast-policy.json
 python3 -m incident_lab run disk-full --policy-file my-policy.json
+python3 -m incident_lab run disk-full --rota-file examples/rota.json
+python3 -m incident_lab run disk-full --rota-file examples/rota.json --rota-week 1
 python3 -m incident_lab run dns-outage --json > /tmp/dns-outage.json
 python3 -m incident_lab run disk-full --seed 7 --json
 python3 -m incident_lab run disk-full --seed 7 --jitter 0-3 --json
@@ -114,7 +116,9 @@ serialize as `null` (for example, an incident nobody acks has
 the `--seed` value used for the run, or `null` for an unseeded run, and the
 top-level `jitter` records the `--jitter` range as `[lo, hi]`, or `null`
 for an unseeded run. The top-level `difficulty` records the difficulty
-the run was played at (`easy`, `normal` or `hard`; see below).
+the run was played at (`easy`, `normal` or `hard`; see below), and the
+top-level `rota_week` records the rota week the run was played for,
+or `null` when no rota file was used (see On-call rota).
 
 A batch run (`--seeds`, below) prints a different JSON shape: `seeds`
 (the seed list), `jitter`, `difficulty`, the shared `incident` and
@@ -448,6 +452,45 @@ and a positive integer `ack_timeout_min`, and a policy needs at least
 one level. A missing file, bad JSON, or an invalid policy fails the run
 with exit code 2 and an error message.
 
+## On-call rota
+
+In real life the person holding the pager changes every week, and the
+simulator's fixed names (`ana`, `ben`, `carla`) are just one week's
+rotation. A rota file maps each role to a weekly rotation list of
+responder names, in rotation order — one name per week — and `run` /
+`drill` page whoever is on call for that week:
+
+```json
+{"rota": {"primary": ["ana", "dave", "erin"],
+          "secondary": ["ben", "fay"],
+          "manager": ["carla"]}}
+```
+
+```sh
+python3 -m incident_lab run disk-full --rota-file examples/rota.json
+python3 -m incident_lab run disk-full --rota-file examples/rota.json --rota-week 1
+printf 'ack 3\nmitigate 20\nresolve 12\n' | python3 -m incident_lab drill disk-full --rota-file examples/rota.json --rota-week 2
+```
+
+`--rota-week N` picks the name at position `N % len(names)` in each
+role's list, so the pager moves to the next person each week and wraps
+around at the end of the list: week 0 pages `ana`, week 1 pages `dave`,
+week 2 pages `erin`, week 3 pages `ana` again. With no `--rota-week`
+the run uses the current ISO calendar week, so the same command run
+next week pages the next person on the rotation. A role the rota does
+not cover keeps the policy's responder, and a rota entry for a role no
+level uses changes nothing — only the names change, never the roles,
+the order or the ack timeouts, so a rota run scores exactly like the
+same run without one. The week is printed in the human-readable output
+(`rota week: 1`) and recorded in the `run --json` output (top-level
+`rota_week`, `null` without a rota file), and `replay` re-prints it
+from a saved run. A `what-if` replay keeps the original run's rota
+week when it keeps the original policy, and drops it when the policy
+is swapped for a different one (whose responders are that policy's
+own). A missing file, bad JSON, an empty rotation list, or a negative
+week fails the run with exit code 2 and an error message, as does
+`--rota-week` without `--rota-file`.
+
 ## Escalation chain
 
 Every run records the escalation chain as it was actually walked, in
@@ -749,7 +792,8 @@ every run in the batch.
 
 ```
 incident_lab/
-  policy.py      escalation chain: responders, ack timeouts
+  policy.py      escalation chain: responders, ack timeouts; on-call
+                 rota files and per-week responder resolution
   incident.py    incident model
   timeline.py    append-only, time-ordered event log
   scenarios.py   built-in incident scenarios + scenario files/templates
@@ -850,6 +894,20 @@ exit code 2 and an error message. With `--json` the batch prints
 human-readable form.
 
 ## Version
+
+0.31.0 — On-call rota: `run` / `drill` take `--rota-file PATH` (a
+JSON file mapping each role to a weekly rotation list of responder
+names, see `examples/rota.json`) and `--rota-week N`, and page
+whoever is on call for that week — the name at position `N %
+len(names)` in each role's list, wrapping around, so the pager
+moves to the next person each week. With no `--rota-week` the run
+uses the current ISO calendar week. A role the rota does not cover
+keeps the policy's responder; only names change, never roles, order
+or ack timeouts, so a rota run scores like the same run without one.
+The week is printed in the human-readable output and recorded in
+`run --json` output (top-level `rota_week`, `null` without a rota
+file), `replay` re-prints it, and a `what-if` replay keeps it when
+it keeps the original policy and drops it when the policy is swapped.
 
 0.30.0 — PDF postmortem export: `postmortem <saved-run.json>
 --format pdf --out file.pdf` renders the same postmortem the HTML
@@ -990,3 +1048,4 @@ resolved instead of claiming nobody acked.
 - [x] HTML postmortem export: `postmortem <saved-run.json>` renders the debrief as a self-contained HTML page (inline CSS, no JavaScript, no external resources) with the score and grade, the timeline, a per-responder timings table from the escalation chain, the hints used with what each one cost, findings and action items with owners; a saved `what-if --json` file renders its replay with a provenance box (the overrides, the points delta and the base run's score), `--out PATH` writes the page to a file, and every string from the run is escaped (0.28.0)
 - [x] Shareable postmortem bundle: `bundle <saved-run.json>` packages the run JSON (verbatim), the HTML postmortem and a manifest with provenance (incident-lab version, incident and score, seed and difficulty, what-if overrides and points delta when the source is a what-if replay) and a SHA-256 hash of every other member into one zip, validated as it is created (hashes re-checked, `run.json` loaded back through `replay` to prove it re-imports, a failing bundle deleted); a what-if file bundles its replay as `run.json` and its base run as `base-run.json`; `bundle --check <bundle.zip>` validates a shared bundle, and the unzipped run works with `replay`, `debrief` and `postmortem` (0.29.0)
 - [x] PDF postmortem export: `postmortem <saved-run.json> --format pdf --out file.pdf` renders the same postmortem as the HTML export (score and grade, timeline, per-responder timings, hints with cost, findings and action items, what-if provenance) as a readable multi-page PDF, hand-rolled and standard library only (Letter pages, Helvetica, no embedded fonts, no new dependency), text wrapped and flowed across pages with a footer on each; `--out` is required, non-Latin-1 text folds to ASCII lookalikes, and parentheses and backslashes are escaped (0.30.0)
+- [x] On-call rota: `run` / `drill` take `--rota-file PATH` (a JSON file mapping each role to a weekly rotation list of responder names) and `--rota-week N`, and page whoever is on call for that week — the name at position `N % len(names)` per role, wrapping around; with no `--rota-week` the run uses the current ISO calendar week; a role the rota does not cover keeps the policy's responder, only names change, never roles, order or timeouts; the week is printed in the human-readable output and recorded in `run --json` (top-level `rota_week`), `replay` re-prints it, and a `what-if` replay keeps it when it keeps the original policy and drops it when the policy is swapped (0.31.0)

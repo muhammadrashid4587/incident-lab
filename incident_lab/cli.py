@@ -24,8 +24,8 @@ from .history import (
     render_all_operators, summarize_all, summarize_operator,
 )
 from .policy import (
-    POLICIES, list_policies, load_policy_file, parse_ack_timeout_overrides,
-    policy_template,
+    POLICIES, apply_rota, current_rota_week, list_policies, load_policy_file,
+    load_rota_file, parse_ack_timeout_overrides, policy_template,
 )
 from .replay import load_result, load_saved
 from .scenarios import (
@@ -118,6 +118,8 @@ def _print_result(result) -> None:
     print(f"policy:   {result.policy.name}")
     if result.difficulty is not None:
         print(f"difficulty: {result.difficulty.name}")
+    if result.rota_week is not None:
+        print(f"rota week: {result.rota_week}")
     if result.seed is not None:
         print(f"seed:     {result.seed}")
     if result.jitter is not None:
@@ -189,6 +191,8 @@ def _print_batch_result(batch) -> None:
     print(f"policy:   {batch.policy.name}")
     if batch.difficulty is not None:
         print(f"difficulty: {batch.difficulty.name}")
+    if batch.rota_week is not None:
+        print(f"rota week: {batch.rota_week}")
     print(f"seeds:    {', '.join(str(seed) for seed in batch.seeds)}")
     if batch.jitter is not None:
         print(f"jitter:   {batch.jitter[0]}-{batch.jitter[1]}m")
@@ -213,9 +217,10 @@ def _resolve_scenario_policy(args):
     ``--scenario-file``), the policy (built-in, or from
     ``--policy-file``), the difficulty scaling and the explicit ack
     timeout overrides, plus the ``--hints`` validation. Returns
-    ``(scenario, policy, difficulty)`` — ``difficulty`` is None when
-    no ``--difficulty`` was given — or None after printing the error,
-    for the caller to fail with exit code 2.
+    ``(scenario, policy, difficulty, rota_week)`` — ``difficulty``
+    is None when no ``--difficulty`` was given, and ``rota_week``
+    is None when no ``--rota-file`` was given — or None after
+    printing the error, for the caller to fail with exit code 2.
     """
     file_scenarios = {}
     if args.scenario_file is not None:
@@ -273,6 +278,35 @@ def _resolve_scenario_policy(args):
         print(f"known policies: {', '.join(policies)}",
               file=sys.stderr)
         return None
+    # A rota file resolves the policy's responders to whoever is on
+    # call for the rota week: the pager moves to the next person each
+    # week. Only the names change — the roles, order and timeouts
+    # are the policy's own.
+    rota_week = None
+    if getattr(args, "rota_week", None) is not None and \
+            getattr(args, "rota_file", None) is None:
+        print("--rota-week needs --rota-file: the week only means "
+              "something against a rota", file=sys.stderr)
+        return None
+    if getattr(args, "rota_file", None) is not None:
+        try:
+            rota = load_rota_file(args.rota_file)
+        except OSError as exc:
+            print(f"cannot read rota file: {exc}", file=sys.stderr)
+            return None
+        except json.JSONDecodeError as exc:
+            print(f"invalid rota file: {exc}", file=sys.stderr)
+            return None
+        except ValueError as exc:
+            print(f"invalid rota file: {exc}", file=sys.stderr)
+            return None
+        rota_week = (args.rota_week if args.rota_week is not None
+                     else current_rota_week())
+        try:
+            policy = apply_rota(policy, rota, rota_week)
+        except ValueError as exc:
+            print(f"invalid --rota-week: {exc}", file=sys.stderr)
+            return None
     if args.ack_timeout is not None and args.ack_timeouts is not None:
         print("use only one of --ack-timeout and --ack-timeouts",
               file=sys.stderr)
@@ -310,7 +344,7 @@ def _resolve_scenario_policy(args):
               f"{len(scenario.hints)} hint(s), asked for {args.hints}",
               file=sys.stderr)
         return None
-    return scenario, policy, difficulty
+    return scenario, policy, difficulty, rota_week
 
 
 def main(argv=None) -> int:
@@ -362,6 +396,16 @@ def main(argv=None) -> int:
                      help="load named policies from a JSON file; use one "
                           "with --policy, or the file's only policy if it "
                           "has exactly one")
+    run.add_argument("--rota-file", default=None, metavar="PATH",
+                     help="load an on-call rota from a JSON file: each "
+                          "role maps to a weekly rotation list of "
+                          "responder names, and the run pages whoever is "
+                          "on call for --rota-week (default: this week)")
+    run.add_argument("--rota-week", type=int, default=None, metavar="N",
+                     help="which week of the rota to page (0-based index "
+                          "into each role's rotation list, wrapping "
+                          "around); needs --rota-file, default: the "
+                          "current ISO calendar week")
     run.add_argument("--difficulty", default=None,
                      help="difficulty level: "
                           f"{', '.join(list_difficulties())} (or 1, 2, 3); "
@@ -416,6 +460,17 @@ def main(argv=None) -> int:
                        help="load named policies from a JSON file; use one "
                             "with --policy, or the file's only policy if it "
                             "has exactly one")
+    drill.add_argument("--rota-file", default=None, metavar="PATH",
+                       help="load an on-call rota from a JSON file: each "
+                            "role maps to a weekly rotation list of "
+                            "responder names, and the drill pages whoever "
+                            "is on call for --rota-week (default: this "
+                            "week)")
+    drill.add_argument("--rota-week", type=int, default=None, metavar="N",
+                       help="which week of the rota to page (0-based "
+                            "index into each role's rotation list, "
+                            "wrapping around); needs --rota-file, default: "
+                            "the current ISO calendar week")
     drill.add_argument("--difficulty", default=None,
                        help="difficulty level: "
                             f"{', '.join(list_difficulties())} (or 1, 2, 3); "
@@ -911,7 +966,7 @@ def main(argv=None) -> int:
         resolved = _resolve_scenario_policy(args)
         if resolved is None:
             return 2
-        scenario, policy, difficulty = resolved
+        scenario, policy, difficulty, rota_week = resolved
         if args.seed is not None and args.seeds is not None:
             print("use only one of --seed and --seeds", file=sys.stderr)
             return 2
@@ -936,14 +991,16 @@ def main(argv=None) -> int:
                 print(f"invalid --seeds: {exc}", file=sys.stderr)
                 return 2
             batch = simulate_batch(scenario, policy, seeds, jitter=jitter,
-                                   difficulty=difficulty)
+                                   difficulty=difficulty,
+                                   rota_week=rota_week)
             if args.json:
                 print(json.dumps(batch.to_dict(), indent=2))
             else:
                 _print_batch_result(batch)
             return 0
         result = simulate(scenario, policy, seed=args.seed, jitter=jitter,
-                          difficulty=difficulty, hints=args.hints)
+                          difficulty=difficulty, hints=args.hints,
+                          rota_week=rota_week)
         if args.json:
             print(json.dumps(result.to_dict(), indent=2))
         else:
@@ -961,7 +1018,7 @@ def main(argv=None) -> int:
         resolved = _resolve_scenario_policy(args)
         if resolved is None:
             return 2
-        scenario, policy, difficulty = resolved
+        scenario, policy, difficulty, rota_week = resolved
         input_stream = sys.stdin
         input_file = None
         if args.input is not None:
@@ -975,7 +1032,8 @@ def main(argv=None) -> int:
         try:
             result = run_drill(scenario, policy, difficulty=difficulty,
                                hints=args.hints,
-                               input_stream=input_stream)
+                               input_stream=input_stream,
+                               rota_week=rota_week)
         except ValueError as exc:
             print(f"invalid drill: {exc}", file=sys.stderr)
             return 2
