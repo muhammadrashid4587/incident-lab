@@ -551,13 +551,28 @@ SCENARIOS = {
             "on another incident bridge and acks 2m late against the "
             "sev1 policy's 3m window, then rolls the rotation back "
             "while the impact grows from saved-card checkouts failing "
-            "to payments blocked."
+            "to payments blocked. Confirming the rollback costs more "
+            "the farther the region: workers in us-east pick up the "
+            "restored key in 2m, us-west in 4m, and eu-west — where "
+            "workers cache the key version longest — in 8m, so the "
+            "last saved-card test payment only decrypts once the key "
+            "has crossed the Atlantic."
         ),
         ack_delay_min=(5,),
         mitigate_delay_min=35,
         resolve_delay_min=20,
         slo_percent=99.95,
         regions=("us-east", "us-west", "eu-west"),
+        # Verifying the rollback is not the same price everywhere:
+        # a saved-card test payment decrypts in 2m in us-east, where
+        # workers pick up the restored key almost at once, in 4m in
+        # us-west, and in 8m in eu-west, where workers cache the key
+        # version longest. The total is 14m, 5m more than the 3m
+        # default, so the verified run scores 27/100 where the
+        # default-cost run scored 28.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 4, "eu-west": 8,
+        },
         hints=(
             "Roll back the key rotation first: the old key still "
             "decrypts the stored tokens, and a rollback is faster "

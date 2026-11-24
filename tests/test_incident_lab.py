@@ -5498,7 +5498,11 @@ class TestKeyRotationScenario(unittest.TestCase):
     policy with a late ack by the first level: no miss, no escalation,
     but the late ack keeps only a third of the score, and the chain
     records the first impact stage while the stages spell out the
-    token-decryption failure spreading.
+    token-decryption failure spreading. Verifying the rollback is
+    not the same price everywhere: the new key reaches us-east in
+    2m, us-west in 4m and eu-west in 8m, so the verified run costs
+    14m of checks and scores 27/100 where the default-cost run
+    scored 28.
     """
 
     def test_key_rotation_scenario(self):
@@ -5507,8 +5511,86 @@ class TestKeyRotationScenario(unittest.TestCase):
         self.assertEqual(scenario.service, "payments-tokens")
         self.assertEqual(scenario.ack_delay_min, (5,))
         self.assertEqual(scenario.slo_percent, 99.95)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 4, "eu-west": 8})
+        self.assertEqual(scenario.verify_delay_min_total(), 14)
         self.assertEqual(len(scenario.impact_stages), 3)
         self.assertEqual(len(scenario.hints), 3)
+
+    def test_verified_per_region_costs_key_rotation(self):
+        result = simulate(get("key-rotation"), get_policy("sev1"),
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(result.score.verify_delay_min, 14)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 4, "eu-west": 8})
+        # The on-call acks at 5m, so the checks land at 7m, 11m and
+        # 19m: the 8m eu-west check is what pushes mitigation to 54m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(7, "us-east"), (11, "us-west"), (19, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (2m)",
+             "fix confirmed in us-west (4m)",
+             "fix confirmed in eu-west (8m)"])
+        self.assertEqual(score.time_to_mitigate_min, 54)
+        self.assertEqual(score.time_to_resolve_min, 74)
+        # 100 - 19 (54m to mitigate past the 15m grace, halved)
+        # = 81, scaled by the 1/3 ack credit: round(81 / 3) = 27 —
+        # one point below the 28 the 3m-default costs scored.
+        self.assertEqual(score.points, 27)
+        self.assertEqual(score.downtime_min, 54)
+        self.assertEqual(score.error_budget_burn_pct, 250.0)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 2m, us-west 4m, eu-west 8m, +14m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 2, "us-west": 4, "eu-west": 8})
+
+    def test_what_if_turning_verification_on_costs_two_points(self):
+        base = simulate(get("key-rotation"), get_policy("sev1"))
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 27)
+        self.assertEqual(outcome.points_delta, -2)
+
+    def test_drill_matches_run_with_per_region_costs(self):
+        drill = run_drill(
+            get("key-rotation"), get_policy("sev1"),
+            input_stream=io.StringIO(
+                "ack 5\nmitigate 35\nresolve 20\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("key-rotation"), get_policy("sev1"),
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 27)
+
+    def test_shift_with_per_region_costs(self):
+        shift = simulate_shift(
+            [get("key-rotation")], DEFAULT_POLICY,
+            slo_percent=99.95, purge_verification="per-region")
+        self.assertEqual([run.score.points for run in shift.runs], [81])
+        self.assertEqual(shift.total_burn_pct, 250.0)
+
+    def test_cli_run_shows_per_region_breakdown(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "key-rotation", "--policy", "sev1",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     14m "
+            "(us-east 2m, us-west 4m, eu-west 8m)", out)
+        self.assertIn("27/100", out)
 
     def test_late_ack_on_sev1_keeps_a_third_of_the_score(self):
         result = simulate(get("key-rotation"), get_policy("sev1"))
@@ -5560,6 +5642,10 @@ class TestKeyRotationScenario(unittest.TestCase):
     def test_template_round_trips_key_rotation(self):
         data = scenario_to_dict(get("key-rotation"))
         self.assertEqual(data["ack_delay_min"], [5])
+        self.assertEqual(data["regions"],
+                         ["us-east", "us-west", "eu-west"])
+        self.assertEqual(data["verify_delay_min_by_region"],
+                         {"us-east": 2, "us-west": 4, "eu-west": 8})
         handle = tempfile.NamedTemporaryFile(
             "w", suffix=".json", delete=False, encoding="utf-8")
         with handle:
@@ -6080,7 +6166,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.45.0", text)
+        self.assertIn("Generated by incident-lab 0.46.0", text)
         self.assertIn("Page 1 of 1", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -6280,7 +6366,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.45.0")
+                         "incident-lab 0.46.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -6941,7 +7027,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.45.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.46.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
