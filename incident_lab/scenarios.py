@@ -870,6 +870,71 @@ SCENARIOS = {
             "poisoned entries, orders placed at the wrong amount",
         ),
     ),
+    "webhook-outage": Scenario(
+        name="webhook-outage",
+        service="webhooks-outbound",
+        title="Webhook provider down, outbound event deliveries failing",
+        severity="critical",
+        description=(
+            "The third-party webhook provider went down, so outbound "
+            "event deliveries are failing and queueing up: order "
+            "confirmations, shipping updates and payment receipts "
+            "never reach the customers who subscribed to them, and "
+            "the retries back off while the queue grows. The "
+            "primary's page is buried under a storm of "
+            "delivery-failure alerts, so they miss; the secondary "
+            "acks 1m late, then fails over to the backup provider "
+            "and drains the queued events while the impact grows "
+            "from deliveries failing to customers missing events. "
+            "The fix is only real once a test webhook actually "
+            "delivers in every region: the provider's gateway "
+            "recovers first in us-east, where the queue is "
+            "shallowest, in 3m; us-west takes 5m, where the backlog "
+            "of queued events has to drain before a fresh test "
+            "delivery is accepted; and eu-west takes 8m, where the "
+            "provider's EU endpoint comes back last and each queued "
+            "payload has to be re-signed before it can be delivered."
+        ),
+        ack_delay_min=(None, 6),
+        mitigate_delay_min=35,
+        resolve_delay_min=20,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test webhook delivers in 3m in us-east, where the
+        # provider's gateway recovers first and the queue is
+        # shallowest, in 5m in us-west, where the backlog of queued
+        # events has to drain before a fresh test delivery is
+        # accepted, and in 8m in eu-west, where the provider's EU
+        # endpoint comes back last and each queued payload has to
+        # be re-signed before it can be delivered. The total is
+        # 16m, 7m more than the 3m default, so the verified run
+        # scores 45/100 where the default-cost run scored 47.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 5, "eu-west": 8,
+        },
+        hints=(
+            "Check the webhook provider's status first: deliveries "
+            "failing everywhere at once is the provider, not your "
+            "queue — and fail over to the backup provider before "
+            "digging into the retries.",
+            "Drain the queued events after the failover: the queue "
+            "holds deliveries customers are still waiting on, and "
+            "re-enabling delivery with a full queue just restarts "
+            "the backlog.",
+            "Verify a test webhook actually delivers in every region "
+            "before declaring the incident mitigated; a gateway "
+            "still draining its backlog will drop it, and eu-west "
+            "re-signs every queued payload before delivery.",
+        ),
+        impact_stages=(
+            "Deliveries failing: outbound webhooks erroring, events "
+            "queueing up instead of reaching subscribers",
+            "Customers missing events: order confirmations and "
+            "shipping updates never delivered, support tickets "
+            "rising",
+        ),
+    ),
 }
 
 
