@@ -817,6 +817,59 @@ SCENARIOS = {
             "revenue stopped",
         ),
     ),
+    "cache-poisoning": Scenario(
+        name="cache-poisoning",
+        service="storefront-cache",
+        title="Cache poisoning serves stale prices across stores",
+        severity="critical",
+        description=(
+            "A deploy to the pricing service starts writing cache "
+            "entries with a key format that drops the tenant segment, "
+            "so entries collide across stores: shoppers see another "
+            "store's prices and cart contents. The primary's page is "
+            "buried under a storm of cache-eviction alerts, so they "
+            "miss; the secondary acks 2m late, then flushes the "
+            "poisoned keyspace and re-warms the cache while the impact "
+            "grows from stale prices to wrong charges at checkout. "
+            "The fix is only real once a test request returns fresh "
+            "prices in every region: the flush propagates in 4m in "
+            "us-east, 6m in us-west and 9m in eu-west, where edge "
+            "caches hold the poisoned entries longest on their TTLs."
+        ),
+        ack_delay_min=(None, 7),
+        mitigate_delay_min=30,
+        resolve_delay_min=15,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test request returns fresh prices in 4m in us-east, 6m
+        # in us-west and 9m in eu-west, where edge caches hold the
+        # poisoned entries longest on their TTLs. The total is 19m,
+        # 10m more than the 3m default, so the verified run scores
+        # 33/100 where the default-cost run scored 36.
+        verify_delay_min_by_region={
+            "us-east": 4, "us-west": 6, "eu-west": 9,
+        },
+        hints=(
+            "Check the cache keys first: entries written after the "
+            "deploy that are missing the tenant segment are the "
+            "poison — a key collision looks like stale data, not a "
+            "cache outage.",
+            "Flush the poisoned keyspace before re-warming: "
+            "re-warming over poisoned entries just re-serves them, "
+            "and flush the whole prefix, not one key.",
+            "Verify a test request returns fresh prices in every "
+            "region before declaring the incident mitigated; edge "
+            "caches in eu-west hold the poisoned entries longest on "
+            "their TTLs.",
+        ),
+        impact_stages=(
+            "Stale prices served: product pages showing pre-change "
+            "prices, customers seeing the wrong amounts",
+            "Checkout charging wrong prices: carts priced from "
+            "poisoned entries, orders placed at the wrong amount",
+        ),
+    ),
 }
 
 
