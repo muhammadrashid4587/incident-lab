@@ -220,12 +220,30 @@ SCENARIOS = {
         severity="critical",
         description=(
             "Error rate jumped to 18% right after a deploy. Both on-call "
-            "engineers miss the page; the manager picks it up."
+            "engineers miss the page; the manager picks it up. The "
+            "rollback is only real once the old version is actually "
+            "serving in every region: a canary search query on the "
+            "rolled-back version returns good results in 3m in us-east, "
+            "where the search fleet is smallest and the rollback lands "
+            "fastest, 5m in us-west and 8m in eu-west, where the search "
+            "nodes hold the bad version longest before they pick up the "
+            "rollback."
         ),
         ack_delay_min=(None, None, 6),
         mitigate_delay_min=45,
         resolve_delay_min=30,
         slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the rollback is not the same price everywhere: a
+        # canary search query on the rolled-back version returns good
+        # results in 3m in us-east, 5m in us-west and 8m in eu-west,
+        # where the search nodes hold the bad version longest before
+        # picking up the rollback. The total is 16m, 7m more than the
+        # 3m default, so the verified run scores 28/100 where the
+        # default-cost run scored 32.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 5, "eu-west": 8,
+        },
         hints=(
             "Roll back the deploy first: an 18% error rate starting "
             "right after a deploy is the deploy until proven otherwise.",
@@ -233,6 +251,9 @@ SCENARIOS = {
             "errors, the rollback will confirm it.",
             "Freeze further deploys until the bad one is out; a second "
             "deploy on top of a regression hides the cause.",
+            "Verify the rollback actually took in every region before "
+            "declaring the incident mitigated; eu-west search nodes "
+            "hold the bad version longest.",
         ),
     ),
     "queue-backlog": Scenario(

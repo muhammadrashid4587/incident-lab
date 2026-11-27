@@ -3370,7 +3370,7 @@ class TestPurgeVerification(unittest.TestCase):
 
     def test_per_region_needs_regions(self):
         with self.assertRaises(ValueError):
-            simulate(get("deploy-regression"), DEFAULT_POLICY,
+            simulate(get("queue-backlog"), DEFAULT_POLICY,
                      purge_verification="per-region")
         with self.assertRaises(ValueError):
             simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
@@ -3444,7 +3444,7 @@ class TestPurgeVerification(unittest.TestCase):
         self.assertEqual(outcome.replayed.to_dict(), base.to_dict())
 
     def test_what_if_verification_needs_regions(self):
-        base = simulate(get("deploy-regression"), DEFAULT_POLICY)
+        base = simulate(get("queue-backlog"), DEFAULT_POLICY)
         with self.assertRaises(ValueError):
             what_if(base, purge_verification="per-region")
         # A run saved before regions existed has none either.
@@ -3476,7 +3476,7 @@ class TestPurgeVerification(unittest.TestCase):
         err = io.StringIO()
         with redirect_stderr(err):
             self.assertEqual(main([
-                "run", "deploy-regression", "--verify-purge", "per-region"]), 2)
+                "run", "queue-backlog", "--verify-purge", "per-region"]), 2)
         self.assertIn("no regions to verify", err.getvalue())
 
     def test_cli_run_bad_verification_value_fails(self):
@@ -3584,7 +3584,7 @@ class TestPurgeVerification(unittest.TestCase):
     def test_shift_verification_needs_regions_for_every_incident(self):
         with self.assertRaises(ValueError):
             simulate_shift(
-                [get("cdn-purge-failure"), get("deploy-regression")],
+                [get("cdn-purge-failure"), get("queue-backlog")],
                 DEFAULT_POLICY, slo_percent=99.5,
                 purge_verification="per-region")
 
@@ -5636,6 +5636,108 @@ class TestCertExpiryPerRegionCosts(unittest.TestCase):
             "verify delay:     13m "
             "(us-east 2m, us-west 4m, eu-west 7m)", out)
         self.assertIn("96/100", out)
+
+
+class TestDeployRegressionPerRegionCosts(unittest.TestCase):
+    """deploy-regression: per-region verification costs for the rollback.
+
+    The rolled-back version must actually be serving in every region
+    before the incident counts as mitigated, and the check is slowest
+    where the search nodes hold the bad version longest — 3m in
+    us-east, 5m in us-west and 8m in eu-west — so the verified run
+    costs 7m more than the 3m default and scores 28/100 where the
+    default-cost run scored 32.
+    """
+
+    def test_deploy_regression_scenario(self):
+        scenario = get("deploy-regression")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "search-api")
+        self.assertEqual(scenario.ack_delay_min, (None, None, 6))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 8})
+        self.assertEqual(scenario.verify_delay_min_total(), 16)
+        self.assertGreaterEqual(len(scenario.hints), 1)
+
+    def test_verified_per_region_costs_deploy_regression(self):
+        result = simulate(get("deploy-regression"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(result.score.verify_delay_min, 16)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 8})
+        # The manager acks at 16m, so the checks land at 19m, 24m
+        # and 32m: the 8m eu-west check is what pushes
+        # mitigation to 77m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(19, "us-east"), (24, "us-west"), (32, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in us-west (5m)",
+             "fix confirmed in eu-west (8m)"])
+        self.assertEqual(score.time_to_mitigate_min, 77)
+        self.assertEqual(score.time_to_resolve_min, 107)
+        # 100 - 30 (two escalations) - 11 (16m to ack past the 5m
+        # grace) - 31 (77m to mitigate past the 15m grace, halved)
+        # = 28, four points below the 32 the 3m-default costs
+        # scored.
+        self.assertEqual(score.points, 28)
+        self.assertEqual(score.downtime_min, 77)
+        self.assertEqual(score.error_budget_burn_pct, 178.2)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 3m, us-west 5m, eu-west 8m, +16m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 3, "us-west": 5, "eu-west": 8})
+
+    def test_what_if_turning_verification_on_costs_eight_points(self):
+        base = simulate(get("deploy-regression"),
+                        DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 28)
+        self.assertEqual(outcome.points_delta, -8)
+
+    def test_drill_matches_run_with_per_region_costs(self):
+        drill = run_drill(
+            get("deploy-regression"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "wait\nwait\nack 6\nmitigate 45\nresolve 30\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("deploy-regression"),
+                       DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 28)
+
+    def test_shift_with_per_region_costs(self):
+        shift = simulate_shift(
+            [get("deploy-regression")], DEFAULT_POLICY,
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual([run.score.points for run in shift.runs], [28])
+        self.assertEqual(shift.total_burn_pct, 178.2)
+
+    def test_cli_run_shows_per_region_breakdown(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "deploy-regression",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     16m "
+            "(us-east 3m, us-west 5m, eu-west 8m)", out)
+        self.assertIn("28/100", out)
 
 
 class TestNetworkPartitionPerRegionCosts(unittest.TestCase):
@@ -10006,7 +10108,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.71.0", text)
+        self.assertIn("Generated by incident-lab 0.72.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -10209,7 +10311,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.71.0")
+                         "incident-lab 0.72.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -10870,7 +10972,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.71.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.72.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
