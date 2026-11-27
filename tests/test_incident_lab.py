@@ -1905,8 +1905,11 @@ class TestDebrief(unittest.TestCase):
         self.assertEqual(data["summary"]["escalations"], 1)
         # latency-spike: 44m of downtime against a 99.95% SLO (21.6m
         # monthly budget) burns 203.7% of the budget, so the debrief
-        # adds a third action item about the SLO and the response.
-        self.assertEqual(len(data["action_items"]), 3)
+        # adds an action item about the SLO and the response — and
+        # the unverified run of a scenario with regions adds one
+        # more, to verify the fix per region next time, for four
+        # in total.
+        self.assertEqual(len(data["action_items"]), 4)
         self.assertEqual(data["action_items"][0]["owner"], "ana")
         self.assertEqual(data["summary"]["slo_percent"], 99.95)
         self.assertEqual(data["summary"]["downtime_min"], 44)
@@ -3343,7 +3346,7 @@ class TestPurgeVerification(unittest.TestCase):
 
     def test_per_region_needs_regions(self):
         with self.assertRaises(ValueError):
-            simulate(get("latency-spike"), DEFAULT_POLICY,
+            simulate(get("cert-expiry"), DEFAULT_POLICY,
                      purge_verification="per-region")
         with self.assertRaises(ValueError):
             simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
@@ -3417,7 +3420,7 @@ class TestPurgeVerification(unittest.TestCase):
         self.assertEqual(outcome.replayed.to_dict(), base.to_dict())
 
     def test_what_if_verification_needs_regions(self):
-        base = simulate(get("latency-spike"), DEFAULT_POLICY)
+        base = simulate(get("cert-expiry"), DEFAULT_POLICY)
         with self.assertRaises(ValueError):
             what_if(base, purge_verification="per-region")
         # A run saved before regions existed has none either.
@@ -3449,7 +3452,7 @@ class TestPurgeVerification(unittest.TestCase):
         err = io.StringIO()
         with redirect_stderr(err):
             self.assertEqual(main([
-                "run", "latency-spike", "--verify-purge", "per-region"]), 2)
+                "run", "cert-expiry", "--verify-purge", "per-region"]), 2)
         self.assertIn("no regions to verify", err.getvalue())
 
     def test_cli_run_bad_verification_value_fails(self):
@@ -3557,7 +3560,7 @@ class TestPurgeVerification(unittest.TestCase):
     def test_shift_verification_needs_regions_for_every_incident(self):
         with self.assertRaises(ValueError):
             simulate_shift(
-                [get("cdn-purge-failure"), get("latency-spike")],
+                [get("cdn-purge-failure"), get("cert-expiry")],
                 DEFAULT_POLICY, slo_percent=99.5,
                 purge_verification="per-region")
 
@@ -5405,6 +5408,109 @@ class TestPaymentsOutagePerRegionCosts(unittest.TestCase):
             "verify delay:     22m "
             "(us-east 4m, us-west 7m, eu-west 11m)", out)
         self.assertIn("26/100", out)
+
+
+class TestLatencySpikePerRegionCosts(unittest.TestCase):
+    """latency-spike: per-region verification costs for the fix.
+
+    A canary checkout must complete inside the p99 threshold in
+    every region before the incident counts as mitigated, and the
+    check is slowest where the slow downstream dependency takes
+    longest to drain its backlog — 3m in us-east, 6m in us-west
+    and 10m in eu-west — so the verified run costs 10m more than
+    the 3m default and scores 57/100 where the default-cost run
+    scored 62.
+    """
+
+    def test_latency_spike_scenario(self):
+        scenario = get("latency-spike")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "checkout-api")
+        self.assertEqual(scenario.ack_delay_min, (None, 4, None))
+        self.assertEqual(scenario.slo_percent, 99.95)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 6, "eu-west": 10})
+        self.assertEqual(scenario.verify_delay_min_total(), 19)
+        self.assertGreaterEqual(len(scenario.hints), 1)
+
+    def test_verified_per_region_costs_latency_spike(self):
+        result = simulate(get("latency-spike"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(result.score.verify_delay_min, 19)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 6, "eu-west": 10})
+        # The secondary acks at 9m, so the checks land at 12m,
+        # 18m and 28m: the 10m eu-west check is what pushes
+        # mitigation to 63m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(12, "us-east"), (18, "us-west"), (28, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in us-west (6m)",
+             "fix confirmed in eu-west (10m)"])
+        self.assertEqual(score.time_to_mitigate_min, 63)
+        self.assertEqual(score.time_to_resolve_min, 83)
+        # 100 - 15 (one escalation) - 4 (9m to ack past the 5m
+        # grace) - 24 (63m to mitigate past the 15m grace, halved)
+        # = 57, five points below the 62 the 3m-default costs
+        # scored.
+        self.assertEqual(score.points, 57)
+        self.assertEqual(score.downtime_min, 63)
+        self.assertEqual(score.error_budget_burn_pct, 291.7)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 3m, us-west 6m, eu-west 10m, +19m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 3, "us-west": 6, "eu-west": 10})
+
+    def test_what_if_turning_verification_on_costs_ten_points(self):
+        base = simulate(get("latency-spike"),
+                        DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 57)
+        self.assertEqual(outcome.points_delta, -10)
+
+    def test_drill_matches_run_with_per_region_costs(self):
+        drill = run_drill(
+            get("latency-spike"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "wait\nack 4\nmitigate 35\nresolve 20\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("latency-spike"),
+                       DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 57)
+
+    def test_shift_with_per_region_costs(self):
+        shift = simulate_shift(
+            [get("latency-spike")], DEFAULT_POLICY,
+            slo_percent=99.95, purge_verification="per-region")
+        self.assertEqual([run.score.points for run in shift.runs], [57])
+        self.assertEqual(shift.total_burn_pct, 291.7)
+
+    def test_cli_run_shows_per_region_breakdown(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "latency-spike",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     19m "
+            "(us-east 3m, us-west 6m, eu-west 10m)", out)
+        self.assertIn("57/100", out)
 
 
 class TestNetworkPartitionPerRegionCosts(unittest.TestCase):
@@ -9775,7 +9881,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.69.0", text)
+        self.assertIn("Generated by incident-lab 0.70.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -9978,7 +10084,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.69.0")
+                         "incident-lab 0.70.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -10639,7 +10745,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.69.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.70.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

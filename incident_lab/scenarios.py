@@ -151,6 +151,20 @@ SCENARIOS = {
         mitigate_delay_min=35,
         resolve_delay_min=20,
         slo_percent=99.95,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # canary checkout has to complete inside the p99 threshold
+        # in every region before the incident counts as mitigated
+        # — 3m in us-east, where the checkout fleet is smallest
+        # and the canary clears fastest, 6m in us-west and 10m in
+        # eu-west, where the slow downstream dependency takes
+        # longest to drain its backlog before a clean checkout can
+        # be measured. The total is 19m, 10m more than the 3m
+        # default, so the verified run scores 57/100 where the
+        # default-cost run scored 62.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 6, "eu-west": 10,
+        },
         hints=(
             "Check the downstream dependency first: a latency spike "
             "with no deploys is usually a slow database or queue.",
