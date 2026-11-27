@@ -1047,6 +1047,65 @@ SCENARIOS = {
             "orders backing up while the team fails over",
         ),
     ),
+    "vault-outage": Scenario(
+        name="vault-outage",
+        service="secrets-vault",
+        title="Secrets manager down, services cannot fetch secrets",
+        severity="critical",
+        description=(
+            "The secrets manager is down after its storage backend "
+            "lost quorum: every secret fetch errors, so any service "
+            "that restarts crash-loops on startup and no deploy can "
+            "ship. The team has to fail over to the secondary vault "
+            "cluster — and stop restarting services until it is up, "
+            "because a restart while Vault is down turns a running "
+            "service into a crash-looping one. The primary's page is "
+            "buried under a storm of crash-loop alerts, so they "
+            "miss; the secondary is in the storage-backend review "
+            "and misses too; the manager is in an incident-review "
+            "meeting, phone on silent, and acks 3m late against the "
+            "fast policy's 5m window, then starts the failover while "
+            "the impact grows from secret fetches failing to "
+            "services restarting without secrets. The fix is only "
+            "real once a test secret actually fetches in every "
+            "region: the replica lags in 2m in us-east, 5m in "
+            "us-west and 9m in eu-west, where it lags the primary "
+            "longest."
+        ),
+        ack_delay_min=(None, None, 8),
+        mitigate_delay_min=30,
+        resolve_delay_min=20,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test secret fetches in 2m in us-east, 5m in us-west and
+        # 9m in eu-west, where the replica lags the primary
+        # longest. The total is 16m, 7m more than the 3m default,
+        # so the verified run scores 17/100 where the
+        # default-cost run scored 18.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 5, "eu-west": 9,
+        },
+        hints=(
+            "Fail over to the secondary vault cluster first: "
+            "nothing can start until secret fetches work again, "
+            "and every restart without secrets crash-loops.",
+            "Stop the deploy pipeline and freeze restarts while "
+            "Vault is down: a restart turns a running service "
+            "into a crash-looping one.",
+            "Verify a test secret actually fetches in every region "
+            "before declaring the incident mitigated; the eu-west "
+            "replica lags the primary longest.",
+        ),
+        impact_stages=(
+            "Secret fetches failing: new pods crash-looping on "
+            "startup, deploys blocked",
+            "Services restarting without secrets: checkout and "
+            "payments shedding traffic",
+            "Vault failover in progress: secondary cluster "
+            "catching up, leases expiring",
+        ),
+    ),
 }
 
 

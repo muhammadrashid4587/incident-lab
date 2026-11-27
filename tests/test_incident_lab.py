@@ -6845,6 +6845,187 @@ class TestPaymentProcessorOutageScenario(unittest.TestCase):
         self.assertIn("34/100", out)
 
 
+class TestVaultOutageScenario(unittest.TestCase):
+    """vault-outage: the secrets manager goes down, so services
+    cannot fetch secrets and any restart crash-loops.
+
+    The primary's page is buried under crash-loop alerts, so they
+    miss; the secondary is in the storage-backend review and misses
+    too; the manager acks 3m late against the fast policy's 5m
+    window, so the late ack keeps only 40% of the score — the
+    first built-in run exercising two misses with a late ack on the
+    fast policy. Without verification the incident mitigates in 42m
+    and scores 20; verifying the fix in every region costs 16m — a
+    test secret fetches in 2m in us-east, 5m in us-west and 9m in
+    eu-west, where the replica lags the primary longest — so
+    mitigation lands at 58m and the score drops to 17, 1 point
+    below the 18 the 3m-default costs scored.
+    """
+
+    def test_vault_outage_scenario(self):
+        scenario = get("vault-outage")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "secrets-vault")
+        self.assertEqual(scenario.ack_delay_min, (None, None, 8))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 5, "eu-west": 9})
+        self.assertEqual(scenario.verify_delay_min_total(), 16)
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_unverified_scores_20_with_40_percent_ack_credit(self):
+        result = simulate(get("vault-outage"), get_policy("fast"))
+        score = result.score
+        # Fast timeouts 2m, 2m, 5m: the primary misses at 2m, the
+        # secondary misses at 4m, and the manager acks 8m after
+        # being paged, at 12m — 3m late against the 5m timeout.
+        self.assertEqual(score.time_to_ack_min, 12)
+        self.assertEqual(score.time_to_mitigate_min, 42)
+        self.assertEqual(score.time_to_resolve_min, 62)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 2)
+        self.assertEqual(score.ack_late_min, 3)
+        self.assertAlmostEqual(score.ack_credit, 0.4)
+        self.assertEqual(score.verify_delay_min, 0)
+        # 100 - 30 (two escalations) - 7 (12m to ack past the 5m
+        # grace) - 13 (42m to mitigate past the 15m grace, halved)
+        # = 50, and the 3m-late ack keeps 40% of it: 50 x 0.4 =
+        # 20.
+        self.assertEqual(score.points, 20)
+        # Downtime 42m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 42)
+        self.assertEqual(score.error_budget_burn_pct, 97.2)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 3)
+        self.assertEqual([step.outcome for step in chain],
+                         ["missed", "missed", "acked"])
+        self.assertEqual([step.paged_at_min for step in chain],
+                         [0, 2, 4])
+        self.assertEqual(
+            [step.impact for step in chain],
+            list(get("vault-outage").impact_stages))
+
+    def test_verified_per_region_scores_17(self):
+        result = simulate(get("vault-outage"), get_policy("fast"),
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(score.verify_delay_min, 16)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 5, "eu-west": 9})
+        # The manager acks at 12m, so the checks land at 14m,
+        # 19m and 28m: the 9m eu-west check is what pushes
+        # mitigation to 58m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(14, "us-east"), (19, "us-west"), (28, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (2m)",
+             "fix confirmed in us-west (5m)",
+             "fix confirmed in eu-west (9m)"])
+        self.assertEqual(score.time_to_mitigate_min, 58)
+        self.assertEqual(score.time_to_resolve_min, 78)
+        # 100 - 30 (two escalations) - 7 (12m to ack past the 5m
+        # grace) - 21 (58m to mitigate past the 15m grace, halved)
+        # = 42, and the 3m-late ack keeps 40% of it: 42 x 0.4 =
+        # 16.8, rounded to 17 — one point below the 18 the
+        # 3m-default costs scored.
+        self.assertEqual(score.points, 17)
+        self.assertEqual(score.downtime_min, 58)
+        self.assertEqual(score.error_budget_burn_pct, 134.3)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 2m, us-west 5m, eu-west 9m, +16m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 2, "us-west": 5, "eu-west": 9})
+
+    def test_what_if_turning_verification_on_costs_three_points(self):
+        base = simulate(get("vault-outage"), get_policy("fast"))
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 17)
+        self.assertEqual(outcome.points_delta, -3)
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("vault-outage"), get_policy("fast"),
+            input_stream=io.StringIO(
+                "wait\nwait\nack 8\nmitigate 30\nresolve 20\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("vault-outage"), get_policy("fast"),
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 17)
+        plain_drill = run_drill(
+            get("vault-outage"), get_policy("fast"),
+            input_stream=io.StringIO(
+                "wait\nwait\nack 8\nmitigate 30\nresolve 20\n"),
+            prompt_stream=io.StringIO())
+        plain_run = simulate(get("vault-outage"), get_policy("fast"))
+        self.assertEqual(plain_drill.to_dict(), plain_run.to_dict())
+        self.assertEqual(plain_drill.score.points, 20)
+
+    def test_template_round_trips_vault_outage(self):
+        data = scenario_to_dict(get("vault-outage"))
+        self.assertEqual(data["ack_delay_min"], [None, None, 8])
+        self.assertEqual(data["regions"],
+                         ["us-east", "us-west", "eu-west"])
+        self.assertEqual(data["verify_delay_min_by_region"],
+                         {"us-east": 2, "us-west": 5, "eu-west": 9})
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"vault-outage": data}},
+                      handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["vault-outage"],
+                         get("vault-outage"))
+
+    def test_shift_runs_vault_outage_like_a_run(self):
+        # vault-outage burns 97.2% of the budget, so a shift that
+        # schedules it first still runs disk-full — but the two
+        # together burn 150.5%, exhausting the budget.
+        shift = simulate_shift(
+            [get("vault-outage"), get("disk-full")],
+            get_policy("fast"), slo_percent=99.9)
+        self.assertEqual(
+            [run.score.points for run in shift.runs], [20, 48])
+        self.assertTrue(shift.budget_exhausted)
+        self.assertEqual(shift.skipped, [])
+        self.assertEqual(shift.total_burn_pct, 150.5)
+        verified = simulate_shift(
+            [get("vault-outage")], get_policy("fast"),
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual(
+            [run.score.points for run in verified.runs], [17])
+        self.assertEqual(verified.total_burn_pct, 134.3)
+
+    def test_cli_runs_vault_outage_fast(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "vault-outage", "--policy", "fast"]), 0)
+        self.assertIn("20/100", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "vault-outage", "--policy", "fast",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     16m "
+            "(us-east 2m, us-west 5m, eu-west 9m)", out)
+        self.assertIn("17/100", out)
+
+
 class TestKeyRotationScenario(unittest.TestCase):
     """key-rotation: a KMS key rotation breaks saved-card decryption.
 
@@ -7609,7 +7790,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.57.0", text)
+        self.assertIn("Generated by incident-lab 0.58.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -7812,7 +7993,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.57.0")
+                         "incident-lab 0.58.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -8473,7 +8654,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.57.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.58.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
