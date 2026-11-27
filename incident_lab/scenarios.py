@@ -935,6 +935,63 @@ SCENARIOS = {
             "rising",
         ),
     ),
+    "feature-flag-misfire": Scenario(
+        name="feature-flag-misfire",
+        service="checkout-flags",
+        title="Feature flag misfire enables unfinished checkout for everyone",
+        severity="critical",
+        description=(
+            "A feature-flag rollout meant to enable the new checkout "
+            "for 5% of users instead enables it for everyone: the "
+            "flag evaluation service misreads the rollout percentage "
+            "after a bad deploy, so every shopper lands on the "
+            "unfinished checkout, which errors on payment and drops "
+            "carts. The primary's page is buried under a storm of "
+            "flag-evaluation error alerts, so they miss; the "
+            "secondary acks in 4m, on time, then kills the flag and "
+            "rolls the evaluation service back while the impact "
+            "grows from shoppers hitting the unfinished checkout to "
+            "carts being dropped. The fix is only real once the flag "
+            "is confirmed off in every region: the flag evaluation "
+            "cache holds the bad value on its TTL, so a test checkout "
+            "clears in 3m in us-east, 5m in us-west, 7m in eu-west "
+            "and 10m in ap-southeast, where the cache holds the "
+            "flag longest before it re-evaluates."
+        ),
+        ack_delay_min=(None, 4),
+        mitigate_delay_min=30,
+        resolve_delay_min=15,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west", "ap-southeast"),
+        # Verifying the fix is not the same price everywhere: the
+        # flag evaluation cache holds the bad value on its TTL, so
+        # a test checkout clears in 3m in us-east, 5m in us-west,
+        # 7m in eu-west and 10m in ap-southeast, where the cache
+        # holds the flag longest before it re-evaluates. The total
+        # is 25m, 13m more than the 3m default, so the verified run
+        # scores 57/100 where the default-cost run scored 63.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 5, "eu-west": 7, "ap-southeast": 10,
+        },
+        hints=(
+            "Check the flag evaluation service first: an unfinished "
+            "checkout appearing for everyone right after a flag "
+            "rollout is the flag, not the checkout code.",
+            "Kill the flag before rolling anything back: turning "
+            "the flag off stops the bleeding in seconds, and the "
+            "evaluation-service rollback can follow.",
+            "Verify a test checkout goes through the old flow in "
+            "every region before declaring the incident mitigated; "
+            "the flag cache in ap-southeast holds the bad value "
+            "longest on its TTL.",
+        ),
+        impact_stages=(
+            "Shoppers hitting the unfinished checkout: the new "
+            "flow erroring on payment, carts being dropped",
+            "Checkout down for everyone: the unfinished flow is "
+            "the only flow, orders failing, revenue stopped",
+        ),
+    ),
 }
 
 
