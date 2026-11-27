@@ -1297,6 +1297,78 @@ SCENARIOS = {
             "holds the lock, writes failing",
         ),
     ),
+    "search-index-corruption": Scenario(
+        name="search-index-corruption",
+        service="search-index",
+        title="Search index corrupted after a bad deploy",
+        severity="critical",
+        description=(
+            "A bad deploy ships a new analyzer that tokenizes "
+            "product names wrong, and a disk fault on one shard "
+            "host corrupts the segments it holds: queries return "
+            "stale listings for products that changed days ago, "
+            "new products never appear in results at all, and "
+            "some searches return products that have nothing to "
+            "do with the query. There is no clean alert — the "
+            "search error rate stays flat, because the queries "
+            "succeed, they just return the wrong answers — so the "
+            "team only finds out from user reports and a slow "
+            "climb in zero-result searches, and then has to freeze "
+            "writes to the index, rebuild it from the source of "
+            "truth instead of the corrupted segments, and verify "
+            "a sample of known queries returns the right results "
+            "before trusting search again. The primary's page is "
+            "buried under a storm of zero-result-search alerts, "
+            "so they miss; the senior is chasing a checkout "
+            "discrepancy and acks 2m late against the sev1 "
+            "policy's 5m window, then freezes index writes while "
+            "the impact grows from results going stale to results "
+            "coming back wrong to search becoming unusable. The "
+            "fix is only real once a sample of known queries "
+            "returns the right results in every region: the check "
+            "takes 5m in us-east, 7m in us-west and 10m in "
+            "eu-west, where the index shard is largest and takes "
+            "longest to rebuild."
+        ),
+        ack_delay_min=(None, 7),
+        mitigate_delay_min=45,
+        resolve_delay_min=15,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # sample of known queries is checked region by region at
+        # the price each region's rebuild charges — 5m in
+        # us-east, 7m in us-west and 10m in eu-west, where the
+        # index shard is largest and takes longest to rebuild.
+        # The total is 22m, 13m more than the 3m default, so the
+        # verified run scores 29/100 where the default-cost run
+        # scored 34.
+        verify_delay_min_by_region={
+            "us-east": 5, "us-west": 7, "eu-west": 10,
+        },
+        hints=(
+            "Freeze writes to the index first: every document "
+            "indexed against the corrupted postings makes the "
+            "rebuild harder to verify.",
+            "Rebuild the index from the source of truth, not from "
+            "the corrupted segments: reindexing bad data just "
+            "reproduces the corruption.",
+            "Verify a sample of known queries returns the right "
+            "results in every region before declaring the incident "
+            "mitigated; the eu-west shard is largest and takes "
+            "longest to rebuild, and a region still serving stale "
+            "results keeps customers from finding what they "
+            "searched for.",
+        ),
+        impact_stages=(
+            "Search results stale: listings days out of date, new "
+            "products missing from results",
+            "Search results wrong: corrupted postings returning "
+            "unrelated products, conversion dropping",
+            "Search unusable: index rebuild in progress, queries "
+            "timing out or returning nothing",
+        ),
+    ),
 }
 
 

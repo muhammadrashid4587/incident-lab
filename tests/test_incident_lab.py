@@ -7585,6 +7585,193 @@ class TestClockSkewScenario(unittest.TestCase):
         self.assertIn("10/100", out)
 
 
+class TestSearchIndexCorruptionScenario(unittest.TestCase):
+    """search-index-corruption: a bad deploy and a disk fault corrupt
+    the search index, so queries return stale or wrong results.
+
+    There is no clean alert — the queries succeed, they just return
+    the wrong answers — so the team only finds out from user reports.
+    The on-call's page is buried under zero-result-search alerts, so
+    they miss; the senior is chasing a checkout discrepancy and acks
+    2m late against the sev1 policy's 5m window, so the late ack
+    keeps 60% of the score. Without verification the incident
+    mitigates in 55m and scores 36; verifying a sample of known
+    queries in every region costs 22m — 5m in us-east, 7m in us-west
+    and 10m in eu-west, where the index shard is largest and takes
+    longest to rebuild — so mitigation lands at 77m and the score
+    drops to 29, 5 points below the 34 the 3m-default costs scored.
+    """
+
+    def test_search_index_corruption_scenario(self):
+        scenario = get("search-index-corruption")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "search-index")
+        self.assertEqual(scenario.ack_delay_min, (None, 7))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 5, "us-west": 7, "eu-west": 10})
+        self.assertEqual(scenario.verify_delay_min_total(), 22)
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_unverified_scores_36_with_60_percent_ack_credit(self):
+        result = simulate(get("search-index-corruption"),
+                          get_policy("sev1"))
+        score = result.score
+        # sev1 timeouts 3m, 5m, 10m: the on-call misses at 3m and
+        # the senior acks 7m after being paged, at 10m — 2m late
+        # against the 5m timeout.
+        self.assertEqual(score.time_to_ack_min, 10)
+        self.assertEqual(score.time_to_mitigate_min, 55)
+        self.assertEqual(score.time_to_resolve_min, 70)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 1)
+        self.assertEqual(score.ack_late_min, 2)
+        self.assertAlmostEqual(score.ack_credit, 0.6)
+        self.assertEqual(score.verify_delay_min, 0)
+        # 100 - 15 (one escalation) - 5 (10m to ack past the 5m
+        # grace) - 20 (55m to mitigate past the 15m grace, halved)
+        # = 60, and the 2m-late ack keeps 60% of it: 60 x 0.6 =
+        # 36.
+        self.assertEqual(score.points, 36)
+        # Downtime 55m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 55)
+        self.assertEqual(score.error_budget_burn_pct, 127.3)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 2)
+        self.assertEqual([step.outcome for step in chain],
+                         ["missed", "acked"])
+        self.assertEqual([step.paged_at_min for step in chain],
+                         [0, 3])
+        self.assertEqual(
+            [step.impact for step in chain],
+            list(get("search-index-corruption").impact_stages[:2]))
+
+    def test_verified_per_region_scores_29(self):
+        result = simulate(get("search-index-corruption"),
+                          get_policy("sev1"),
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(score.verify_delay_min, 22)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 5, "us-west": 7, "eu-west": 10})
+        # The senior acks at 10m, so the checks land at 15m, 22m
+        # and 32m: the 10m eu-west check is what pushes mitigation
+        # to 77m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(15, "us-east"), (22, "us-west"), (32, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (5m)",
+             "fix confirmed in us-west (7m)",
+             "fix confirmed in eu-west (10m)"])
+        self.assertEqual(score.time_to_mitigate_min, 77)
+        self.assertEqual(score.time_to_resolve_min, 92)
+        # 100 - 15 (one escalation) - 5 (10m to ack past the 5m
+        # grace) - 31 (77m to mitigate past the 15m grace, halved)
+        # = 49, and the 2m-late ack keeps 60% of it: 49 x 0.6 =
+        # 29.4, rounded to 29 — five points below the 34 the
+        # 3m-default costs scored.
+        self.assertEqual(score.points, 29)
+        self.assertEqual(score.downtime_min, 77)
+        self.assertEqual(score.error_budget_burn_pct, 178.2)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 5m, us-west 7m, eu-west 10m, +22m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 5, "us-west": 7, "eu-west": 10})
+
+    def test_what_if_turning_verification_on_costs_seven_points(self):
+        base = simulate(get("search-index-corruption"),
+                        get_policy("sev1"))
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 29)
+        self.assertEqual(outcome.points_delta, -7)
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("search-index-corruption"), get_policy("sev1"),
+            input_stream=io.StringIO(
+                "wait\nack 7\nmitigate 45\nresolve 15\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("search-index-corruption"),
+                       get_policy("sev1"),
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 29)
+        plain_drill = run_drill(
+            get("search-index-corruption"), get_policy("sev1"),
+            input_stream=io.StringIO(
+                "wait\nack 7\nmitigate 45\nresolve 15\n"),
+            prompt_stream=io.StringIO())
+        plain_run = simulate(get("search-index-corruption"),
+                             get_policy("sev1"))
+        self.assertEqual(plain_drill.to_dict(), plain_run.to_dict())
+        self.assertEqual(plain_drill.score.points, 36)
+
+    def test_template_round_trips_search_index_corruption(self):
+        data = scenario_to_dict(get("search-index-corruption"))
+        self.assertEqual(data["ack_delay_min"], [None, 7])
+        self.assertEqual(data["regions"],
+                         ["us-east", "us-west", "eu-west"])
+        self.assertEqual(data["verify_delay_min_by_region"],
+                         {"us-east": 5, "us-west": 7, "eu-west": 10})
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"search-index-corruption": data}},
+                      handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["search-index-corruption"],
+                         get("search-index-corruption"))
+
+    def test_shift_runs_search_index_corruption_like_a_run(self):
+        # search-index-corruption alone burns 127.3% of the budget,
+        # so a shift that schedules it first ends early: disk-full
+        # is skipped.
+        shift = simulate_shift(
+            [get("search-index-corruption"), get("disk-full")],
+            get_policy("sev1"), slo_percent=99.9)
+        self.assertEqual(
+            [run.score.points for run in shift.runs], [36])
+        self.assertTrue(shift.budget_exhausted)
+        self.assertEqual(shift.skipped, ["disk-full"])
+        self.assertEqual(shift.total_burn_pct, 127.3)
+        self.assertEqual(shift.shift_points, 18)
+        verified = simulate_shift(
+            [get("search-index-corruption")], get_policy("sev1"),
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual(
+            [run.score.points for run in verified.runs], [29])
+        self.assertEqual(verified.total_burn_pct, 178.2)
+
+    def test_cli_runs_search_index_corruption_sev1(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "search-index-corruption", "--policy", "sev1"]), 0)
+        self.assertIn("36/100", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "search-index-corruption", "--policy", "sev1",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     22m "
+            "(us-east 5m, us-west 7m, eu-west 10m)", out)
+        self.assertIn("29/100", out)
+
+
 class TestKeyRotationScenario(unittest.TestCase):
     """key-rotation: a KMS key rotation breaks saved-card decryption.
 
@@ -8349,7 +8536,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.61.0", text)
+        self.assertIn("Generated by incident-lab 0.62.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -8552,7 +8739,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.61.0")
+                         "incident-lab 0.62.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -9213,7 +9400,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.61.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.62.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
