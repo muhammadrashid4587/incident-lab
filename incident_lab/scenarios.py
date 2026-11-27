@@ -1728,6 +1728,81 @@ SCENARIOS = {
             "service, customers cannot load the site",
         ),
     ),
+    "cicd-pipeline-outage": Scenario(
+        name="cicd-pipeline-outage",
+        service="ci-cd-pipeline",
+        title="CI/CD pipeline outage blocks builds and deploys",
+        severity="critical",
+        description=(
+            "A bad runner-fleet upgrade takes the CI/CD runners "
+            "offline and corrupts the job queue's scheduler state: "
+            "builds queue and never start, deploys block at the "
+            "pipeline step, and rollbacks are unavailable because "
+            "the rollback path runs through the same pipeline, "
+            "while the services already running stay healthy — "
+            "production looks fine while the team quietly loses "
+            "the ability to ship anything, which is what makes "
+            "the incident sneaky. There is no clean alert — the "
+            "pipeline dashboard shows jobs queued, not failed, so "
+            "the team only finds out from a climb in queued builds "
+            "and engineers reporting that deploys are stuck, and "
+            "then has to fail over to the standby runner fleet "
+            "and drain the queued jobs through it, because a "
+            "failover without the drain leaves every queued build "
+            "and deploy stranded, and the manual deploy path is "
+            "the only way to ship a hotfix while the queue drains. "
+            "The primary acks in 3m, on time against the standard "
+            "policy's 5m window, then fails over to the standby "
+            "runners while the impact grows from builds queueing "
+            "to deploys blocked to delivery fully stalled. The fix "
+            "is only real once a test pipeline runs green in every "
+            "region: the check takes 4m in us-east, where the "
+            "standby fleet is already warm, 6m in us-west, where "
+            "the new runners have to register before they can take "
+            "jobs, and 10m in eu-west, where the standby fleet has "
+            "to rebuild its image cache before a build can run."
+        ),
+        ack_delay_min=(3,),
+        mitigate_delay_min=36,
+        resolve_delay_min=15,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test pipeline runs green region by region at the price
+        # each region's standby runner fleet charges — 4m in
+        # us-east, 6m in us-west and 10m in eu-west, where the
+        # standby fleet has to rebuild its image cache before a
+        # build can run. The total is 20m, 11m more than the 3m
+        # default, so the verified run scores 78/100 where the
+        # default-cost run scored 84.
+        verify_delay_min_by_region={
+            "us-east": 4, "us-west": 6, "eu-west": 10,
+        },
+        hints=(
+            "Check the runner fleet first: builds queueing with no "
+            "failures is the pipeline, not the code — compare the "
+            "queued-build count with the runner heartbeat before "
+            "digging into any one repo's failing tests.",
+            "Fail over to the standby runner fleet before draining "
+            "the queue: jobs start moving while the bad scheduler "
+            "state is unwound, and drain the queue too — a failover "
+            "without the drain leaves every queued build and "
+            "deploy stranded.",
+            "Verify a test pipeline runs green in every region "
+            "before declaring the incident mitigated; the eu-west "
+            "standby fleet rebuilds its image cache slowest, and "
+            "a region still queueing builds keeps its deploys "
+            "blocked.",
+        ),
+        impact_stages=(
+            "Builds queueing: jobs piling up in the queue, no "
+            "builds starting, engineers waiting on CI",
+            "Deploys blocked: no release can ship, rollbacks "
+            "unavailable, hotfixes stuck in the queue",
+            "Delivery fully stalled: the pipeline cannot run "
+            "anything, the team cannot ship or roll back",
+        ),
+    ),
 }
 
 
