@@ -283,6 +283,21 @@ SCENARIOS = {
         mitigate_delay_min=50,
         resolve_delay_min=30,
         slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test payment clears region by region at the price each
+        # region's standby payments cluster charges — 4m in
+        # us-east, where the standby cluster is already warm, 7m
+        # in us-west, where the standby has to re-register its
+        # payment-provider credentials before it can take a test
+        # charge, and 11m in eu-west, where the provider's
+        # European gateway re-authenticates every queued payment
+        # before it clears a fresh one. The total is 22m, 13m
+        # more than the 3m default, so the verified run scores
+        # 26/100 where the default-cost run scored 32.
+        verify_delay_min_by_region={
+            "us-east": 4, "us-west": 7, "eu-west": 11,
+        },
         hints=(
             "Fail over to the standby payments cluster first; "
             "checkout is down and every minute costs revenue.",
