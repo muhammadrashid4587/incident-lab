@@ -1106,6 +1106,62 @@ SCENARIOS = {
             "catching up, leases expiring",
         ),
     ),
+    "schema-migration": Scenario(
+        name="schema-migration",
+        service="orders-api",
+        title="Schema migration locks the orders table",
+        severity="critical",
+        description=(
+            "A deploy runs a schema migration that adds a NOT NULL "
+            "column with no default, and the ALTER TABLE takes an "
+            "exclusive lock on the orders table: every write queues "
+            "behind the migration and times out, so orders stop "
+            "being placed. The primary's page is buried under a "
+            "storm of slow-query alerts, so they miss; the senior "
+            "is mid-deploy-review and acks 2m late against the "
+            "sev1 policy's 5m window, then kills the migration "
+            "and rolls it back while the impact grows from writes "
+            "queueing to orders failing. The fix is only real once "
+            "a test order actually writes in every region: the "
+            "rollback has to reach each region's replica, so the "
+            "check takes 3m in us-east, 6m in us-west and 8m in "
+            "eu-west, where the replica applies the rollback "
+            "slowest."
+        ),
+        ack_delay_min=(None, 7),
+        mitigate_delay_min=40,
+        resolve_delay_min=20,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test order writes in 3m in us-east, 6m in us-west and
+        # 8m in eu-west, where the replica applies the rollback
+        # slowest. The total is 17m, 8m more than the 3m default,
+        # so the verified run scores 32/100 where the
+        # default-cost run scored 35.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 6, "eu-west": 8,
+        },
+        hints=(
+            "Kill the migration first: the ALTER TABLE holds an "
+            "exclusive lock, and no write gets through until it "
+            "is gone — the lock is the incident, not the slow "
+            "queries.",
+            "Roll the migration back before re-running it: a "
+            "migration that adds a NOT NULL column with no default "
+            "will lock the table the same way a second time.",
+            "Verify a test order actually writes in every region "
+            "before declaring the incident mitigated; the eu-west "
+            "replica applies the rollback slowest, and a region "
+            "still locked keeps failing writes.",
+        ),
+        impact_stages=(
+            "Writes queueing: inserts timing out behind the "
+            "migration lock, orders backing up",
+            "Orders failing: the write queue full, checkouts "
+            "timing out, orders lost",
+        ),
+    ),
 }
 
 
