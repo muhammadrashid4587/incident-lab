@@ -1780,9 +1780,19 @@ class TestDebrief(unittest.TestCase):
         return path.name
 
     def test_clean_run_has_no_bad_findings_or_actions(self):
-        # cert-expiry: primary acks in 2m, mitigates in 10m, resolves
-        # in 15m, no escalations, 100 points.
-        result = simulate(get("cert-expiry"), DEFAULT_POLICY)
+        # A clean run — primary acks in 2m, mitigates in 10m, resolves
+        # in 15m, no escalations, 100 points — has nothing to flag.
+        # cert-expiry used to be that run; it now carries regions, so
+        # an unverified run of it is flagged for never verifying per
+        # region, and this test uses a region-less scenario with the
+        # same timings instead.
+        clean = Scenario(
+            name="clean", service="svc", title="Clean run",
+            severity="low", description="",
+            ack_delay_min=(2, None, None),
+            mitigate_delay_min=8, resolve_delay_min=5,
+            slo_percent=99.9)
+        result = simulate(clean, DEFAULT_POLICY)
         debrief = generate_debrief(result)
         self.assertEqual(debrief.points, 100)
         self.assertEqual(debrief.grade, "A")
@@ -1858,9 +1868,16 @@ class TestDebrief(unittest.TestCase):
         self.assertEqual(grade(0), "D")
 
     def test_debrief_dict_has_summary_findings_and_timeline(self):
-        result = simulate(get("cert-expiry"), DEFAULT_POLICY)
+        # The clean run (see test_clean_run_has_no_bad_findings_or_actions).
+        clean = Scenario(
+            name="clean", service="svc", title="Clean run",
+            severity="low", description="",
+            ack_delay_min=(2, None, None),
+            mitigate_delay_min=8, resolve_delay_min=5,
+            slo_percent=99.9)
+        result = simulate(clean, DEFAULT_POLICY)
         data = generate_debrief(result).to_dict()
-        self.assertEqual(data["incident"]["id"], "cert-expiry")
+        self.assertEqual(data["incident"]["id"], "clean")
         self.assertEqual(data["summary"]["points"], 100)
         self.assertEqual(data["summary"]["grade"], "A")
         self.assertEqual(data["went_badly"], [])
@@ -1880,7 +1897,14 @@ class TestDebrief(unittest.TestCase):
         self.assertIn("(owner: ana)", text)
 
     def test_render_with_no_findings_says_none(self):
-        result = simulate(get("cert-expiry"), DEFAULT_POLICY)
+        # The clean run (see test_clean_run_has_no_bad_findings_or_actions).
+        clean = Scenario(
+            name="clean", service="svc", title="Clean run",
+            severity="low", description="",
+            ack_delay_min=(2, None, None),
+            mitigate_delay_min=8, resolve_delay_min=5,
+            slo_percent=99.9)
+        result = simulate(clean, DEFAULT_POLICY)
         text = generate_debrief(result).render()
         self.assertIn("## What went badly\n\n- none", text)
         self.assertIn("## Action items\n\n- none", text)
@@ -2408,7 +2432,7 @@ class TestHints(unittest.TestCase):
 
     def test_more_hints_than_available_fails(self):
         with self.assertRaises(ValueError):
-            simulate(get("cert-expiry"), DEFAULT_POLICY, hints=3)
+            simulate(get("cert-expiry"), DEFAULT_POLICY, hints=4)
 
     def test_negative_hints_fails(self):
         with self.assertRaises(ValueError):
@@ -2450,7 +2474,7 @@ class TestHints(unittest.TestCase):
                             for hint in data["hints"]))
 
     def test_cli_run_too_many_hints_fails(self):
-        self.assertEqual(main(["run", "cert-expiry", "--hints", "3"]), 2)
+        self.assertEqual(main(["run", "cert-expiry", "--hints", "4"]), 2)
 
     def test_cli_run_negative_hints_fails(self):
         self.assertEqual(main(["run", "disk-full", "--hints", "-1"]), 2)
@@ -3346,7 +3370,7 @@ class TestPurgeVerification(unittest.TestCase):
 
     def test_per_region_needs_regions(self):
         with self.assertRaises(ValueError):
-            simulate(get("cert-expiry"), DEFAULT_POLICY,
+            simulate(get("deploy-regression"), DEFAULT_POLICY,
                      purge_verification="per-region")
         with self.assertRaises(ValueError):
             simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
@@ -3420,7 +3444,7 @@ class TestPurgeVerification(unittest.TestCase):
         self.assertEqual(outcome.replayed.to_dict(), base.to_dict())
 
     def test_what_if_verification_needs_regions(self):
-        base = simulate(get("cert-expiry"), DEFAULT_POLICY)
+        base = simulate(get("deploy-regression"), DEFAULT_POLICY)
         with self.assertRaises(ValueError):
             what_if(base, purge_verification="per-region")
         # A run saved before regions existed has none either.
@@ -3452,7 +3476,7 @@ class TestPurgeVerification(unittest.TestCase):
         err = io.StringIO()
         with redirect_stderr(err):
             self.assertEqual(main([
-                "run", "cert-expiry", "--verify-purge", "per-region"]), 2)
+                "run", "deploy-regression", "--verify-purge", "per-region"]), 2)
         self.assertIn("no regions to verify", err.getvalue())
 
     def test_cli_run_bad_verification_value_fails(self):
@@ -3560,7 +3584,7 @@ class TestPurgeVerification(unittest.TestCase):
     def test_shift_verification_needs_regions_for_every_incident(self):
         with self.assertRaises(ValueError):
             simulate_shift(
-                [get("cdn-purge-failure"), get("cert-expiry")],
+                [get("cdn-purge-failure"), get("deploy-regression")],
                 DEFAULT_POLICY, slo_percent=99.5,
                 purge_verification="per-region")
 
@@ -5511,6 +5535,107 @@ class TestLatencySpikePerRegionCosts(unittest.TestCase):
             "verify delay:     19m "
             "(us-east 3m, us-west 6m, eu-west 10m)", out)
         self.assertIn("57/100", out)
+
+
+class TestCertExpiryPerRegionCosts(unittest.TestCase):
+    """cert-expiry: per-region verification costs for the renewal.
+
+    The renewed certificate must actually be serving in every
+    region before the incident counts as mitigated, and the check
+    is slowest where the edge PoPs hold the old cert longest —
+    2m in us-east, 4m in us-west and 7m in eu-west — so the
+    verified run costs 4m more than the 3m default and scores
+    96/100 where the default-cost run scored 98.
+    """
+
+    def test_cert_expiry_scenario(self):
+        scenario = get("cert-expiry")
+        self.assertEqual(scenario.severity, "high")
+        self.assertEqual(scenario.service, "edge-tls")
+        self.assertEqual(scenario.ack_delay_min, (2, None, None))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 4, "eu-west": 7})
+        self.assertEqual(scenario.verify_delay_min_total(), 13)
+        self.assertGreaterEqual(len(scenario.hints), 1)
+
+    def test_verified_per_region_costs_cert_expiry(self):
+        result = simulate(get("cert-expiry"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(result.score.verify_delay_min, 13)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 4, "eu-west": 7})
+        # The primary acks at 2m, so the checks land at 4m, 8m
+        # and 15m: the 7m eu-west check is what pushes
+        # mitigation to 23m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(4, "us-east"), (8, "us-west"), (15, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (2m)",
+             "fix confirmed in us-west (4m)",
+             "fix confirmed in eu-west (7m)"])
+        self.assertEqual(score.time_to_mitigate_min, 23)
+        self.assertEqual(score.time_to_resolve_min, 28)
+        # 100 - 0 (no escalations, ack on time) - 4 (23m to
+        # mitigate past the 15m grace, halved) = 96, two points
+        # below the 98 the 3m-default costs scored.
+        self.assertEqual(score.points, 96)
+        self.assertEqual(score.downtime_min, 23)
+        self.assertEqual(score.error_budget_burn_pct, 53.2)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 2m, us-west 4m, eu-west 7m, +13m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 2, "us-west": 4, "eu-west": 7})
+
+    def test_what_if_turning_verification_on_costs_four_points(self):
+        base = simulate(get("cert-expiry"),
+                        DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 96)
+        self.assertEqual(outcome.points_delta, -4)
+
+    def test_drill_matches_run_with_per_region_costs(self):
+        drill = run_drill(
+            get("cert-expiry"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 2\nmitigate 8\nresolve 5\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("cert-expiry"),
+                       DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 96)
+
+    def test_shift_with_per_region_costs(self):
+        shift = simulate_shift(
+            [get("cert-expiry")], DEFAULT_POLICY,
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual([run.score.points for run in shift.runs], [96])
+        self.assertEqual(shift.total_burn_pct, 53.2)
+
+    def test_cli_run_shows_per_region_breakdown(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "cert-expiry",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     13m "
+            "(us-east 2m, us-west 4m, eu-west 7m)", out)
+        self.assertIn("96/100", out)
 
 
 class TestNetworkPartitionPerRegionCosts(unittest.TestCase):
@@ -9881,7 +10006,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.70.0", text)
+        self.assertIn("Generated by incident-lab 0.71.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -10084,7 +10209,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.70.0")
+                         "incident-lab 0.71.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -10745,7 +10870,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.70.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.71.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

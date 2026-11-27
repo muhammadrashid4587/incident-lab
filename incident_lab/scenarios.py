@@ -181,17 +181,36 @@ SCENARIOS = {
         severity="high",
         description=(
             "The edge TLS certificate expires in 6 hours and the renewal "
-            "job has been failing silently for a week."
+            "job has been failing silently for a week. The renewal is "
+            "only real once the new certificate is actually serving in "
+            "every region: a TLS handshake check confirms the renewed "
+            "cert in 2m in us-east, where the edge PoPs pull the new "
+            "cert fastest, 4m in us-west and 7m in eu-west, where the "
+            "PoPs hold the old cert longest before they pick up the "
+            "replacement."
         ),
         ack_delay_min=(2, None, None),
         mitigate_delay_min=8,
         resolve_delay_min=5,
         slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the renewal is not the same price everywhere: a
+        # TLS handshake confirms the new cert in 2m in us-east, 4m
+        # in us-west and 7m in eu-west, where the edge PoPs hold the
+        # old cert longest before picking up the replacement. The
+        # total is 13m, 4m more than the 3m default, so the verified
+        # run scores 96/100 where the default-cost run scored 98.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 4, "eu-west": 7,
+        },
         hints=(
             "Renew the certificate by hand first; fix the silent renewal "
             "job after the incident is over.",
             "Check the renewal job's logs: a week of silent failures "
             "means its alerting is broken too.",
+            "Verify the new certificate is actually serving in every "
+            "region before declaring the incident mitigated; edge PoPs "
+            "in eu-west hold the old cert longest.",
         ),
     ),
     "deploy-regression": Scenario(
