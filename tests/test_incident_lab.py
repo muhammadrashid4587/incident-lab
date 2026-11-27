@@ -7209,6 +7209,196 @@ class TestSchemaMigrationScenario(unittest.TestCase):
         self.assertIn("32/100", out)
 
 
+class TestEmailProviderOutageScenario(unittest.TestCase):
+    """email-provider-outage: the transactional email provider goes
+    down, so password resets, order confirmations and receipts
+    never send.
+
+    The on-call's page is buried under delivery-failure alerts, so
+    they miss; the senior is on the vendor status call and misses
+    too; the incident commander acks 3m late against the sev1
+    policy's 10m window, so the late ack keeps only 70% of the
+    score — the first built-in run exercising two misses with a
+    late ack by the third level on the sev1 policy. Without
+    verification the incident mitigates in 61m and scores 22;
+    verifying the fix in every region costs 16m — a test email
+    delivers in 3m in us-east, 5m in us-west and 8m in eu-west,
+    where the relay re-authenticates every queued message — so
+    mitigation lands at 77m and the score drops to 16, 3 points
+    below the 19 the 3m-default costs scored.
+    """
+
+    def test_email_provider_outage_scenario(self):
+        scenario = get("email-provider-outage")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "comms-email")
+        self.assertEqual(scenario.ack_delay_min, (None, None, 13))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 8})
+        self.assertEqual(scenario.verify_delay_min_total(), 16)
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_unverified_scores_22_with_70_percent_ack_credit(self):
+        result = simulate(get("email-provider-outage"),
+                          get_policy("sev1"))
+        score = result.score
+        # sev1 timeouts 3m, 5m, 10m: the on-call misses at 3m, the
+        # senior misses at 8m, and the incident commander acks 13m
+        # after being paged, at 21m — 3m late against the 10m
+        # timeout.
+        self.assertEqual(score.time_to_ack_min, 21)
+        self.assertEqual(score.time_to_mitigate_min, 61)
+        self.assertEqual(score.time_to_resolve_min, 81)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 2)
+        self.assertEqual(score.ack_late_min, 3)
+        self.assertAlmostEqual(score.ack_credit, 0.7)
+        self.assertEqual(score.verify_delay_min, 0)
+        # 100 - 30 (two escalations) - 16 (21m to ack past the 5m
+        # grace) - 23 (61m to mitigate past the 15m grace, halved)
+        # = 31, and the 3m-late ack keeps 70% of it: 31 x 0.7 =
+        # 21.7, rounded to 22.
+        self.assertEqual(score.points, 22)
+        # Downtime 61m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 61)
+        self.assertEqual(score.error_budget_burn_pct, 141.2)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 3)
+        self.assertEqual([step.outcome for step in chain],
+                         ["missed", "missed", "acked"])
+        self.assertEqual([step.paged_at_min for step in chain],
+                         [0, 3, 8])
+        self.assertEqual(
+            [step.impact for step in chain],
+            list(get("email-provider-outage").impact_stages))
+
+    def test_verified_per_region_scores_16(self):
+        result = simulate(get("email-provider-outage"),
+                          get_policy("sev1"),
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(score.verify_delay_min, 16)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 8})
+        # The incident commander acks at 21m, so the checks land
+        # at 24m, 29m and 37m: the 8m eu-west check is what pushes
+        # mitigation to 77m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(24, "us-east"), (29, "us-west"), (37, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in us-west (5m)",
+             "fix confirmed in eu-west (8m)"])
+        self.assertEqual(score.time_to_mitigate_min, 77)
+        self.assertEqual(score.time_to_resolve_min, 97)
+        # 100 - 30 (two escalations) - 16 (21m to ack past the 5m
+        # grace) - 31 (77m to mitigate past the 15m grace, halved)
+        # = 23, and the 3m-late ack keeps 70% of it: 23 x 0.7 =
+        # 16.1, rounded to 16 — three points below the 19 the
+        # 3m-default costs scored.
+        self.assertEqual(score.points, 16)
+        self.assertEqual(score.downtime_min, 77)
+        self.assertEqual(score.error_budget_burn_pct, 178.2)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 3m, us-west 5m, eu-west 8m, +16m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 3, "us-west": 5, "eu-west": 8})
+
+    def test_what_if_turning_verification_on_costs_six_points(self):
+        base = simulate(get("email-provider-outage"),
+                        get_policy("sev1"))
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 16)
+        self.assertEqual(outcome.points_delta, -6)
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("email-provider-outage"), get_policy("sev1"),
+            input_stream=io.StringIO(
+                "wait\nwait\nack 13\nmitigate 40\nresolve 20\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("email-provider-outage"),
+                       get_policy("sev1"),
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 16)
+        plain_drill = run_drill(
+            get("email-provider-outage"), get_policy("sev1"),
+            input_stream=io.StringIO(
+                "wait\nwait\nack 13\nmitigate 40\nresolve 20\n"),
+            prompt_stream=io.StringIO())
+        plain_run = simulate(get("email-provider-outage"),
+                             get_policy("sev1"))
+        self.assertEqual(plain_drill.to_dict(), plain_run.to_dict())
+        self.assertEqual(plain_drill.score.points, 22)
+
+    def test_template_round_trips_email_provider_outage(self):
+        data = scenario_to_dict(get("email-provider-outage"))
+        self.assertEqual(data["ack_delay_min"], [None, None, 13])
+        self.assertEqual(data["regions"],
+                         ["us-east", "us-west", "eu-west"])
+        self.assertEqual(data["verify_delay_min_by_region"],
+                         {"us-east": 3, "us-west": 5, "eu-west": 8})
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"email-provider-outage": data}},
+                      handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["email-provider-outage"],
+                         get("email-provider-outage"))
+
+    def test_shift_runs_email_provider_outage_like_a_run(self):
+        # email-provider-outage alone burns 141.2% of the budget, so
+        # a shift that schedules it first ends early: disk-full is
+        # skipped.
+        shift = simulate_shift(
+            [get("email-provider-outage"), get("disk-full")],
+            get_policy("sev1"), slo_percent=99.9)
+        self.assertEqual(
+            [run.score.points for run in shift.runs], [22])
+        self.assertTrue(shift.budget_exhausted)
+        self.assertEqual(shift.skipped, ["disk-full"])
+        self.assertEqual(shift.total_burn_pct, 141.2)
+        self.assertEqual(shift.shift_points, 11)
+        verified = simulate_shift(
+            [get("email-provider-outage")], get_policy("sev1"),
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual(
+            [run.score.points for run in verified.runs], [16])
+        self.assertEqual(verified.total_burn_pct, 178.2)
+
+    def test_cli_runs_email_provider_outage_sev1(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "email-provider-outage", "--policy", "sev1"]), 0)
+        self.assertIn("22/100", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "email-provider-outage", "--policy", "sev1",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     16m "
+            "(us-east 3m, us-west 5m, eu-west 8m)", out)
+        self.assertIn("16/100", out)
+
+
 class TestKeyRotationScenario(unittest.TestCase):
     """key-rotation: a KMS key rotation breaks saved-card decryption.
 
@@ -7973,7 +8163,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.59.0", text)
+        self.assertIn("Generated by incident-lab 0.60.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -8176,7 +8366,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.59.0")
+                         "incident-lab 0.60.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -8837,7 +9027,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.59.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.60.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

@@ -1162,6 +1162,72 @@ SCENARIOS = {
             "timing out, orders lost",
         ),
     ),
+    "email-provider-outage": Scenario(
+        name="email-provider-outage",
+        service="comms-email",
+        title="Transactional email provider down, mail never sends",
+        severity="critical",
+        description=(
+            "The transactional email provider is down: password "
+            "resets, order confirmations and receipts never send — "
+            "the provider accepts the messages and drops them, so "
+            "the queue grows while nothing reaches a customer. The "
+            "team has to fail over to the backup provider and replay "
+            "the queued mail, because a failover without the replay "
+            "leaves every customer who already asked for a reset "
+            "locked out. The primary's page is buried under a storm "
+            "of delivery-failure alerts, so they miss; the senior "
+            "is on the vendor status call and misses too; the "
+            "incident commander is in an exec review, phone on "
+            "silent, and acks 3m late against the sev1 policy's "
+            "10m window, then starts the failover while the impact "
+            "grows from password resets failing to order "
+            "confirmations not sending to transactional email fully "
+            "down. The fix is only real once a test email actually "
+            "delivers in every region: the backup provider's "
+            "regional relays clear the queue at different speeds, "
+            "so the check takes 3m in us-east, 5m in us-west and "
+            "8m in eu-west, where the relay re-authenticates every "
+            "queued message before it sends."
+        ),
+        ack_delay_min=(None, None, 13),
+        mitigate_delay_min=40,
+        resolve_delay_min=20,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test email delivers in 3m in us-east, 5m in us-west and
+        # 8m in eu-west, where the relay re-authenticates every
+        # queued message before it sends. The total is 16m, 7m
+        # more than the 3m default, so the verified run scores
+        # 16/100 where the default-cost run scored 19.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 5, "eu-west": 8,
+        },
+        hints=(
+            "Fail over to the backup email provider first: "
+            "transactional mail is down and every minute leaves "
+            "more customers locked out of their accounts.",
+            "Replay the queued mail after the failover: the queue "
+            "holds password resets customers are still waiting on, "
+            "and skipping the replay leaves them locked out even "
+            "after the provider is back.",
+            "Verify a test email actually delivers in every region "
+            "before declaring the incident mitigated; the eu-west "
+            "relay re-authenticates every queued message before it "
+            "sends, and a region still queueing keeps customers "
+            "waiting.",
+        ),
+        impact_stages=(
+            "Password resets failing: reset emails never arriving, "
+            "customers locked out of their accounts",
+            "Order confirmations not sending: receipts and shipping "
+            "updates queued, support tickets rising",
+            "Transactional email fully down: no resets, "
+            "confirmations or receipts going out, accounts "
+            "unrecoverable",
+        ),
+    ),
 }
 
 
