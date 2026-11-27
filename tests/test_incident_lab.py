@@ -6679,6 +6679,172 @@ class TestFeatureFlagMisfireScenario(unittest.TestCase):
         self.assertIn("57/100", out)
 
 
+class TestPaymentProcessorOutageScenario(unittest.TestCase):
+    """payment-processor-outage: the third-party card processor goes
+    down, so checkout cannot take payments.
+
+    The primary's page is buried under checkout-error alerts, so
+    they miss; the secondary acks 2m late, so the late ack keeps
+    only 60% of the score. Without verification the incident
+    mitigates in 40m and scores 40; verifying the fix in every
+    region costs 18m — a test charge clears in 3m in us-east, 6m
+    in us-west and 9m in eu-west, where the secondary processor's
+    EU endpoint settles slowest — so mitigation lands at 58m and
+    the score drops to 34, 3 points below the 37 the 3m-default
+    costs scored.
+    """
+
+    def test_payment_processor_outage_scenario(self):
+        scenario = get("payment-processor-outage")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "checkout-payments")
+        self.assertEqual(scenario.ack_delay_min, (None, 7))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 6, "eu-west": 9})
+        self.assertEqual(scenario.verify_delay_min_total(), 18)
+        self.assertEqual(len(scenario.impact_stages), 2)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_unverified_scores_40_with_60_percent_ack_credit(self):
+        result = simulate(get("payment-processor-outage"), DEFAULT_POLICY)
+        score = result.score
+        self.assertEqual(score.time_to_ack_min, 12)
+        self.assertEqual(score.time_to_mitigate_min, 40)
+        self.assertEqual(score.time_to_resolve_min, 58)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 1)
+        self.assertEqual(score.ack_late_min, 2)
+        self.assertAlmostEqual(score.ack_credit, 0.6)
+        self.assertEqual(score.verify_delay_min, 0)
+        # 100 - 15 (one escalation) - 7 (12m to ack past the 5m
+        # grace) - 12 (40m to mitigate past the 15m grace, halved)
+        # = 66, and the 2m-late ack keeps 60% of it: 66 x 0.6 =
+        # 39.6, rounded to 40.
+        self.assertEqual(score.points, 40)
+        # Downtime 40m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 40)
+        self.assertEqual(score.error_budget_burn_pct, 92.6)
+
+    def test_verified_per_region_scores_34(self):
+        result = simulate(get("payment-processor-outage"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(score.verify_delay_min, 18)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 6, "eu-west": 9})
+        # The secondary acks at 12m, so the checks land at 15m,
+        # 21m and 30m: the 9m eu-west check is what pushes
+        # mitigation to 58m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(15, "us-east"), (21, "us-west"), (30, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in us-west (6m)",
+             "fix confirmed in eu-west (9m)"])
+        self.assertEqual(score.time_to_mitigate_min, 58)
+        self.assertEqual(score.time_to_resolve_min, 76)
+        # 100 - 15 (one escalation) - 7 (12m to ack past the 5m
+        # grace) - 21 (58m to mitigate past the 15m grace, halved)
+        # = 57, and the 2m-late ack keeps 60% of it: 57 x 0.6 =
+        # 34.2, rounded to 34 — three points below the 37 the
+        # 3m-default costs scored.
+        self.assertEqual(score.points, 34)
+        self.assertEqual(score.downtime_min, 58)
+        self.assertEqual(score.error_budget_burn_pct, 134.3)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 3m, us-west 6m, eu-west 9m, +18m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 3, "us-west": 6, "eu-west": 9})
+
+    def test_what_if_turning_verification_on_costs_six_points(self):
+        base = simulate(get("payment-processor-outage"), DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 34)
+        self.assertEqual(outcome.points_delta, -6)
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("payment-processor-outage"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "wait\nack 7\nmitigate 28\nresolve 18\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("payment-processor-outage"), DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 34)
+        plain_drill = run_drill(
+            get("payment-processor-outage"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "wait\nack 7\nmitigate 28\nresolve 18\n"),
+            prompt_stream=io.StringIO())
+        plain_run = simulate(get("payment-processor-outage"), DEFAULT_POLICY)
+        self.assertEqual(plain_drill.to_dict(), plain_run.to_dict())
+        self.assertEqual(plain_drill.score.points, 40)
+
+    def test_template_round_trips_payment_processor_outage(self):
+        data = scenario_to_dict(get("payment-processor-outage"))
+        self.assertEqual(data["ack_delay_min"], [None, 7])
+        self.assertEqual(data["regions"],
+                         ["us-east", "us-west", "eu-west"])
+        self.assertEqual(data["verify_delay_min_by_region"],
+                         {"us-east": 3, "us-west": 6, "eu-west": 9})
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"payment-processor-outage": data}},
+                      handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["payment-processor-outage"],
+                         get("payment-processor-outage"))
+
+    def test_shift_runs_payment_processor_outage_like_a_run(self):
+        # payment-processor-outage burns 92.6% of the budget, so a
+        # shift that schedules it first still runs disk-full — but
+        # the two together burn 145.8%, exhausting the budget.
+        shift = simulate_shift(
+            [get("payment-processor-outage"), get("disk-full")],
+            DEFAULT_POLICY, slo_percent=99.9)
+        self.assertEqual(
+            [run.score.points for run in shift.runs], [40, 96])
+        self.assertTrue(shift.budget_exhausted)
+        self.assertEqual(shift.skipped, [])
+        self.assertEqual(shift.total_burn_pct, 145.8)
+        verified = simulate_shift(
+            [get("payment-processor-outage")], DEFAULT_POLICY,
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual(
+            [run.score.points for run in verified.runs], [34])
+        self.assertEqual(verified.total_burn_pct, 134.3)
+
+    def test_cli_runs_payment_processor_outage(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main(["run", "payment-processor-outage"]), 0)
+        self.assertIn("40/100", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "payment-processor-outage",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     18m "
+            "(us-east 3m, us-west 6m, eu-west 9m)", out)
+        self.assertIn("34/100", out)
+
+
 class TestKeyRotationScenario(unittest.TestCase):
     """key-rotation: a KMS key rotation breaks saved-card decryption.
 
@@ -7443,7 +7609,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.56.0", text)
+        self.assertIn("Generated by incident-lab 0.57.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -7646,7 +7812,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.56.0")
+                         "incident-lab 0.57.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -8307,7 +8473,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.56.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.57.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)

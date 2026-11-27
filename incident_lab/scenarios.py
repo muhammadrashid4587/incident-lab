@@ -992,6 +992,61 @@ SCENARIOS = {
             "the only flow, orders failing, revenue stopped",
         ),
     ),
+    "payment-processor-outage": Scenario(
+        name="payment-processor-outage",
+        service="checkout-payments",
+        title="Card processor down, checkout cannot take payments",
+        severity="critical",
+        description=(
+            "The third-party card processor is down: every card "
+            "authorization errors, so checkout cannot take payments "
+            "at all. The team has to decide whether to wait for the "
+            "vendor to recover, fail over to the secondary processor "
+            "— cards only, no wallets, a degraded path — or shed "
+            "load by queueing checkouts until payments work again. "
+            "The primary's page is buried under a storm of "
+            "checkout-error alerts, so they miss; the secondary "
+            "acks 2m late, then fails over to the secondary "
+            "processor and starts queueing checkouts while the "
+            "impact grows from card payments failing to checkouts "
+            "queueing up. The fix is only real once a test charge "
+            "actually clears in every region: the secondary "
+            "processor settles in 3m in us-east, 6m in us-west and "
+            "9m in eu-west, where its EU endpoint settles slowest."
+        ),
+        ack_delay_min=(None, 7),
+        mitigate_delay_min=28,
+        resolve_delay_min=18,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test charge clears in 3m in us-east, 6m in us-west and
+        # 9m in eu-west, where the secondary processor's EU
+        # endpoint settles slowest. The total is 18m, 9m more
+        # than the 3m default, so the verified run scores 34/100
+        # where the default-cost run scored 37.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 6, "eu-west": 9,
+        },
+        hints=(
+            "Check the processor's status page first: card "
+            "failures everywhere at once with no deploy is the "
+            "vendor, not checkout — and start the failover to the "
+            "secondary processor instead of waiting on the vendor.",
+            "Shed load while the failover runs: queue checkouts "
+            "instead of letting them fail, so a customer retries "
+            "once instead of hammering a dead processor.",
+            "Verify a test charge actually clears in every region "
+            "before declaring the incident mitigated; the "
+            "secondary processor's EU endpoint settles slowest.",
+        ),
+        impact_stages=(
+            "Card payments failing: authorizations erroring, "
+            "customers retrying and failing",
+            "Checkouts queueing: card payments down everywhere, "
+            "orders backing up while the team fails over",
+        ),
+    ),
 }
 
 
