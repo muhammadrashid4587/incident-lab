@@ -1650,6 +1650,84 @@ SCENARIOS = {
             "and services exist only in the snapshot",
         ),
     ),
+    "load-balancer-ingress-outage": Scenario(
+        name="load-balancer-ingress-outage",
+        service="edge-ingress",
+        title="Load balancer / ingress outage drops external traffic",
+        severity="critical",
+        description=(
+            "A bad ingress config deploy pushes a routing rule that "
+            "sends all external traffic to a decommissioned backend "
+            "pool: the load balancer still answers, but every "
+            "request 502s or times out at the edge, while the "
+            "services behind it stay healthy — internal health "
+            "checks pass and the dashboards stay green, which is "
+            "what makes the incident sneaky: the platform looks "
+            "fine while no customer can reach it. There is no "
+            "clean alert — the load balancer's health check probes "
+            "the control plane, which still answers, so the team "
+            "only finds out from a climb in 5xx errors at the edge "
+            "and customer reports that the site will not load, and "
+            "then has to fail over to the standby ingress and roll "
+            "the bad config back, because a failover without the "
+            "rollback leaves the standby serving the same bad "
+            "routing rule. The primary acks in 3m, on time against "
+            "the standard policy's 5m window, then fails over to "
+            "the standby ingress while the impact grows from "
+            "external traffic erroring to checkout unreachable to "
+            "the site fully down. The fix is only real once a "
+            "staged test request through the load balancer succeeds "
+            "in every region: the check takes 3m in us-east, where "
+            "the standby ingress is already warm, 7m in us-west, "
+            "where the new config has to propagate across the load "
+            "balancer control plane, and 11m in eu-west, where the "
+            "standby has to drain the bad config from its cache "
+            "and re-register its backends."
+        ),
+        ack_delay_min=(3,),
+        mitigate_delay_min=34,
+        resolve_delay_min=14,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # staged test request through the load balancer succeeds
+        # region by region at the price each region's standby
+        # ingress charges — 3m in us-east, 7m in us-west and 11m
+        # in eu-west, where the standby has to drain the bad
+        # config from its cache and re-register its backends.
+        # The total is 21m, 12m more than the 3m default, so the
+        # verified run scores 79/100 where the default-cost run
+        # scored 85.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 7, "eu-west": 11,
+        },
+        hints=(
+            "Check the ingress config deploy first: 5xx errors at "
+            "the edge with healthy services behind it is the load "
+            "balancer's routing, not the services — compare the "
+            "edge 5xx rate with the internal success rate before "
+            "digging into any one service.",
+            "Fail over to the standby ingress before rolling the "
+            "config back: traffic recovers while the bad config "
+            "is unwound, and roll the config back too — a failover "
+            "without the rollback leaves the standby serving the "
+            "same bad routing rule.",
+            "Verify a staged test request through the load balancer "
+            "succeeds in every region before declaring the incident "
+            "mitigated; the eu-west standby drains the bad config "
+            "from its cache slowest, and a region still serving "
+            "502s keeps its customers locked out.",
+        ),
+        impact_stages=(
+            "External traffic erroring: 5xx errors at the edge, "
+            "customers seeing errors while the services behind the "
+            "load balancer stay healthy",
+            "Checkout unreachable: external requests timing out, "
+            "orders failing at the edge",
+            "Site fully down: no external traffic reaching any "
+            "service, customers cannot load the site",
+        ),
+    ),
 }
 
 

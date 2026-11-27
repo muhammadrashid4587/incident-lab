@@ -8522,6 +8522,199 @@ class TestKubernetesControlPlaneOutageScenario(unittest.TestCase):
         self.assertIn("78/100", out)
 
 
+class TestLoadBalancerIngressOutageScenario(unittest.TestCase):
+    """load-balancer-ingress-outage: a bad ingress config deploy
+    sends all external traffic to a decommissioned backend pool,
+    so every request 502s or times out at the edge while the
+    services behind the load balancer stay healthy.
+
+    The primary acks in 3m, on time against the standard policy's
+    5m window, so there is no miss and no escalation and the full
+    ack credit is kept — the fifth built-in run whose score is
+    driven by a long mitigation rather than by ack trouble: it
+    mitigates in 37m and scores 89, burning 85.6% of the monthly
+    error budget. Verifying a staged test request through the load
+    balancer in every region costs 21m — 3m in us-east, 7m in
+    us-west and 11m in eu-west, where the standby ingress has to
+    drain the bad config from its cache and re-register its
+    backends — so mitigation lands at 58m and the score drops to
+    79, 6 points below the 85 the 3m-default costs scored, and the
+    burn crosses the budget at 134.3%.
+    """
+
+    def test_load_balancer_ingress_outage_scenario(self):
+        scenario = get("load-balancer-ingress-outage")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "edge-ingress")
+        self.assertEqual(scenario.ack_delay_min, (3,))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 7, "eu-west": 11})
+        self.assertEqual(scenario.verify_delay_min_total(), 21)
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_unverified_scores_89_with_full_ack_credit(self):
+        result = simulate(get("load-balancer-ingress-outage"),
+                          DEFAULT_POLICY)
+        score = result.score
+        # Standard timeouts 5m, 5m, 10m: the primary acks 3m after
+        # being paged, on time, so nobody escalates.
+        self.assertEqual(score.time_to_ack_min, 3)
+        self.assertEqual(score.time_to_mitigate_min, 37)
+        self.assertEqual(score.time_to_resolve_min, 51)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 0)
+        self.assertEqual(score.ack_late_min, 0)
+        self.assertAlmostEqual(score.ack_credit, 1.0)
+        self.assertEqual(score.verify_delay_min, 0)
+        # 100 - 0 (no escalations) - 0 (3m to ack inside the 5m
+        # grace) - 11 (37m to mitigate past the 15m grace, halved)
+        # = 89, and the on-time ack keeps all of it.
+        self.assertEqual(score.points, 89)
+        # Downtime 37m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 37)
+        self.assertEqual(score.error_budget_burn_pct, 85.6)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 1)
+        self.assertEqual([step.outcome for step in chain],
+                         ["acked"])
+        self.assertEqual([step.paged_at_min for step in chain], [0])
+        self.assertEqual(
+            [step.impact for step in chain],
+            list(get("load-balancer-ingress-outage")
+                 .impact_stages[:1]))
+
+    def test_verified_per_region_scores_79(self):
+        result = simulate(get("load-balancer-ingress-outage"),
+                          DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(score.verify_delay_min, 21)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 7, "eu-west": 11})
+        # The primary acks at 3m, so the checks land at 6m, 13m
+        # and 24m: the 11m eu-west check is what pushes mitigation
+        # to 58m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(6, "us-east"), (13, "us-west"), (24, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in us-west (7m)",
+             "fix confirmed in eu-west (11m)"])
+        self.assertEqual(score.time_to_mitigate_min, 58)
+        self.assertEqual(score.time_to_resolve_min, 72)
+        # 100 - 0 - 0 - 21 (58m to mitigate past the 15m grace,
+        # halved) = 79 — six points below the 85 the 3m-default
+        # costs scored.
+        self.assertEqual(score.points, 79)
+        self.assertEqual(score.downtime_min, 58)
+        self.assertEqual(score.error_budget_burn_pct, 134.3)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 3m, us-west 7m, eu-west 11m, +21m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 3, "us-west": 7, "eu-west": 11})
+
+    def test_what_if_turning_verification_on_costs_ten_points(self):
+        base = simulate(get("load-balancer-ingress-outage"),
+                        DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 79)
+        self.assertEqual(outcome.points_delta, -10)
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("load-balancer-ingress-outage"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 3\nmitigate 34\nresolve 14\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("load-balancer-ingress-outage"),
+                       DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 79)
+        plain_drill = run_drill(
+            get("load-balancer-ingress-outage"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 3\nmitigate 34\nresolve 14\n"),
+            prompt_stream=io.StringIO())
+        plain_run = simulate(get("load-balancer-ingress-outage"),
+                             DEFAULT_POLICY)
+        self.assertEqual(plain_drill.to_dict(), plain_run.to_dict())
+        self.assertEqual(plain_drill.score.points, 89)
+
+    def test_template_round_trips_load_balancer_ingress_outage(self):
+        data = scenario_to_dict(
+            get("load-balancer-ingress-outage"))
+        self.assertEqual(data["ack_delay_min"], [3])
+        self.assertEqual(data["regions"],
+                         ["us-east", "us-west", "eu-west"])
+        self.assertEqual(data["verify_delay_min_by_region"],
+                         {"us-east": 3, "us-west": 7, "eu-west": 11})
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(
+                {"scenarios": {
+                    "load-balancer-ingress-outage": data}},
+                handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["load-balancer-ingress-outage"],
+                         get("load-balancer-ingress-outage"))
+
+    def test_shift_runs_load_balancer_ingress_outage_like_a_run(self):
+        # load-balancer-ingress-outage burns 85.6% of the budget,
+        # so a shift that schedules it first still runs disk-full
+        # — the two together burn 138.9%, so the shift ends
+        # exhausted and latency-spike is skipped.
+        shift = simulate_shift(
+            [get("load-balancer-ingress-outage"), get("disk-full"),
+             get("latency-spike")],
+            DEFAULT_POLICY, slo_percent=99.9)
+        self.assertEqual(
+            [run.score.points for run in shift.runs], [89, 96])
+        self.assertTrue(shift.budget_exhausted)
+        self.assertEqual(shift.skipped, ["latency-spike"])
+        self.assertEqual(shift.total_burn_pct, 138.9)
+        # Skipped incidents count as 0 in the shift mean:
+        # (89 + 96 + 0) / 3 = 61.7.
+        self.assertEqual(shift.shift_points, 61.7)
+        verified = simulate_shift(
+            [get("load-balancer-ingress-outage")], DEFAULT_POLICY,
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual(
+            [run.score.points for run in verified.runs], [79])
+        self.assertEqual(verified.total_burn_pct, 134.3)
+
+    def test_cli_runs_load_balancer_ingress_outage(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "load-balancer-ingress-outage"]), 0)
+        self.assertIn("89/100", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "load-balancer-ingress-outage",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     21m "
+            "(us-east 3m, us-west 7m, eu-west 11m)", out)
+        self.assertIn("79/100", out)
+
+
 class TestKeyRotationScenario(unittest.TestCase):
     """key-rotation: a KMS key rotation breaks saved-card decryption.
 
@@ -9286,7 +9479,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.66.0", text)
+        self.assertIn("Generated by incident-lab 0.67.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -9489,7 +9682,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.66.0")
+                         "incident-lab 0.67.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -10150,7 +10343,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.66.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.67.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
