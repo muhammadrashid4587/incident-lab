@@ -1918,6 +1918,84 @@ SCENARIOS = {
             "anything, the team cannot ship or roll back",
         ),
     ),
+    "observability-outage": Scenario(
+        name="observability-outage",
+        service="telemetry-pipeline",
+        title="Metrics and logs pipeline down, on-call flying blind",
+        severity="critical",
+        description=(
+            "The metrics, logs and traces pipeline is down: a bad "
+            "deploy to the ingestion collectors corrupts the "
+            "queue's routing state, so telemetry stops flowing — "
+            "dashboards go blank, alerts stop firing, and the team "
+            "is flying blind, because the alerting that would have "
+            "paged them rides the same pipeline that just died. "
+            "There is no clean alert — nothing fires at all — so "
+            "the team only finds out from a customer reporting "
+            "that the status page is stale and an engineer "
+            "noticing the dashboards are empty, and then has to "
+            "fail over ingestion to the standby pipeline and "
+            "replay the buffered telemetry, because a failover "
+            "without the replay loses every metric and log from "
+            "the outage window and leaves gaps that make the "
+            "incident unreconstructable. The primary's page never "
+            "arrives — the alerting rides the dead pipeline — so "
+            "the chain moves on after the timeout; the secondary "
+            "notices the blank dashboards and acks 1m late "
+            "against the standard policy's 5m window, then fails "
+            "over ingestion while the impact grows from dashboards "
+            "going blank to alerts going silent to the team flying "
+            "blind. The fix is only real once a test metric "
+            "actually lands in every region: the standby "
+            "pipeline's regional ingestion clears the backlog at "
+            "different speeds, so the check takes 3m in us-east, "
+            "6m in us-west and 10m in eu-west, where the standby "
+            "ingesters have to drain the deepest backlog before a "
+            "fresh metric is accepted."
+        ),
+        ack_delay_min=(None, 6),
+        mitigate_delay_min=35,
+        resolve_delay_min=15,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test metric lands region by region at the price each
+        # region's standby ingestion charges — 3m in us-east,
+        # 6m in us-west and 10m in eu-west, where the standby
+        # ingesters have to drain the deepest backlog before a
+        # fresh metric is accepted. The total is 19m, 10m more
+        # than the 3m default, so the verified run scores 43/100
+        # where the default-cost run scored 47.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 6, "eu-west": 10,
+        },
+        hints=(
+            "Check the ingestion pipeline before the dashboards: "
+            "blank dashboards with no alerts is the telemetry "
+            "pipeline, not the services — compare the ingestion "
+            "queue depth with the alert history before digging "
+            "into any one service.",
+            "Fail over ingestion to the standby pipeline before "
+            "replaying the backlog: telemetry flows again while "
+            "the bad routing state is unwound, and replay the "
+            "buffered telemetry too — a failover without the "
+            "replay loses every metric and log from the outage "
+            "window.",
+            "Verify a test metric actually lands in every region "
+            "before declaring the incident mitigated; the eu-west "
+            "standby ingesters drain the deepest backlog, and a "
+            "region still dropping telemetry keeps its dashboards "
+            "blank.",
+        ),
+        impact_stages=(
+            "Dashboards going blank: metrics and logs stop flowing, "
+            "graphs flatline",
+            "Alerts going silent: the alerting rides the dead "
+            "pipeline, nothing fires",
+            "Team flying blind: no telemetry anywhere, the incident "
+            "cannot be reconstructed",
+        ),
+    ),
 }
 
 

@@ -9611,6 +9611,218 @@ class TestCicdPipelineOutageScenario(unittest.TestCase):
         self.assertIn("78/100", out)
 
 
+class TestObservabilityOutageScenario(unittest.TestCase):
+    """observability-outage: the metrics and logs pipeline goes down,
+    so dashboards go blank and alerts stop firing — the alerting
+    that would have paged the team rides the same pipeline that
+    just died, so the primary's page never arrives and the chain
+    moves on after the timeout.
+
+    The secondary notices the blank dashboards and acks 1m late
+    against the standard policy's 5m window, so the late ack keeps
+    only 80% of the score — the first built-in run exercising a
+    miss by the first level with a 1m-late ack by the second level:
+    it acks at 11m, mitigates in 46m and scores 51, burning 106.5%
+    of the monthly error budget. Verifying a test metric actually
+    lands in every region costs 19m — 3m in us-east, 6m in us-west
+    and 10m in eu-west, where the standby ingesters have to drain
+    the deepest backlog before a fresh metric is accepted — so
+    mitigation lands at 65m and the score drops to 43, 4 points
+    below the 47 the 3m-default costs scored, and the burn crosses
+    the budget at 150.5%.
+    """
+
+    def test_observability_outage_scenario(self):
+        scenario = get("observability-outage")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "telemetry-pipeline")
+        self.assertEqual(scenario.ack_delay_min, (None, 6))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 6, "eu-west": 10})
+        self.assertEqual(scenario.verify_delay_min_total(), 19)
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_unverified_scores_51_with_late_ack(self):
+        result = simulate(get("observability-outage"),
+                          DEFAULT_POLICY)
+        score = result.score
+        # Standard timeouts 5m, 5m, 10m: the primary never gets
+        # paged — the alerting rides the dead pipeline — so the
+        # chain moves on after the 5m timeout, and the secondary
+        # acks 6m after being paged, 1m late.
+        self.assertEqual(score.time_to_ack_min, 11)
+        self.assertEqual(score.time_to_mitigate_min, 46)
+        self.assertEqual(score.time_to_resolve_min, 61)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 1)
+        self.assertEqual(score.ack_late_min, 1)
+        self.assertAlmostEqual(score.ack_credit, 0.8)
+        self.assertEqual(score.verify_delay_min, 0)
+        # 100 - 15 (one escalation) - 6 (11m to ack past the 5m
+        # grace) - 15 (46m to mitigate past the 15m grace, halved)
+        # = 64, scaled by the 80% ack credit to 51.
+        self.assertEqual(score.points, 51)
+        # Downtime 46m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 46)
+        self.assertEqual(score.error_budget_burn_pct, 106.5)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 2)
+        self.assertEqual([step.outcome for step in chain],
+                         ["missed", "acked"])
+        self.assertEqual([step.paged_at_min for step in chain], [0, 5])
+        self.assertEqual(
+            [step.impact for step in chain],
+            list(get("observability-outage")
+                 .impact_stages[:2]))
+
+    def test_verified_per_region_scores_43(self):
+        result = simulate(get("observability-outage"),
+                          DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(score.verify_delay_min, 19)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 6, "eu-west": 10})
+        # The secondary acks at 11m, so the checks land at 14m,
+        # 20m and 30m: the 10m eu-west check is what pushes
+        # mitigation to 65m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(14, "us-east"), (20, "us-west"), (30, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in us-west (6m)",
+             "fix confirmed in eu-west (10m)"])
+        self.assertEqual(score.time_to_mitigate_min, 65)
+        self.assertEqual(score.time_to_resolve_min, 80)
+        # 100 - 15 - 6 - 25 (65m to mitigate past the 15m grace,
+        # halved) = 54, scaled by the 80% ack credit to 43 — four
+        # points below the 47 the 3m-default costs scored.
+        self.assertEqual(score.points, 43)
+        self.assertEqual(score.downtime_min, 65)
+        self.assertEqual(score.error_budget_burn_pct, 150.5)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 3m, us-west 6m, eu-west 10m, +19m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 3, "us-west": 6, "eu-west": 10})
+
+    def test_default_cost_run_scores_47(self):
+        default = replace(get("observability-outage"),
+                          verify_delay_min_by_region={})
+        result = simulate(default, DEFAULT_POLICY,
+                          purge_verification="per-region")
+        # The 3m default in every region: checks at 14m, 17m and
+        # 20m for a 9m total, mitigation at 55m.
+        self.assertEqual(result.score.verify_delay_min, 9)
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in
+             result.timeline.events if event.kind == "verified"],
+            [(14, "us-east"), (17, "us-west"), (20, "eu-west")])
+        self.assertEqual(result.score.time_to_mitigate_min, 55)
+        self.assertEqual(result.score.time_to_resolve_min, 70)
+        self.assertEqual(result.score.points, 47)
+        self.assertEqual(result.score.error_budget_burn_pct, 127.3)
+
+    def test_what_if_turning_verification_on_costs_eight_points(self):
+        base = simulate(get("observability-outage"),
+                        DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 43)
+        self.assertEqual(outcome.points_delta, -8)
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("observability-outage"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "wait\nack 6\nmitigate 35\nresolve 15\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("observability-outage"),
+                       DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 43)
+        plain_drill = run_drill(
+            get("observability-outage"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "wait\nack 6\nmitigate 35\nresolve 15\n"),
+            prompt_stream=io.StringIO())
+        plain_run = simulate(get("observability-outage"),
+                             DEFAULT_POLICY)
+        self.assertEqual(plain_drill.to_dict(), plain_run.to_dict())
+        self.assertEqual(plain_drill.score.points, 51)
+
+    def test_template_round_trips_observability_outage(self):
+        data = scenario_to_dict(
+            get("observability-outage"))
+        self.assertEqual(data["ack_delay_min"], [None, 6])
+        self.assertEqual(data["regions"],
+                         ["us-east", "us-west", "eu-west"])
+        self.assertEqual(data["verify_delay_min_by_region"],
+                         {"us-east": 3, "us-west": 6, "eu-west": 10})
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(
+                {"scenarios": {
+                    "observability-outage": data}},
+                handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["observability-outage"],
+                         get("observability-outage"))
+
+    def test_shift_runs_observability_outage_like_a_run(self):
+        # observability-outage burns 106.5% of the budget on its
+        # own, so a shift that schedules it first skips the
+        # incidents after it.
+        shift = simulate_shift(
+            [get("observability-outage"), get("disk-full"),
+             get("latency-spike")],
+            DEFAULT_POLICY, slo_percent=99.9)
+        self.assertEqual(
+            [run.score.points for run in shift.runs], [51])
+        self.assertTrue(shift.budget_exhausted)
+        self.assertEqual(shift.skipped, ["disk-full", "latency-spike"])
+        self.assertEqual(shift.total_burn_pct, 106.5)
+        # Skipped incidents count as 0 in the shift mean:
+        # (51 + 0 + 0) / 3 = 17.0.
+        self.assertEqual(shift.shift_points, 17.0)
+        verified = simulate_shift(
+            [get("observability-outage")], DEFAULT_POLICY,
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual(
+            [run.score.points for run in verified.runs], [43])
+        self.assertEqual(verified.total_burn_pct, 150.5)
+
+    def test_cli_runs_observability_outage(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "observability-outage"]), 0)
+        self.assertIn("51/100", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "observability-outage",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     19m "
+            "(us-east 3m, us-west 6m, eu-west 10m)", out)
+        self.assertIn("43/100", out)
+
+
 class TestKeyRotationScenario(unittest.TestCase):
     """key-rotation: a KMS key rotation breaks saved-card decryption.
 
@@ -10375,7 +10587,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.74.0", text)
+        self.assertIn("Generated by incident-lab 0.75.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -10578,7 +10790,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.74.0")
+                         "incident-lab 0.75.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -11239,7 +11451,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.74.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.75.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
