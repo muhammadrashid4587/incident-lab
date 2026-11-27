@@ -264,12 +264,29 @@ SCENARIOS = {
         description=(
             "Order processing is falling behind: consumer lag passed 2M "
             "messages after a downstream slowdown. The primary acks in "
-            "4m and scales up consumers to drain the backlog."
+            "4m and scales up consumers to drain the backlog. The drain "
+            "is only real once the lag is actually falling in every "
+            "region: a test order clears the queue in 3m in us-east, "
+            "where the downstream is healthiest and the backlog is "
+            "shallowest, 6m in us-west and 9m in eu-west, where the "
+            "downstream is slowest and the backlog is deepest, so the "
+            "lag takes longest to confirm falling."
         ),
         ack_delay_min=(4, None, None),
         mitigate_delay_min=25,
         resolve_delay_min=15,
         slo_percent=99.5,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the drain is not the same price everywhere: a
+        # test order clears the queue in 3m in us-east, 6m in
+        # us-west and 9m in eu-west, where the downstream is
+        # slowest and the backlog deepest, so the lag takes
+        # longest to confirm falling. The total is 18m, 9m more
+        # than the 3m default, so the verified run scores 84/100
+        # where the default-cost run scored 89.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 6, "eu-west": 9,
+        },
         hints=(
             "Scale the consumers up before anything else: lag drains "
             "only as fast as consumption, and the backlog is the "
@@ -278,6 +295,9 @@ SCENARIOS = {
             "fast extra consumers can drain the queue.",
             "Confirm the lag is actually falling after scaling; if it "
             "is flat, the consumers are stuck, not short-handed.",
+            "Verify the lag is actually falling in every region before "
+            "declaring the incident mitigated; eu-west holds the "
+            "deepest backlog and takes longest to confirm.",
         ),
     ),
     "dns-outage": Scenario(
