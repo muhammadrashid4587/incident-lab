@@ -1369,6 +1369,72 @@ SCENARIOS = {
             "timing out or returning nothing",
         ),
     ),
+    "object-storage-outage": Scenario(
+        name="object-storage-outage",
+        service="media-store",
+        title="Object storage outage breaks uploads and images",
+        severity="critical",
+        description=(
+            "A bad deploy to the storage gateway corrupts the "
+            "metadata index the object store uses to address its "
+            "objects: the bytes are still on disk, but reads cannot "
+            "find them, so product images 404, uploads return 500s, "
+            "and receipts cannot be fetched. There is no clean "
+            "alert — the store's health check only probes the "
+            "gateway, which still answers, so the team only finds "
+            "out from a climb in broken-image reports and failed "
+            "uploads, and then has to fail over reads to the "
+            "secondary region's replicated bucket and replay the "
+            "queued uploads, because a failover without the replay "
+            "leaves every upload from the outage window lost. The "
+            "primary acks in 3m, on time against the standard "
+            "policy's 5m window, then fails over reads while the "
+            "impact grows from uploads failing to images breaking "
+            "to the store becoming unusable. The fix is only real "
+            "once a sample of known objects returns the right bytes "
+            "in every region: the check takes 4m in us-east, 6m in "
+            "us-west and 9m in eu-west, where the replica lags the "
+            "primary longest and takes longest to catch up."
+        ),
+        ack_delay_min=(3,),
+        mitigate_delay_min=40,
+        resolve_delay_min=15,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # sample of known objects is checked region by region at
+        # the price each region's replica charges — 4m in us-east,
+        # 6m in us-west and 9m in eu-west, where the replica lags
+        # the primary longest and takes longest to catch up.
+        # The total is 19m, 10m more than the 3m default, so the
+        # verified run scores 77/100 where the default-cost run
+        # scored 82.
+        verify_delay_min_by_region={
+            "us-east": 4, "us-west": 6, "eu-west": 9,
+        },
+        hints=(
+            "Fail over reads to the secondary region's replicated "
+            "bucket first: the objects are still on disk there, and "
+            "reads recover while the primary index is repaired.",
+            "Replay the queued uploads after the failover: a "
+            "failover without the replay leaves every upload from "
+            "the outage window lost.",
+            "Verify a sample of known objects — an upload, a "
+            "product image and a receipt — returns the right bytes "
+            "in every region before declaring the incident "
+            "mitigated; the eu-west replica lags longest, and a "
+            "region still serving 404s keeps customers from seeing "
+            "what they bought.",
+        ),
+        impact_stages=(
+            "Uploads failing: new images and receipts cannot be "
+            "stored, uploads returning 500s",
+            "Images breaking: product pages serving broken images "
+            "as cached copies expire",
+            "Store unusable: reads failing across regions, uploads "
+            "queued, receipts unreachable",
+        ),
+    ),
 }
 
 
