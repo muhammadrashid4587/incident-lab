@@ -1435,6 +1435,78 @@ SCENARIOS = {
             "queued, receipts unreachable",
         ),
     ),
+    "container-registry-outage": Scenario(
+        name="container-registry-outage",
+        service="image-registry",
+        title="Container registry outage blocks deploys and image pulls",
+        severity="critical",
+        description=(
+            "The container registry stops serving image pulls: the "
+            "registry is unreachable, and when it does answer it "
+            "serves stale or corrupt manifests, so new deploys fail "
+            "at the pull step, rollbacks are blocked for the same "
+            "reason, and any node that restarts cannot pull its "
+            "image and stays down. Running workloads are unaffected "
+            "until they restart, which is what makes the incident "
+            "sneaky: the service looks healthy while the fleet "
+            "quietly loses the ability to change. There is no clean "
+            "alert — the registry's health check probes the load "
+            "balancer, which still answers, so the team only finds "
+            "out from a climb in failed deploys and image-pull "
+            "errors, and then has to fail over pulls to the mirrored "
+            "registry and promote the cached images, because a "
+            "failover without the promotion leaves every node "
+            "pulling from a mirror that never held the images it "
+            "needs. The primary acks in 4m, on time against the "
+            "standard policy's 5m window, then fails over pulls "
+            "while the impact grows from deploys failing to nodes "
+            "unable to restart to rollbacks blocked. The fix is "
+            "only real once a known image pulls and starts in every "
+            "region: the check takes 3m in us-east, 6m in us-west "
+            "and 11m in eu-west, where the mirror is coldest and "
+            "the largest base images take longest to re-pull."
+        ),
+        ack_delay_min=(4,),
+        mitigate_delay_min=35,
+        resolve_delay_min=15,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # known image is pulled and started region by region at
+        # the price each region's mirror charges — 3m in us-east,
+        # 6m in us-west and 11m in eu-west, where the mirror is
+        # coldest and the largest base images take longest to
+        # re-pull. The total is 20m, 11m more than the 3m
+        # default, so the verified run scores 78/100 where the
+        # default-cost run scored 84.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 6, "eu-west": 11,
+        },
+        hints=(
+            "Fail over pulls to the mirrored registry first: the "
+            "images are still cached there, and deploys recover "
+            "while the primary registry is repaired.",
+            "Promote the cached images after the failover, and pin "
+            "deploys to image digests: a failover without the "
+            "promotion leaves nodes pulling from a mirror that "
+            "never held the images they need, and the latest tag "
+            "cannot be trusted while the registry serves stale "
+            "manifests.",
+            "Verify a known image pulls and starts in every region "
+            "before declaring the incident mitigated; the eu-west "
+            "mirror is coldest and takes longest to warm, and a "
+            "region still failing pulls keeps its nodes from "
+            "restarting.",
+        ),
+        impact_stages=(
+            "Deploys failing: new deploys failing at the image "
+            "pull step, rollbacks blocked for the same reason",
+            "Nodes unable to restart: restarted nodes cannot pull "
+            "their image and stay down, fleet slowly shrinking",
+            "Fleet frozen: no deploy, no rollback and no restart "
+            "can pull an image anywhere",
+        ),
+    ),
 }
 
 
