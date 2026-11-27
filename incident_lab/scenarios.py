@@ -1228,6 +1228,75 @@ SCENARIOS = {
             "unrecoverable",
         ),
     ),
+    "clock-skew": Scenario(
+        name="clock-skew",
+        service="checkout-api",
+        title="Clock skew breaks leases and ordering across regions",
+        severity="critical",
+        description=(
+            "A bad config push kills the NTP daemon on part of the "
+            "fleet, and the affected hosts drift minutes apart: "
+            "leases expire early, so idempotency locks are released "
+            "while requests are still in flight and duplicate "
+            "charges appear; events are timestamped out of order, "
+            "so checkout state disagrees across regions; and "
+            "leader election flaps, because nodes that disagree "
+            "about the time disagree about who holds the lock. The "
+            "team has to freeze the election, restart NTP and force "
+            "a step resync on the drifted hosts — a slow slew would "
+            "take hours to close a minutes-wide gap — and then "
+            "verify the clocks agree before trusting any lease "
+            "again. The primary's page is buried under a storm of "
+            "duplicate-charge alerts, so they miss; the senior is "
+            "chasing a payments discrepancy and acks 4m late "
+            "against the sev1 policy's 5m window, then freezes the "
+            "election while the impact grows from leases expiring "
+            "early to ordering breaking to leader election "
+            "flapping. The fix is only real once every region's "
+            "clocks agree within tolerance: the check takes 4m in "
+            "us-east, 6m in us-west and 9m in eu-west, where the "
+            "hosts drifted furthest and take longest to resync."
+        ),
+        ack_delay_min=(None, 9),
+        mitigate_delay_min=40,
+        resolve_delay_min=20,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: the
+        # clocks are checked region by region at the price each
+        # region's drift charges — 4m in us-east, 6m in us-west
+        # and 9m in eu-west, where the hosts drifted furthest.
+        # The total is 19m, 16m more than the 3m default, so the
+        # verified run scores 10/100 where the default-cost run
+        # scored 11.
+        verify_delay_min_by_region={
+            "us-east": 4, "us-west": 6, "eu-west": 9,
+        },
+        hints=(
+            "Freeze the leader election first: no decision made on "
+            "a skewed clock can be trusted, and every election "
+            "held while the clocks disagree makes the flapping "
+            "worse.",
+            "Restart NTP and force a step resync on the drifted "
+            "hosts: a slow slew takes hours to close a "
+            "minutes-wide gap, and the leases stay broken until "
+            "the clocks agree.",
+            "Verify every region's clocks agree within tolerance "
+            "before declaring the incident mitigated; the eu-west "
+            "hosts drifted furthest and take longest to resync, "
+            "and a region still skewed keeps expiring leases "
+            "early.",
+        ),
+        impact_stages=(
+            "Leases expiring early: idempotency locks released "
+            "while requests are still in flight, duplicate charges "
+            "appearing",
+            "Ordering broken: events timestamped out of order, "
+            "checkout state disagreeing across regions",
+            "Leader election flapping: nodes disagreeing about who "
+            "holds the lock, writes failing",
+        ),
+    ),
 }
 
 
