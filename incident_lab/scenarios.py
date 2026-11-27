@@ -397,12 +397,34 @@ SCENARIOS = {
             "The identity provider is failing every login attempt. "
             "The alert fired, but the pages go to a stale on-call "
             "rotation: the three responders paged have all rotated "
-            "off the team, so nobody answers while the impact grows."
+            "off the team, so nobody answers while the impact grows. "
+            "The failover to the backup provider is only real once a "
+            "test login clears in every region: the backup IdP "
+            "answers in 3m in us-east, where its primary region is, "
+            "5m in us-west and 8m in eu-west, where sessions must "
+            "re-validate against the EU directory and take longest "
+            "to confirm."
         ),
         ack_delay_min=(None, None, None),
         mitigate_delay_min=30,
         resolve_delay_min=20,
         slo_percent=99.95,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the failover is not the same price everywhere:
+        # a test login clears in 3m in us-east, 5m in us-west and
+        # 8m in eu-west, where sessions must re-validate against
+        # the EU directory and take longest to confirm. The total
+        # is 16m, 7m more than the 3m default. A `run` never
+        # reaches the checks — nobody acks, so the incident ends
+        # unacked — so the costs are exercised through a drill,
+        # where the operator acks and mitigates: ack 2m, mitigate
+        # 30m, the checks land at 5m, 10m and 18m, and the
+        # verified drill scores 84/100 (mitigation 48m, 222.2%
+        # of the monthly error budget burned) where the
+        # default-cost drill scored 87.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 5, "eu-west": 8,
+        },
         hints=(
             "Fail over to the backup identity provider first; logins "
             "are down and every minute locks out more users.",
@@ -412,6 +434,10 @@ SCENARIOS = {
             "Force a session refresh once the failover is up; sessions "
             "that expired during the outage will not recover on "
             "their own.",
+            "Verify a test login clears in every region before "
+            "declaring the incident mitigated; eu-west re-validates "
+            "sessions against its own directory and takes longest "
+            "to confirm.",
         ),
         impact_stages=(
             "Logins failing: new sign-ins erroring, existing sessions "

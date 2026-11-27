@@ -3368,9 +3368,22 @@ class TestPurgeVerification(unittest.TestCase):
              if event.kind == "verified"], [])
         self.assertEqual(result.score.points, 34)
 
+    def _regionless_scenario(self):
+        # sso-outage used to be the library's region-less scenario;
+        # since 0.74.0 every built-in scenario has regions, so the
+        # "needs regions" checks use a scenario file scenario with
+        # none instead.
+        return Scenario(
+            name="cache-down", service="sessions-cache",
+            title="Cache cluster unreachable",
+            severity="high",
+            description="The sessions cache stopped accepting writes.",
+            ack_delay_min=(2, None, None),
+            mitigate_delay_min=15, resolve_delay_min=10)
+
     def test_per_region_needs_regions(self):
         with self.assertRaises(ValueError):
-            simulate(get("sso-outage"), DEFAULT_POLICY,
+            simulate(self._regionless_scenario(), DEFAULT_POLICY,
                      purge_verification="per-region")
         with self.assertRaises(ValueError):
             simulate(get("cdn-purge-failure"), DEFAULT_POLICY,
@@ -3444,7 +3457,7 @@ class TestPurgeVerification(unittest.TestCase):
         self.assertEqual(outcome.replayed.to_dict(), base.to_dict())
 
     def test_what_if_verification_needs_regions(self):
-        base = simulate(get("sso-outage"), DEFAULT_POLICY)
+        base = simulate(self._regionless_scenario(), DEFAULT_POLICY)
         with self.assertRaises(ValueError):
             what_if(base, purge_verification="per-region")
         # A run saved before regions existed has none either.
@@ -3473,10 +3486,13 @@ class TestPurgeVerification(unittest.TestCase):
         self.assertIn("30/100", out)
 
     def test_cli_run_verification_needs_regions(self):
+        path = self._write_json({"scenarios": {"cache-down":
+            scenario_to_dict(self._regionless_scenario())}})
         err = io.StringIO()
         with redirect_stderr(err):
             self.assertEqual(main([
-                "run", "sso-outage", "--verify-purge", "per-region"]), 2)
+                "run", "cache-down", "--scenario-file", path,
+                "--verify-purge", "per-region"]), 2)
         self.assertIn("no regions to verify", err.getvalue())
 
     def test_cli_run_bad_verification_value_fails(self):
@@ -3584,7 +3600,7 @@ class TestPurgeVerification(unittest.TestCase):
     def test_shift_verification_needs_regions_for_every_incident(self):
         with self.assertRaises(ValueError):
             simulate_shift(
-                [get("cdn-purge-failure"), get("sso-outage")],
+                [get("cdn-purge-failure"), self._regionless_scenario()],
                 DEFAULT_POLICY, slo_percent=99.5,
                 purge_verification="per-region")
 
@@ -5840,6 +5856,155 @@ class TestQueueBacklogPerRegionCosts(unittest.TestCase):
             "verify delay:     18m "
             "(us-east 3m, us-west 6m, eu-west 9m)", out)
         self.assertIn("84/100", out)
+
+
+class TestSsoOutagePerRegionCosts(unittest.TestCase):
+    """sso-outage: per-region verification costs for the failover.
+
+    The failover to the backup identity provider is only real once
+    a test login clears in every region, and the check is slowest
+    where sessions must re-validate against the EU directory — 3m
+    in us-east, 5m in us-west and 8m in eu-west — so the verified
+    drill costs 7m more than the 3m default and scores 84/100
+    where the default-cost drill scored 87. A `run` never reaches
+    the checks: nobody acks, so the incident ends unacked at 0
+    with no verification recorded — the costs are exercised
+    through a drill, where the operator acks and mitigates.
+    """
+
+    def test_sso_outage_scenario(self):
+        scenario = get("sso-outage")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "identity-sso")
+        self.assertEqual(scenario.ack_delay_min, (None, None, None))
+        self.assertEqual(scenario.slo_percent, 99.95)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 8})
+        self.assertEqual(scenario.verify_delay_min_total(), 16)
+        self.assertGreaterEqual(len(scenario.hints), 1)
+
+    def test_run_still_ends_unacked_with_verification_on(self):
+        # The flag is accepted now that the scenario has regions,
+        # but the run never reaches the checks: nobody acks, so
+        # the incident ends unacked at 0 with no verification time.
+        result = simulate(get("sso-outage"), DEFAULT_POLICY,
+                          purge_verification="per-region")
+        self.assertEqual(result.purge_verification, "per-region")
+        self.assertEqual(result.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 8})
+        self.assertEqual(result.score.verify_delay_min, 0)
+        self.assertEqual(result.score.points, 0)
+        self.assertIsNone(result.score.time_to_mitigate_min)
+        self.assertEqual(
+            [event for event in result.timeline.events
+             if event.kind == "verified"], [])
+
+    def test_verified_drill_costs_sso_outage(self):
+        drill = run_drill(
+            get("sso-outage"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 2\nmitigate 30\nresolve 20\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        score = drill.score
+        self.assertEqual(drill.score.verify_delay_min, 16)
+        self.assertEqual(drill.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 8})
+        # The primary acks at 2m, so the checks land at 5m, 10m
+        # and 18m: the 8m eu-west check is what pushes
+        # mitigation to 48m.
+        verified = [event for event in drill.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(5, "us-east"), (10, "us-west"), (18, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in us-west (5m)",
+             "fix confirmed in eu-west (8m)"])
+        self.assertEqual(score.time_to_mitigate_min, 48)
+        self.assertEqual(score.time_to_resolve_min, 68)
+        # 100 - 16 (48m to mitigate past the 15m grace, halved)
+        # = 84, three points below the 87 the 3m-default costs
+        # scored.
+        self.assertEqual(score.points, 84)
+        self.assertEqual(score.downtime_min, 48)
+        self.assertEqual(score.error_budget_burn_pct, 222.2)
+        debrief = generate_debrief(drill)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 3m, us-west 5m, eu-west 8m, +16m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 3, "us-west": 5, "eu-west": 8})
+
+    def test_default_cost_drill_scores_higher(self):
+        default = replace(get("sso-outage"),
+                          verify_delay_min_by_region={})
+        drill = run_drill(
+            default, DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 2\nmitigate 30\nresolve 20\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        # The 3m default in every region: checks at 5m, 8m and
+        # 11m for a 9m total, mitigation at 41m.
+        self.assertEqual(drill.score.verify_delay_min, 9)
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in drill.timeline.events
+             if event.kind == "verified"],
+            [(5, "us-east"), (8, "us-west"), (11, "eu-west")])
+        self.assertEqual(drill.score.time_to_mitigate_min, 41)
+        self.assertEqual(drill.score.time_to_resolve_min, 61)
+        self.assertEqual(drill.score.points, 87)
+        self.assertEqual(drill.score.error_budget_burn_pct, 189.8)
+
+    def test_what_if_turning_verification_off_on_drill(self):
+        drill = run_drill(
+            get("sso-outage"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 2\nmitigate 30\nresolve 20\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        outcome = what_if(drill, purge_verification="off")
+        self.assertEqual(outcome.replayed.score.points, 92)
+        self.assertEqual(outcome.points_delta, 8)
+        self.assertEqual(outcome.replayed.score.verify_delay_min, 0)
+        self.assertEqual(outcome.replayed.score.time_to_mitigate_min, 32)
+
+    def test_cli_drill_shows_per_region_breakdown(self):
+        from unittest import mock
+        out = io.StringIO()
+        with mock.patch.object(
+                sys, "stdin",
+                io.StringIO("ack 2\nmitigate 30\nresolve 20\n")), \
+                redirect_stdout(out), redirect_stderr(io.StringIO()):
+            self.assertEqual(main([
+                "drill", "sso-outage",
+                "--verify-purge", "per-region"]), 0)
+        out = out.getvalue()
+        self.assertIn(
+            "verify delay:     16m "
+            "(us-east 3m, us-west 5m, eu-west 8m)", out)
+        self.assertIn("84/100", out)
+
+    def test_cli_run_verification_accepted_but_unacked(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "sso-outage",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "purge verification: per-region (3 regions, +0m)", out)
+        self.assertIn("unacked", out)
+        self.assertIn("0/100", out)
 
 
 class TestNetworkPartitionPerRegionCosts(unittest.TestCase):
@@ -10210,7 +10375,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.73.0", text)
+        self.assertIn("Generated by incident-lab 0.74.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -10413,7 +10578,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.73.0")
+                         "incident-lab 0.74.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -11074,7 +11239,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.73.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.74.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
