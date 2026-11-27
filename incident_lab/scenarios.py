@@ -1507,6 +1507,75 @@ SCENARIOS = {
             "can pull an image anywhere",
         ),
     ),
+    "kafka-outage": Scenario(
+        name="kafka-outage",
+        service="orders-events",
+        title="Message broker outage stalls order events",
+        severity="critical",
+        description=(
+            "The message broker cluster loses quorum: a bad broker "
+            "deploy and a disk fault on two brokers take the "
+            "cluster down, so producers cannot publish and "
+            "consumers stall, and order events stop flowing — "
+            "orders are still placed, but fulfilment, email and "
+            "inventory never hear about them, so placed orders "
+            "sit invisible downstream. There is no clean alert — "
+            "the producers buffer and retry silently, and consumer "
+            "lag climbs slowly, so the team only finds out from "
+            "customers asking where their order confirmation is, "
+            "and then has to fail over producers and consumers to "
+            "the standby cluster and replay from the last "
+            "committed offsets, because a failover without the "
+            "replay loses every event from the outage window, and "
+            "replaying from the start double-processes orders. "
+            "The primary acks in 3m, on time against the standard "
+            "policy's 5m window, then fails over to the standby "
+            "cluster while the impact grows from events stalling "
+            "to consumers lagging to orders stuck. The fix is only "
+            "real once a test event publishes and is consumed in "
+            "every region: the check takes 2m in us-east, 5m in "
+            "us-west and 9m in eu-west, where the consumers lag "
+            "longest and take longest to catch up."
+        ),
+        ack_delay_min=(3,),
+        mitigate_delay_min=30,
+        resolve_delay_min=12,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test event is published and consumed region by region
+        # at the price each region's consumers charge — 2m in
+        # us-east, 5m in us-west and 9m in eu-west, where the
+        # consumers lag longest and take longest to catch up.
+        # The total is 16m, 7m more than the 3m default, so the
+        # verified run scores 83/100 where the default-cost run
+        # scored 87.
+        verify_delay_min_by_region={
+            "us-east": 2, "us-west": 5, "eu-west": 9,
+        },
+        hints=(
+            "Fail over producers and consumers to the standby "
+            "cluster first: events flow again while the primary "
+            "brokers are repaired.",
+            "Replay from the last committed offsets after the "
+            "failover: a failover without the replay loses every "
+            "event from the outage window, and replaying from the "
+            "start double-processes orders.",
+            "Verify a test event publishes and is consumed in "
+            "every region before declaring the incident mitigated; "
+            "the eu-west consumers lag longest and take longest "
+            "to catch up, and a region still not consuming keeps "
+            "its orders stuck.",
+        ),
+        impact_stages=(
+            "Events stalling: producers buffering and retrying, "
+            "order events not reaching fulfilment or email",
+            "Consumers lagging: consumer lag climbing across "
+            "topics, downstream services working from stale state",
+            "Orders stuck: placed orders invisible to fulfilment, "
+            "inventory and shipping",
+        ),
+    ),
 }
 
 

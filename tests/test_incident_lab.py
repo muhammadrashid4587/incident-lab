@@ -8143,6 +8143,192 @@ class TestContainerRegistryOutageScenario(unittest.TestCase):
         self.assertIn("78/100", out)
 
 
+class TestKafkaOutageScenario(unittest.TestCase):
+    """kafka-outage: the message broker cluster loses quorum, so
+    producers cannot publish and consumers stall, and order events
+    stop flowing — orders are still placed, but fulfilment, email
+    and inventory never hear about them.
+
+    The primary acks in 3m, on time against the standard policy's
+    5m window, so there is no miss and no escalation and the full
+    ack credit is kept — the third built-in run whose score is
+    driven by a long mitigation rather than by ack trouble: it
+    mitigates in 33m and scores 91, burning 76.4% of the monthly
+    error budget. Verifying a test event publishes and is consumed
+    in every region costs 16m — 2m in us-east, 5m in us-west and 9m
+    in eu-west, where the consumers lag longest — so mitigation
+    lands at 49m and the score drops to 83, 4 points below the 87
+    the 3m-default costs scored, and the burn crosses the budget
+    at 113.4%.
+    """
+
+    def test_kafka_outage_scenario(self):
+        scenario = get("kafka-outage")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "orders-events")
+        self.assertEqual(scenario.ack_delay_min, (3,))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 5, "eu-west": 9})
+        self.assertEqual(scenario.verify_delay_min_total(), 16)
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_unverified_scores_91_with_full_ack_credit(self):
+        result = simulate(get("kafka-outage"),
+                          DEFAULT_POLICY)
+        score = result.score
+        # Standard timeouts 5m, 5m, 10m: the primary acks 3m after
+        # being paged, on time, so nobody escalates.
+        self.assertEqual(score.time_to_ack_min, 3)
+        self.assertEqual(score.time_to_mitigate_min, 33)
+        self.assertEqual(score.time_to_resolve_min, 45)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 0)
+        self.assertEqual(score.ack_late_min, 0)
+        self.assertAlmostEqual(score.ack_credit, 1.0)
+        self.assertEqual(score.verify_delay_min, 0)
+        # 100 - 0 (no escalations) - 0 (3m to ack inside the 5m
+        # grace) - 9 (33m to mitigate past the 15m grace, halved)
+        # = 91, and the on-time ack keeps all of it.
+        self.assertEqual(score.points, 91)
+        # Downtime 33m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 33)
+        self.assertEqual(score.error_budget_burn_pct, 76.4)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 1)
+        self.assertEqual([step.outcome for step in chain],
+                         ["acked"])
+        self.assertEqual([step.paged_at_min for step in chain], [0])
+        self.assertEqual(
+            [step.impact for step in chain],
+            list(get("kafka-outage").impact_stages[:1]))
+
+    def test_verified_per_region_scores_83(self):
+        result = simulate(get("kafka-outage"),
+                          DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(score.verify_delay_min, 16)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 2, "us-west": 5, "eu-west": 9})
+        # The primary acks at 3m, so the checks land at 5m, 10m
+        # and 19m: the 9m eu-west check is what pushes mitigation
+        # to 49m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(5, "us-east"), (10, "us-west"), (19, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (2m)",
+             "fix confirmed in us-west (5m)",
+             "fix confirmed in eu-west (9m)"])
+        self.assertEqual(score.time_to_mitigate_min, 49)
+        self.assertEqual(score.time_to_resolve_min, 61)
+        # 100 - 0 - 0 - 17 (49m to mitigate past the 15m grace,
+        # halved) = 83 — four points below the 87 the 3m-default
+        # costs scored.
+        self.assertEqual(score.points, 83)
+        self.assertEqual(score.downtime_min, 49)
+        self.assertEqual(score.error_budget_burn_pct, 113.4)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 2m, us-west 5m, eu-west 9m, +16m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 2, "us-west": 5, "eu-west": 9})
+
+    def test_what_if_turning_verification_on_costs_eight_points(self):
+        base = simulate(get("kafka-outage"),
+                        DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 83)
+        self.assertEqual(outcome.points_delta, -8)
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("kafka-outage"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 3\nmitigate 30\nresolve 12\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("kafka-outage"),
+                       DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 83)
+        plain_drill = run_drill(
+            get("kafka-outage"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 3\nmitigate 30\nresolve 12\n"),
+            prompt_stream=io.StringIO())
+        plain_run = simulate(get("kafka-outage"),
+                             DEFAULT_POLICY)
+        self.assertEqual(plain_drill.to_dict(), plain_run.to_dict())
+        self.assertEqual(plain_drill.score.points, 91)
+
+    def test_template_round_trips_kafka_outage(self):
+        data = scenario_to_dict(get("kafka-outage"))
+        self.assertEqual(data["ack_delay_min"], [3])
+        self.assertEqual(data["regions"],
+                         ["us-east", "us-west", "eu-west"])
+        self.assertEqual(data["verify_delay_min_by_region"],
+                         {"us-east": 2, "us-west": 5, "eu-west": 9})
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump({"scenarios": {"kafka-outage": data}},
+                      handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["kafka-outage"],
+                         get("kafka-outage"))
+
+    def test_shift_runs_kafka_outage_like_a_run(self):
+        # kafka-outage burns 76.4% of the budget, so a shift that
+        # schedules it first still runs disk-full — the two
+        # together burn 129.6%, so the shift ends exhausted and
+        # latency-spike is skipped.
+        shift = simulate_shift(
+            [get("kafka-outage"), get("disk-full"),
+             get("latency-spike")],
+            DEFAULT_POLICY, slo_percent=99.9)
+        self.assertEqual(
+            [run.score.points for run in shift.runs], [91, 96])
+        self.assertTrue(shift.budget_exhausted)
+        self.assertEqual(shift.skipped, ["latency-spike"])
+        self.assertEqual(shift.total_burn_pct, 129.6)
+        self.assertEqual(shift.shift_points, 62.3)
+        verified = simulate_shift(
+            [get("kafka-outage")], DEFAULT_POLICY,
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual(
+            [run.score.points for run in verified.runs], [83])
+        self.assertEqual(verified.total_burn_pct, 113.4)
+
+    def test_cli_runs_kafka_outage(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "kafka-outage"]), 0)
+        self.assertIn("91/100", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "kafka-outage",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     16m "
+            "(us-east 2m, us-west 5m, eu-west 9m)", out)
+        self.assertIn("83/100", out)
+
+
 class TestKeyRotationScenario(unittest.TestCase):
     """key-rotation: a KMS key rotation breaks saved-card decryption.
 
@@ -8907,7 +9093,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.64.0", text)
+        self.assertIn("Generated by incident-lab 0.65.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -9110,7 +9296,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.64.0")
+                         "incident-lab 0.65.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -9771,7 +9957,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.64.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.65.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
