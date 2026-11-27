@@ -1576,6 +1576,80 @@ SCENARIOS = {
             "inventory and shipping",
         ),
     ),
+    "kubernetes-control-plane-outage": Scenario(
+        name="kubernetes-control-plane-outage",
+        service="kubernetes-control-plane",
+        title="Kubernetes control plane outage blocks deploys and scaling",
+        severity="critical",
+        description=(
+            "The Kubernetes control plane goes down: a bad "
+            "control-plane upgrade and a disk fault on two etcd "
+            "members take the API servers offline, so kubectl "
+            "commands fail, rollouts stick and no new pods can be "
+            "scheduled — deploys and scaling are blocked, while "
+            "running workloads keep serving until they need a "
+            "restart or a new replica, which is what makes the "
+            "incident sneaky: the platform looks healthy while "
+            "the fleet quietly loses the ability to change. There "
+            "is no clean alert — the kubelets keep the running "
+            "pods alive and their health checks pass, so the team "
+            "only finds out from a climb in failed kubectl "
+            "commands and stuck rollouts, and then has to fail "
+            "over to the standby control plane and restore etcd "
+            "from snapshot, because a failover without the "
+            "restore loses every deployment, service and config "
+            "the cluster held since the last snapshot. The "
+            "primary acks in 3m, on time against the standard "
+            "policy's 5m window, then fails over to the standby "
+            "control plane while the impact grows from deploys "
+            "blocked to scaling frozen to cluster state at risk. "
+            "The fix is only real once a test deploy rolls out "
+            "and scales in every region: the check takes 3m in "
+            "us-east, 6m in us-west and 10m in eu-west, where the "
+            "standby control plane is coldest and the etcd "
+            "snapshot takes longest to restore."
+        ),
+        ack_delay_min=(3,),
+        mitigate_delay_min=38,
+        resolve_delay_min=12,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test deploy is rolled out and scaled region by region
+        # at the price each region's standby control plane
+        # charges — 3m in us-east, 6m in us-west and 10m in
+        # eu-west, where the standby is coldest and the etcd
+        # snapshot takes longest to restore. The total is 19m,
+        # 10m more than the 3m default, so the verified run
+        # scores 78/100 where the default-cost run scored 83.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 6, "eu-west": 10,
+        },
+        hints=(
+            "Fail over to the standby control plane first: "
+            "deploys and scaling recover while the primary "
+            "control plane is repaired.",
+            "Restore etcd from snapshot after the failover: a "
+            "failover without the restore loses every deployment, "
+            "service and config the cluster held since the last "
+            "snapshot, and a stale snapshot rolls the cluster "
+            "back further than the outage.",
+            "Verify a test deploy rolls out and scales in every "
+            "region before declaring the incident mitigated; the "
+            "eu-west standby is coldest and takes longest to "
+            "restore, and a region still unable to schedule "
+            "keeps its workloads frozen.",
+        ),
+        impact_stages=(
+            "Deploys blocked: kubectl commands failing, rollouts "
+            "stuck, new pods unschedulable",
+            "Scaling frozen: autoscalers unable to act, traffic "
+            "growth with nowhere to go, nodes unable to be "
+            "replaced",
+            "Cluster state at risk: etcd quorum lost, deployments "
+            "and services exist only in the snapshot",
+        ),
+    ),
 }
 
 
