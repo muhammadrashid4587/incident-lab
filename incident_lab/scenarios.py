@@ -2065,6 +2065,72 @@ SCENARIOS = {
             "the WAL archive cannot be replayed",
         ),
     ),
+    "connection-pool-exhaustion": Scenario(
+        name="connection-pool-exhaustion",
+        service="checkout-db",
+        title="Checkout database connection pool exhausted",
+        severity="critical",
+        description=(
+            "A slow reporting query from a new dashboard holds "
+            "checkout's database connections open, and the "
+            "connection pool drains until new checkouts queue and "
+            "time out. There is no clean alert, because the pool "
+            "dashboard shows connections in use but not why they "
+            "are held, so the team has to kill the long-running "
+            "query, raise the pool limit and add a statement "
+            "timeout, because raising the limit alone just lets "
+            "the slow query hold more connections and the pool "
+            "drains again. The primary acks in 4m against the "
+            "standard policy's 5m window, then kills the query "
+            "while the impact grows from checkouts timing out to "
+            "the pool draining dry to queued checkouts failing. "
+            "The fix is only real once a test checkout completes "
+            "in every region: the pool recovers at different "
+            "speeds, so the check takes 3m in us-east, 5m in "
+            "us-west and 9m in eu-west, where the replica pool "
+            "drains slowest."
+        ),
+        ack_delay_min=(4,),
+        mitigate_delay_min=30,
+        resolve_delay_min=15,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # test checkout completes region by region at the price
+        # each region's pool recovery charges — 3m in us-east,
+        # 5m in us-west and 9m in eu-west, where the replica
+        # pool drains slowest. The total is 17m, 8m more than
+        # the 3m default, so the verified run scores 82/100
+        # where the default-cost run scored 86.
+        verify_delay_min_by_region={
+            "us-east": 3, "us-west": 5, "eu-west": 9,
+        },
+        hints=(
+            "Check what is holding the connections before "
+            "raising the pool limit: a pool full of idle "
+            "connections is a leak, but a pool full of one "
+            "long-running query is a query to kill — confirm "
+            "the slowest query and how long it has held its "
+            "connection before deciding what to change.",
+            "Kill the long-running query and add a statement "
+            "timeout as well as raising the pool limit: the "
+            "limit alone lets the slow query hold more "
+            "connections, and the timeout is what stops the "
+            "next slow query draining the pool again.",
+            "Verify a test checkout completes in every region "
+            "before declaring the incident mitigated; the "
+            "eu-west replica pool drains slowest, and a region "
+            "still timing out keeps its checkouts failing.",
+        ),
+        impact_stages=(
+            "Checkouts timing out: the pool fills and new "
+            "checkouts queue instead of completing",
+            "Pool drained dry: no connection is free for a new "
+            "checkout at all",
+            "Queued checkouts failing: the queued checkouts "
+            "time out and fail instead of completing",
+        ),
+    ),
 }
 
 

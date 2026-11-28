@@ -10030,6 +10030,211 @@ class TestBackupRestoreFailureScenario(unittest.TestCase):
         self.assertIn("58/100", out)
 
 
+class TestConnectionPoolExhaustionScenario(unittest.TestCase):
+    """connection-pool-exhaustion: a slow reporting query holds
+    checkout's database connections open until the pool drains
+    and new checkouts queue and time out.
+
+    The primary acks on time in 4m against the standard policy's
+    5m window, mitigates in 34m and scores 91, burning 78.7% of
+    the monthly error budget. Verifying a test checkout completes
+    in every region costs 17m — 3m in us-east, 5m in us-west and
+    9m in eu-west, where the replica pool drains slowest — so
+    mitigation lands at 51m and the score drops to 82, 4 points
+    below the 86 the 3m-default costs scored, and the burn
+    crosses the budget at 118.1%.
+    """
+
+    def test_connection_pool_exhaustion_scenario(self):
+        scenario = get("connection-pool-exhaustion")
+        self.assertEqual(scenario.severity, "critical")
+        self.assertEqual(scenario.service, "checkout-db")
+        self.assertEqual(scenario.ack_delay_min, (4,))
+        self.assertEqual(scenario.slo_percent, 99.9)
+        self.assertEqual(scenario.regions,
+                         ("us-east", "us-west", "eu-west"))
+        self.assertEqual(scenario.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 9})
+        self.assertEqual(scenario.verify_delay_min_total(), 17)
+        self.assertEqual(len(scenario.impact_stages), 3)
+        self.assertEqual(len(scenario.hints), 3)
+
+    def test_unverified_scores_91_with_on_time_ack(self):
+        result = simulate(get("connection-pool-exhaustion"),
+                          DEFAULT_POLICY)
+        score = result.score
+        # Standard timeouts 5m, 5m, 10m: the primary acks 4m after
+        # being paged, inside the 5m window — the page arrives
+        # while the pool dashboard shows connections in use but
+        # not why they are held.
+        self.assertEqual(score.time_to_ack_min, 4)
+        self.assertEqual(score.time_to_mitigate_min, 34)
+        self.assertEqual(score.time_to_resolve_min, 49)
+        self.assertTrue(score.resolved)
+        self.assertEqual(score.escalations, 0)
+        self.assertEqual(score.ack_late_min, 0)
+        self.assertAlmostEqual(score.ack_credit, 1.0)
+        self.assertEqual(score.verify_delay_min, 0)
+        # 100 - 0 (4m to ack inside the 5m grace) - 9 (34m to
+        # mitigate past the 15m grace, halved) = 91.
+        self.assertEqual(score.points, 91)
+        # Downtime 34m against a 99.9% budget of 43.2m.
+        self.assertEqual(score.downtime_min, 34)
+        self.assertEqual(score.error_budget_burn_pct, 78.7)
+        chain = result.escalation_chain
+        self.assertEqual(len(chain), 1)
+        self.assertEqual([step.outcome for step in chain],
+                         ["acked"])
+        self.assertEqual([step.paged_at_min for step in chain], [0])
+        self.assertEqual(
+            [step.impact for step in chain],
+            list(get("connection-pool-exhaustion")
+                 .impact_stages[:1]))
+
+    def test_verified_per_region_scores_82(self):
+        result = simulate(get("connection-pool-exhaustion"),
+                          DEFAULT_POLICY,
+                          purge_verification="per-region")
+        score = result.score
+        self.assertEqual(score.verify_delay_min, 17)
+        self.assertEqual(result.verify_delay_min_by_region,
+                         {"us-east": 3, "us-west": 5, "eu-west": 9})
+        # The primary acks at 4m, so the checks land at 7m,
+        # 12m and 21m: the 9m eu-west check is what pushes
+        # mitigation to 51m.
+        verified = [event for event in result.timeline.events
+                    if event.kind == "verified"]
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in verified],
+            [(7, "us-east"), (12, "us-west"), (21, "eu-west")])
+        self.assertEqual(
+            [event.detail for event in verified],
+            ["fix confirmed in us-east (3m)",
+             "fix confirmed in us-west (5m)",
+             "fix confirmed in eu-west (9m)"])
+        self.assertEqual(score.time_to_mitigate_min, 51)
+        self.assertEqual(score.time_to_resolve_min, 66)
+        # 100 - 0 - 18 (51m to mitigate past the 15m grace,
+        # halved) = 82 — four points below the 86 the 3m-default
+        # costs scored.
+        self.assertEqual(score.points, 82)
+        self.assertEqual(score.downtime_min, 51)
+        self.assertEqual(score.error_budget_burn_pct, 118.1)
+        debrief = generate_debrief(result)
+        self.assertIn(
+            "Purge verification: per-region "
+            "(us-east 3m, us-west 5m, eu-west 9m, +17m)",
+            debrief.render())
+        self.assertEqual(
+            debrief.to_dict()["summary"]["verify_delay_min_by_region"],
+            {"us-east": 3, "us-west": 5, "eu-west": 9})
+
+    def test_default_cost_run_scores_86(self):
+        default = replace(get("connection-pool-exhaustion"),
+                          verify_delay_min_by_region={})
+        result = simulate(default, DEFAULT_POLICY,
+                          purge_verification="per-region")
+        # The 3m default in every region: checks at 7m, 10m and
+        # 13m for a 9m total, mitigation at 43m.
+        self.assertEqual(result.score.verify_delay_min, 9)
+        self.assertEqual(
+            [(event.t_min, event.actor) for event in
+             result.timeline.events if event.kind == "verified"],
+            [(7, "us-east"), (10, "us-west"), (13, "eu-west")])
+        self.assertEqual(result.score.time_to_mitigate_min, 43)
+        self.assertEqual(result.score.time_to_resolve_min, 58)
+        self.assertEqual(result.score.points, 86)
+        self.assertEqual(result.score.error_budget_burn_pct, 99.5)
+
+    def test_what_if_turning_verification_on_costs_nine_points(self):
+        base = simulate(get("connection-pool-exhaustion"),
+                        DEFAULT_POLICY)
+        outcome = what_if(base, purge_verification="per-region")
+        self.assertEqual(outcome.replayed.score.points, 82)
+        self.assertEqual(outcome.points_delta, -9)
+
+    def test_drill_matches_run_for_same_decisions(self):
+        drill = run_drill(
+            get("connection-pool-exhaustion"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 4\nmitigate 30\nresolve 15\n"),
+            prompt_stream=io.StringIO(),
+            purge_verification="per-region")
+        run = simulate(get("connection-pool-exhaustion"),
+                       DEFAULT_POLICY,
+                       purge_verification="per-region")
+        self.assertEqual(drill.to_dict(), run.to_dict())
+        self.assertEqual(drill.score.points, 82)
+        plain_drill = run_drill(
+            get("connection-pool-exhaustion"), DEFAULT_POLICY,
+            input_stream=io.StringIO(
+                "ack 4\nmitigate 30\nresolve 15\n"),
+            prompt_stream=io.StringIO())
+        plain_run = simulate(get("connection-pool-exhaustion"),
+                             DEFAULT_POLICY)
+        self.assertEqual(plain_drill.to_dict(), plain_run.to_dict())
+        self.assertEqual(plain_drill.score.points, 91)
+
+    def test_template_round_trips_connection_pool_exhaustion(self):
+        data = scenario_to_dict(
+            get("connection-pool-exhaustion"))
+        self.assertEqual(data["ack_delay_min"], [4])
+        self.assertEqual(data["regions"],
+                         ["us-east", "us-west", "eu-west"])
+        self.assertEqual(data["verify_delay_min_by_region"],
+                         {"us-east": 3, "us-west": 5, "eu-west": 9})
+        handle = tempfile.NamedTemporaryFile(
+            "w", suffix=".json", delete=False, encoding="utf-8")
+        with handle:
+            json.dump(
+                {"scenarios": {
+                    "connection-pool-exhaustion": data}},
+                handle)
+        loaded = load_scenario_file(handle.name)
+        self.assertEqual(loaded["connection-pool-exhaustion"],
+                         get("connection-pool-exhaustion"))
+
+    def test_shift_runs_connection_pool_exhaustion_like_a_run(self):
+        # connection-pool-exhaustion burns 78.7% of the budget and
+        # disk-full another 53.2%, so a shift that schedules it
+        # first runs disk-full too and skips latency-spike.
+        shift = simulate_shift(
+            [get("connection-pool-exhaustion"), get("disk-full"),
+             get("latency-spike")],
+            DEFAULT_POLICY, slo_percent=99.9)
+        self.assertEqual(
+            [run.score.points for run in shift.runs], [91, 96])
+        self.assertTrue(shift.budget_exhausted)
+        self.assertEqual(shift.skipped, ["latency-spike"])
+        self.assertEqual(shift.total_burn_pct, 131.9)
+        # Skipped incidents count as 0 in the shift mean:
+        # (91 + 96 + 0) / 3 = 62.3.
+        self.assertEqual(shift.shift_points, 62.3)
+        verified = simulate_shift(
+            [get("connection-pool-exhaustion")], DEFAULT_POLICY,
+            slo_percent=99.9, purge_verification="per-region")
+        self.assertEqual(
+            [run.score.points for run in verified.runs], [82])
+        self.assertEqual(verified.total_burn_pct, 118.1)
+
+    def test_cli_runs_connection_pool_exhaustion(self):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "connection-pool-exhaustion"]), 0)
+        self.assertIn("91/100", buf.getvalue())
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            self.assertEqual(main([
+                "run", "connection-pool-exhaustion",
+                "--verify-purge", "per-region"]), 0)
+        out = buf.getvalue()
+        self.assertIn(
+            "verify delay:     17m "
+            "(us-east 3m, us-west 5m, eu-west 9m)", out)
+        self.assertIn("82/100", out)
+
+
 class TestKeyRotationScenario(unittest.TestCase):
     """key-rotation: a KMS key rotation breaks saved-card decryption.
 
@@ -10794,7 +10999,7 @@ class TestPdfPostmortem(unittest.TestCase):
         self.assertIn("3m", text)
         self.assertIn("Error budget", text)
         self.assertIn("53.2%", text)
-        self.assertIn("Generated by incident-lab 0.76.0", text)
+        self.assertIn("Generated by incident-lab 0.77.0", text)
         self.assertIn("Page 1 of 2", text)
 
     def test_pdf_lists_hints_used_with_cost(self):
@@ -10997,7 +11202,7 @@ class TestBundle(unittest.TestCase):
         self.assertEqual(manifest["format"], "incident-lab-bundle")
         self.assertEqual(manifest["format_version"], 1)
         self.assertEqual(manifest["generator"],
-                         "incident-lab 0.76.0")
+                         "incident-lab 0.77.0")
         self.assertEqual(manifest["incident"]["id"], "disk-full")
         self.assertEqual(manifest["score"]["points"], 96)
         self.assertEqual(manifest["score"]["grade"], "A")
@@ -11658,7 +11863,7 @@ class TestShiftBundle(unittest.TestCase):
         out = self._bundle_path()
         manifest = create_bundle(shift_path, out)
         self.assertEqual(manifest["format"], "incident-lab-bundle")
-        self.assertEqual(manifest["generator"], "incident-lab 0.76.0")
+        self.assertEqual(manifest["generator"], "incident-lab 0.77.0")
         self.assertEqual(manifest["shift"]["shift_points"], 81.5)
         self.assertEqual(manifest["shift"]["grade"], "B")
         self.assertEqual(manifest["shift"]["total_burn_pct"], 31.0)
