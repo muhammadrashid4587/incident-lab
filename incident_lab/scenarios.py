@@ -2131,6 +2131,69 @@ SCENARIOS = {
             "time out and fail instead of completing",
         ),
     ),
+    "memory-leak": Scenario(
+        name="memory-leak",
+        service="recommendations-api",
+        title="Memory leak OOM-kills recommendations-api pods",
+        severity="critical",
+        description=(
+            "A new recommendations deploy leaks memory on every "
+            "request: an unbounded in-memory cache of user "
+            "profiles never evicts, so pods climb toward their "
+            "memory limit, get OOM-killed, restart, and climb "
+            "again. There is no clean alert, because restarts "
+            "look healthy at first — the pod comes back up — so "
+            "the team has to roll the deploy back and cap the "
+            "cache, because restarting the pods alone just lets "
+            "the leak climb again and the OOM loop repeats. The "
+            "primary acks in 3m against the standard policy's 5m "
+            "window, then rolls the deploy back while the impact "
+            "grows from recommendations timing out to OOM kills "
+            "cascading to recommendations failing. The fix is "
+            "only real once memory stays flat in every region: "
+            "the watch takes 4m in us-east, 6m in us-west and "
+            "10m in eu-west, where the largest fleet takes "
+            "longest to settle."
+        ),
+        ack_delay_min=(3,),
+        mitigate_delay_min=25,
+        resolve_delay_min=15,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere:
+        # memory has to be watched staying flat region by region
+        # at the price each region's fleet charges — 4m in
+        # us-east, 6m in us-west and 10m in eu-west, where the
+        # largest fleet takes longest to settle. The total is
+        # 20m, 11m more than the 3m default, so the verified run
+        # scores 84/100 where the default-cost run scored 89.
+        verify_delay_min_by_region={
+            "us-east": 4, "us-west": 6, "eu-west": 10,
+        },
+        hints=(
+            "Check memory per pod before restarting anything: "
+            "RSS climbing steadily between restarts is a leak, "
+            "but a flat RSS with a sudden spike is a traffic "
+            "surge — confirm the slope and which deploy started "
+            "it before deciding what to change.",
+            "Roll the deploy back and cap the cache as well as "
+            "restarting the pods: a restart alone lets the leak "
+            "climb again, and the cap is what stops the next "
+            "deploy leaking the fleet dry.",
+            "Watch memory stay flat in every region before "
+            "declaring the incident mitigated; the eu-west "
+            "fleet is largest and takes longest to settle, and "
+            "a region still climbing keeps its pods OOM-killing.",
+        ),
+        impact_stages=(
+            "Recommendations timing out: pods climb toward "
+            "their memory limit and restart",
+            "OOM kills cascading: pods restart faster than they "
+            "can warm up",
+            "Recommendations failing: requests fail while pods "
+            "loop through restarts",
+        ),
+    ),
 }
 
 
