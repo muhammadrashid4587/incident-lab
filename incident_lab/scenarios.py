@@ -1996,6 +1996,75 @@ SCENARIOS = {
             "cannot be reconstructed",
         ),
     ),
+    "backup-restore-failure": Scenario(
+        name="backup-restore-failure",
+        service="data-backups",
+        title="Backups silently failed, restore from a stale snapshot",
+        severity="critical",
+        description=(
+            "A bad deploy corrupts the orders database and the team "
+            "goes to restore from backup — and discovers the nightly "
+            "backup job has been silently failing for six days, so "
+            "the last good backup is six days old. There is no clean "
+            "alert, because the backup health check only probes the "
+            "scheduler, which still answers, so nobody knew the "
+            "backups had stopped until the restore console showed "
+            "no recent snapshots. The team has to restore from the "
+            "stale snapshot and replay six days of write-ahead log, "
+            "because a restore from the snapshot alone loses six "
+            "days of orders, and the orders that never reached the "
+            "WAL archive cannot be replayed at all. The primary "
+            "acks 1m late against the standard policy's 5m window — "
+            "the page arrives while they are staring at a restore "
+            "console showing no recent backups, deciding whether "
+            "the console is lying — then starts the restore while "
+            "the impact grows from backups failing silently to the "
+            "restore coming from a stale snapshot to orders lost "
+            "from the gap. The fix is only real once a restored "
+            "order reads back in every region: the replica "
+            "restores clear at different speeds, so the check takes "
+            "4m in us-east, 7m in us-west and 10m in eu-west, where "
+            "the replica restore lags the primary longest."
+        ),
+        ack_delay_min=(6,),
+        mitigate_delay_min=40,
+        resolve_delay_min=20,
+        slo_percent=99.9,
+        regions=("us-east", "us-west", "eu-west"),
+        # Verifying the fix is not the same price everywhere: a
+        # restored order reads back region by region at the price
+        # each region's replica restore charges — 4m in us-east,
+        # 7m in us-west and 10m in eu-west, where the replica
+        # restore lags the primary longest. The total is 21m, 12m
+        # more than the 3m default, so the verified run scores
+        # 58/100 where the default-cost run scored 63.
+        verify_delay_min_by_region={
+            "us-east": 4, "us-west": 7, "eu-west": 10,
+        },
+        hints=(
+            "Check the backup job's last success before trusting "
+            "the restore console: a restore list with no recent "
+            "backups is the backup job failing, not the console "
+            "lying — confirm the last good snapshot and how old "
+            "it is before deciding what to restore from.",
+            "Restore from the last good snapshot and replay the "
+            "write-ahead log: the snapshot alone loses six days of "
+            "orders, and the replay is what brings the database "
+            "back to the outage, not just to last week.",
+            "Verify a restored order reads back in every region "
+            "before declaring the incident mitigated; the eu-west "
+            "replica restores slowest, and a region still serving "
+            "stale data keeps its orders wrong.",
+        ),
+        impact_stages=(
+            "Backups failing silently: the nightly backup job "
+            "errors for six days and nothing alerts",
+            "Restore from a stale snapshot: the last good backup "
+            "is six days old",
+            "Orders lost from the gap: writes that never reached "
+            "the WAL archive cannot be replayed",
+        ),
+    ),
 }
 
 
